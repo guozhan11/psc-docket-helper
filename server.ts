@@ -203,7 +203,7 @@ const COOL_OFF_DURATION = 15 * 60 * 1000; // 15 minutes of quiet time on 429 err
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // Middleware to support json parsing
   app.use(express.json());
