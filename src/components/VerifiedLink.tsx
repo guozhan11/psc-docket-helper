@@ -39,7 +39,7 @@ interface VerifiedLinkProps {
   fallbackHref?: string;
 }
 
-export default function VerifiedLink({ href, children, className, fallbackHref = 'https://edocket.dcpsc.org/Search/CaseSearch' }: VerifiedLinkProps) {
+export default function VerifiedLink({ href, children, className, fallbackHref = 'https://edocket.dcpsc.org/public/search' }: VerifiedLinkProps) {
   const normalized = normalizeUrl(href || '');
   
   const [status, setStatus] = useState(() => {

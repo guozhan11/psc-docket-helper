@@ -3,7 +3,7 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 
 const DC_PSC_NEWSROOM_URL = "https://dcpsc.org/Newsroom.aspx";
-const EDOCKET_CASE_SEARCH_URL = "https://edocket.dcpsc.org/Search/CaseSearch";
+const EDOCKET_CASE_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
 const DC_PSC_CURRENT_NEWS_URL = "https://dcpsc.org/Newsroom/Current-PSC-News.aspx";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
@@ -361,7 +361,7 @@ If a user asks a question that is irrelevant to the DC PSC, politely decline.
 STRICT LINKING & ACCURACY RULES:
 1. ZERO HALLUCINATION: You are strictly FORBIDDEN from guessing, making up, or constructing URLs. Links must be 100% correct, verified, and functional.
 2. PREFER OFFICIAL SOURCES: Base factual claims on the official DC PSC and e-Docket materials provided in the conversation context.
-3. E-DOCKET CASE SEARCH FALLBACK: Always provide the official, case-sensitive link [e-Docket Search](https://edocket.dcpsc.org/Search/CaseSearch). Advise the user to enter the case/docket number directly when needed.
+3. E-DOCKET CASE SEARCH FALLBACK: Always provide the official public e-Docket search link [e-Docket Search](https://edocket.dcpsc.org/public/search). Advise the user to enter the case/docket number directly when needed.
 4. DO NOT manually construct e-Docket detail URLs. If you know a case number, mention it plainly (for example, FC 1167). The server will append verified e-Docket case and filing links from the official e-Docket API.
 5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: If you are not certain about a URL, provide the case number instead of a link.`;
 
@@ -774,7 +774,7 @@ async function startServer() {
 
       if (!process.env.OPENAI_API_KEY) {
         return res.status(200).json({ 
-          reply: `⚠️ **System Integration Notice:** OPENAI_API_KEY is missing. However, you can still access the case resources directly via the [e-Docket Case Search](https://edocket.dcpsc.org/Search/CaseSearch).` 
+          reply: `⚠️ **System Integration Notice:** OPENAI_API_KEY is missing. However, you can still access the case resources directly via the [e-Docket Case Search](https://edocket.dcpsc.org/public/search).`
         });
       }
 
@@ -818,7 +818,7 @@ async function startServer() {
             reply: `⚠️ **API Rate Limit Notice:** The OpenAI service backing this assistant is currently rate-limited.
   
 To ensure you aren’t blocked from critical public records, please access the official databases directly:
-- **Case or Docket Search:** Use [e-Docket Case Search](https://edocket.dcpsc.org/Search/CaseSearch) and type your Formal Case number (such as \`1156\`, \`1167\` or \`1182\`) directly into the Search bar.
+- **Case or Docket Search:** Use [e-Docket Case Search](https://edocket.dcpsc.org/public/search) and type your Formal Case number (such as \`1156\`, \`1167\` or \`1182\`) directly into the Search bar.
 - **Consumer Assistance & Filings:** For complaints, mediation, or inquiries, visit [Utility Consumer Complaints, Mediation, and Inquiries](https://dcpsc.org/Consumers-Corner/Information/Utility-Consumer-Complaints-Mediation-Inquiries.aspx).
 - **Press Releases & Daily Updates:** Read daily statements in the [DC PSC Newsroom](https://dcpsc.org/Newsroom.aspx).
 
