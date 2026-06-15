@@ -1,22 +1,13 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI } from "@google/genai";
-
-// Initialize Gemini on the server side using the secure env variable with recommended telemetry headers
-const ai = new GoogleGenAI({ 
-  apiKey: process.env.GEMINI_API_KEY || "",
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    }
-  }
-});
 
 const DC_PSC_NEWSROOM_URL = "https://dcpsc.org/Newsroom.aspx";
 const EDOCKET_CASE_SEARCH_URL = "https://edocket.dcpsc.org/Search/CaseSearch";
 const DC_PSC_CURRENT_NEWS_URL = "https://dcpsc.org/Newsroom/Current-PSC-News.aspx";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENAI_MODEL = "gpt-4.1";
 
 // Helper utility to normalize and correct any DC PSC & eDocket URLs (e.g. converting lowercase paths to case-sensitive equivalents used by IIS)
 function normalizeUrl(url: string | undefined): string {
@@ -325,6 +316,81 @@ Use [e-Docket Case Search](${EDOCKET_CASE_SEARCH_URL}) and enter \`${resolvedCas
 
   reply += `\n\nAll links above come from the official e-Docket public API.`;
   return reply;
+}
+
+function buildConversationTranscript(history: any[], message: string): string {
+  const priorTurns = history
+    .map((item: any) => `${item.role === "user" ? "User" : "Assistant"}: ${item.content}`)
+    .join("\n\n");
+
+  if (!priorTurns) {
+    return `User: ${message}`;
+  }
+
+  return `${priorTurns}\n\nUser: ${message}`;
+}
+
+function extractOpenAIText(response: any): string {
+  if (typeof response?.output_text === "string" && response.output_text.trim()) {
+    return response.output_text.trim();
+  }
+
+  const messageParts = Array.isArray(response?.output) ? response.output.flatMap((item: any) => {
+    if (item?.type !== "message" || !Array.isArray(item.content)) {
+      return [];
+    }
+
+    return item.content
+      .filter((part: any) => part?.type === "output_text" && typeof part.text === "string")
+      .map((part: any) => part.text);
+  }) : [];
+
+  return messageParts.join("\n").trim();
+}
+
+async function createOpenAIChatResponse(history: any[], message: string) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is missing");
+  }
+
+  const instructions = `You are the DC PSC Docket Assistant. Your goal is to help users find information about old and current dockets, cases, and regulatory filings from the Public Service Commission of the District of Columbia (DC PSC).
+STRICT RULE: Only answer questions related to the DC Public Service Commission (PSC), its dockets, utility regulations, and energy/telecom/water oversight in DC.
+If a user asks a question that is irrelevant to the DC PSC, politely decline.
+
+STRICT LINKING & ACCURACY RULES:
+1. ZERO HALLUCINATION: You are strictly FORBIDDEN from guessing, making up, or constructing URLs. Links must be 100% correct, verified, and functional.
+2. PREFER OFFICIAL SOURCES: Base factual claims on the official DC PSC and e-Docket materials provided in the conversation context.
+3. E-DOCKET CASE SEARCH FALLBACK: Always provide the official, case-sensitive link [e-Docket Search](https://edocket.dcpsc.org/Search/CaseSearch). Advise the user to enter the case/docket number directly when needed.
+4. DO NOT manually construct e-Docket detail URLs. If you know a case number, mention it plainly (for example, FC 1167). The server will append verified e-Docket case and filing links from the official e-Docket API.
+5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: If you are not certain about a URL, provide the case number instead of a link.`;
+
+  const response = await fetch(OPENAI_RESPONSES_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      instructions,
+      input: buildConversationTranscript(history, message),
+      text: {
+        format: {
+          type: "text"
+        }
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const error = new Error(`OpenAI Responses API returned ${response.status}: ${errorText}`);
+    (error as any).status = response.status;
+    throw error;
+  }
+
+  return response.json();
 }
 
 async function buildVerifiedDocketLinks(text: string) {
@@ -703,55 +769,21 @@ async function startServer() {
           return res.status(200).json({ reply: directCaseReply });
         }
       } catch (directCaseError: any) {
-        console.warn("Direct e-Docket case lookup failed, falling back to Gemini:", directCaseError?.message || directCaseError);
+        console.warn("Direct e-Docket case lookup failed, falling back to OpenAI:", directCaseError?.message || directCaseError);
       }
 
-      if (!process.env.GEMINI_API_KEY) {
+      if (!process.env.OPENAI_API_KEY) {
         return res.status(200).json({ 
-          reply: `⚠️ **System Integration Notice:** Gemini API Key is missing. However, you can still access the case resources directly via the [e-Docket Case Search](https://edocket.dcpsc.org/Search/CaseSearch).` 
+          reply: `⚠️ **System Integration Notice:** OPENAI_API_KEY is missing. However, you can still access the case resources directly via the [e-Docket Case Search](https://edocket.dcpsc.org/Search/CaseSearch).` 
         });
       }
 
       try {
-        const chat = ai.chats.create({
-          model: "gemini-3.5-flash",
-          history: history.map((m: any) => ({ 
-            role: m.role === 'user' ? 'user' : 'model', 
-            parts: [{ text: m.content }] 
-          })),
-          config: {
-            systemInstruction: `You are the DC PSC Docket Assistant. Your goal is to help users find information about old and current dockets, cases, and regulatory filings from the Public Service Commission of the District of Columbia (DC PSC). 
-            STRICT RULE: Only answer questions related to the DC Public Service Commission (PSC), its dockets, utility regulations, and energy/telecom/water oversight in DC. 
-            If a user asks a question that is irrelevant to the DC PSC, politely decline.
-            
-            STRICT LINKING & ACCURACY RULES:
-            1. ZERO HALLUCINATION: You are strictly FORBIDDEN from guessing, making up, or constructing URLs. Links must be 100% correct, verified, and functional.
-            2. PREFER DIRECT LINKING TO FILINGS: Instead of just summarizing or quoting case numbers/dates, you MUST locate and provide direct links to the physical filings, commission orders, applications, or PDF records. Search Google specifically for e-Docket filings, using queries with "site:dcpsc.org" or "site:edocket.dcpsc.org" and filetype:pdf. Always present direct hyperlinks so the user doesn't have to search manually.
-            3. E-DOCKET CASE SEARCH FALLBACK: Always provide the official, case-sensitive link [e-Docket Search](https://edocket.dcpsc.org/Search/CaseSearch) (note correct capitalization 'Search' and 'CaseSearch'). Advise the user to enter the case/docket number (e.g., "1156" or "1167") in the "Case Number" field to find more filings.
-            4. DO NOT manually construct e-Docket detail URLs. If you know a case number, mention it plainly (for example, FC 1167). The server will append verified e-Docket case and filing links from the official e-Docket API.
-            5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: Any PDF or document link you include must come directly from search grounding or an official source result. If you are not certain, provide the case number instead of a URL.`,
-            tools: [{ googleSearch: {} }]
-          }
-        });
-
-        const response = await chat.sendMessage({ message });
-        
-        // Parse verified live search URLs from Google Search grounding context
+        const response = await createOpenAIChatResponse(history, message);
         const verifiedUrls: { uri: string; title: string }[] = [];
-        const groundingMetadata = (response as any).candidates?.[0]?.groundingMetadata;
-        if (groundingMetadata?.groundingChunks) {
-          for (const chunk of groundingMetadata.groundingChunks) {
-            if (chunk?.web?.uri) {
-              verifiedUrls.push({
-                uri: chunk.web.uri,
-                title: chunk.web.title || ""
-              });
-            }
-          }
-        }
 
         // Intercept and resolve all links in markdown output
-        let replyText = response.text || "";
+        let replyText = extractOpenAIText(response);
         replyText = await postProcessChatReply(replyText, verifiedUrls);
         const verifiedDocketLinks = await buildVerifiedDocketLinks(`${message}\n${replyText}`);
 
@@ -774,20 +806,20 @@ async function startServer() {
         }
 
         res.json({ reply: replyText });
-      } catch (geminiError: any) {
-        console.error("Gemini model execution error in chat route:", geminiError);
+      } catch (openaiError: any) {
+        console.error("OpenAI model execution error in chat route:", openaiError);
         
         // Formulate a beautiful, highly informative response based directly on the error context
-        const isQuotaExceeded = geminiError?.message?.includes("quota") || geminiError?.status === "RESOURCE_EXHAUSTED" || geminiError?.code === 429;
+        const isQuotaExceeded = openaiError?.message?.includes("quota") || openaiError?.status === 429 || openaiError?.code === 429;
         
         if (isQuotaExceeded) {
-          console.warn("[Chat Route] Gemini API quota exceeded.");
+          console.warn("[Chat Route] OpenAI API quota exceeded.");
           res.json({
-            reply: `⚠️ **API Rate Limit Notice:** The Public Service Commission search engine is currently experiencing heavy load. 
+            reply: `⚠️ **API Rate Limit Notice:** The OpenAI service backing this assistant is currently rate-limited.
   
 To ensure you aren’t blocked from critical public records, please access the official databases directly:
 - **Case or Docket Search:** Use [e-Docket Case Search](https://edocket.dcpsc.org/Search/CaseSearch) and type your Formal Case number (such as \`1156\`, \`1167\` or \`1182\`) directly into the Search bar.
-- **Consumer Assistance & Filings:** For complaints or public comments, visit [DC PSC Consumer Connection](https://dcpsc.org/Consumers.aspx).
+- **Consumer Assistance & Filings:** For complaints, mediation, or inquiries, visit [Utility Consumer Complaints, Mediation, and Inquiries](https://dcpsc.org/Consumers-Corner/Information/Utility-Consumer-Complaints-Mediation-Inquiries.aspx).
 - **Press Releases & Daily Updates:** Read daily statements in the [DC PSC Newsroom](https://dcpsc.org/Newsroom.aspx).
 
 Please try your chat query again in a moment once the quota resets!`
