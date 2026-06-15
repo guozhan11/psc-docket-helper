@@ -13,6 +13,11 @@ const ai = new GoogleGenAI({
   }
 });
 
+const DC_PSC_NEWSROOM_URL = "https://dcpsc.org/Newsroom.aspx";
+const EDOCKET_CASE_SEARCH_URL = "https://edocket.dcpsc.org/Search/CaseSearch";
+const DC_PSC_CURRENT_NEWS_URL = "https://dcpsc.org/Newsroom/Current-PSC-News.aspx";
+const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
+
 // Helper utility to normalize and correct any DC PSC & eDocket URLs (e.g. converting lowercase paths to case-sensitive equivalents used by IIS)
 function normalizeUrl(url: string | undefined): string {
   if (!url) return '';
@@ -38,6 +43,299 @@ function normalizeUrl(url: string | undefined): string {
   }
 
   return normalized;
+}
+
+function isOfficialPscUrl(urlStr: string): boolean {
+  try {
+    const hostname = new URL(urlStr).hostname.toLowerCase();
+    return hostname === "dcpsc.org" || hostname.endsWith(".dcpsc.org");
+  } catch {
+    return false;
+  }
+}
+
+function isKnownStablePscUrl(urlStr: string): boolean {
+  const normalized = normalizeUrl(urlStr);
+  return normalized === DC_PSC_NEWSROOM_URL
+    || normalized === DC_PSC_CURRENT_NEWS_URL
+    || normalized === EDOCKET_CASE_SEARCH_URL;
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripHtml(value: string): string {
+  return decodeHtmlEntities(value.replace(/<[^>]*>/g, " "));
+}
+
+function toPscAbsoluteUrl(href: string): string {
+  return new URL(decodeHtmlEntities(href), "https://dcpsc.org").href;
+}
+
+function parseOfficialNews(html: string) {
+  const items: any[] = [];
+  const blocks = html.split('<div class="blog-list style-1">').slice(1);
+
+  for (const block of blocks) {
+    const anchorMatch = block.match(/<h2>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>/i);
+    if (!anchorMatch) {
+      continue;
+    }
+
+    const url = toPscAbsoluteUrl(anchorMatch[1]);
+    if (!isOfficialPscUrl(url)) {
+      continue;
+    }
+
+    const title = stripHtml(anchorMatch[2]);
+    const summaryMatch = block.match(/<p>([\s\S]*?)<\/p>/i);
+    const dateMatch = block.match(/fa-calendar-o[\s\S]*?<\/i>\s*([^<\n]+)/i);
+    const summary = summaryMatch ? stripHtml(summaryMatch[1]) : title;
+    const date = dateMatch ? decodeHtmlEntities(dateMatch[1]) : "Latest update";
+
+    if (title && url) {
+      items.push({
+        title,
+        date,
+        summary,
+        url,
+        source: "DCPSC Current PSC News"
+      });
+    }
+  }
+
+  return items;
+}
+
+function extractCaseNumbers(text: string): string[] {
+  const candidates = new Set<string>();
+  const patterns = [
+    /\bFC\s*[-#:]?\s*(\d{3,5})\b/gi,
+    /\bFormal\s+Case\s+(?:No\.?|Number)?\s*[-#:]?\s*(\d{3,5})\b/gi,
+    /\bcaseNumber=(\d{3,5})\b/gi,
+    /\bcase\s+(?:no\.?|number)?\s*[-#:]?\s*(\d{3,5})\b/gi,
+    /\bdocket\s+(?:no\.?|number)?\s*[-#:]?\s*(\d{3,5})\b/gi
+  ];
+
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      candidates.add(match[1]);
+    }
+  }
+
+  return Array.from(candidates);
+}
+
+async function fetchEdocketJson(endpoint: string, params: Record<string, string | number | boolean>) {
+  const url = new URL(endpoint, EDOCKET_API_URL);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, String(value));
+  }
+
+  const response = await fetch(url.href, {
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible; PSC-Docket-Helper/1.0; +https://dcpsc.org/)"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`e-Docket API returned ${response.status} for ${endpoint}`);
+  }
+
+  return response.json();
+}
+
+async function getOfficialCasesByNumber(caseNumber: string): Promise<any[]> {
+  const data = await fetchEdocketJson("Case/GetCaseTable", {
+    caseNumber,
+    recordsToSkip: 0,
+    recordsToShow: 25,
+    orderByColumn: "DateOpen",
+    sortBy: "DESC",
+    isPublicComments: "N",
+    isUser: false
+  });
+
+  return Array.isArray(data?.resultsSet) ? data.resultsSet : [];
+}
+
+async function isRealEdocketCaseNumber(caseNumber: string): Promise<boolean> {
+  const cases = await getOfficialCasesByNumber(caseNumber);
+  return cases.length > 0;
+}
+
+function getEdocketCaseSearchUrl(caseNumber: string): string {
+  return `https://edocket.dcpsc.org/public/search/casenumber/${encodeURIComponent(caseNumber)}`;
+}
+
+function getEdocketFilingDetailUrl(filing: any): string | null {
+  if (!filing?.docketNumber || filing.isConfidential || filing.isArchived) {
+    return null;
+  }
+
+  const primaryDocket = String(filing.docketNumber).split(", ")[0];
+  const parts = primaryDocket.split(" - ").map(part => part.trim()).filter(Boolean);
+  if (parts.length < 2) {
+    return null;
+  }
+
+  return `https://edocket.dcpsc.org/public/search/details/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[parts.length - 1])}`;
+}
+
+function getEdocketAttachmentUrl(filing: any): string | null {
+  if (!filing?.attachmentId || !filing?.attachment || filing.isConfidential || filing.isArchived) {
+    return null;
+  }
+
+  const attachment = String(filing.attachment);
+  if (!attachment.toLowerCase().endsWith(".pdf")) {
+    return null;
+  }
+
+  const params = new URLSearchParams({
+    attachId: String(filing.attachmentId),
+    guidFileName: attachment
+  });
+  return `${EDOCKET_API_URL}Filing/download?${params.toString()}`;
+}
+
+async function getOfficialFilingsByCaseNumber(caseNumber: string): Promise<any[]> {
+  const data = await fetchEdocketJson("Filing/GetFilings", {
+    caseNumber,
+    isAdmin: false,
+    orderByColumn: "receivedDate",
+    sortBy: "desc",
+    recordsToSkip: 0,
+    recordsToShow: 25
+  });
+
+  return Array.isArray(data?.resultsSet) ? data.resultsSet : [];
+}
+
+async function buildVerifiedDocketLinks(text: string) {
+  const caseNumbers = extractCaseNumbers(text);
+  const verified: { label: string; url: string }[] = [];
+
+  for (const caseNumber of caseNumbers) {
+    try {
+      const cases = await getOfficialCasesByNumber(caseNumber);
+      if (cases.length === 0) {
+        continue;
+      }
+
+      const formalCase = cases.find(item => String(item.caseNumber || "").toUpperCase() === `FC${caseNumber}`);
+      const caseRecord = formalCase || cases[0];
+      const caseLabel = `${caseRecord.caseNumber || `Case ${caseNumber}`} - ${stripHtml(caseRecord.caseCaption || caseRecord.companyIndividual || "e-Docket case records")}`;
+      verified.push({
+        label: caseLabel,
+        url: getEdocketCaseSearchUrl(caseNumber)
+      });
+
+      const filings = await getOfficialFilingsByCaseNumber(caseNumber);
+      for (const filing of filings) {
+        const detailUrl = getEdocketFilingDetailUrl(filing);
+        if (detailUrl) {
+          verified.push({
+            label: `${filing.docketNumber} - ${stripHtml(filing.filingType || filing.description || "Filing detail")}`,
+            url: detailUrl
+          });
+        }
+
+        const attachmentUrl = getEdocketAttachmentUrl(filing);
+        if (attachmentUrl) {
+          verified.push({
+            label: `${filing.docketNumber} - ${filing.attachmentFileName || "Filing PDF"}`,
+            url: attachmentUrl
+          });
+        }
+      }
+    } catch (error: any) {
+      console.warn(`[e-Docket] Could not verify case ${caseNumber}:`, error?.message || error);
+    }
+  }
+
+  const seen = new Set<string>();
+  return verified.filter(item => {
+    if (seen.has(item.url)) {
+      return false;
+    }
+    seen.add(item.url);
+    return true;
+  }).slice(0, 8);
+}
+
+async function verifyEdocketUrl(urlStr: string): Promise<{ isValid: boolean; normalized: string; repairUrl?: string }> {
+  const normalized = normalizeUrl(urlStr);
+
+  try {
+    const url = new URL(normalized);
+    const caseDetailNumber = url.pathname.toLowerCase() === "/search/casedetail"
+      ? url.searchParams.get("caseNumber")
+      : null;
+    const publicCaseSearchMatch = url.pathname.match(/^\/public\/search\/casenumber\/(\d{3,5})\/?$/i);
+
+    const caseNumber = caseDetailNumber || publicCaseSearchMatch?.[1];
+    if (caseNumber) {
+      const isReal = await isRealEdocketCaseNumber(caseNumber);
+      return {
+        isValid: isReal,
+        normalized: isReal ? getEdocketCaseSearchUrl(caseNumber) : normalized,
+        repairUrl: EDOCKET_CASE_SEARCH_URL
+      };
+    }
+
+    const detailMatch = url.pathname.match(/^\/public\/search\/details\/([^/]+)\/([^/]+)\/?$/i);
+    if (detailMatch) {
+      const docketPrefix = decodeURIComponent(detailMatch[1]);
+      const itemNumber = decodeURIComponent(detailMatch[2]);
+      const numberMatch = docketPrefix.match(/(\d{3,5})$/);
+      if (!numberMatch) {
+        return { isValid: false, normalized, repairUrl: EDOCKET_CASE_SEARCH_URL };
+      }
+
+      const filings = await getOfficialFilingsByCaseNumber(numberMatch[1]);
+      const isReal = filings.some(filing => {
+        const detailUrl = getEdocketFilingDetailUrl(filing);
+        return detailUrl === `https://edocket.dcpsc.org/public/search/details/${encodeURIComponent(docketPrefix)}/${encodeURIComponent(itemNumber)}`;
+      });
+
+      return {
+        isValid: isReal,
+        normalized,
+        repairUrl: isReal ? undefined : getEdocketCaseSearchUrl(numberMatch[1])
+      };
+    }
+
+    if (url.pathname.toLowerCase() === "/apis/api/filing/download") {
+      const attachId = url.searchParams.get("attachId");
+      const guidFileName = url.searchParams.get("guidFileName");
+      const isReal = !!attachId && !!guidFileName && /^[\w.-]+\.pdf$/i.test(guidFileName);
+      return {
+        isValid: isReal,
+        normalized,
+        repairUrl: EDOCKET_CASE_SEARCH_URL
+      };
+    }
+
+    if (normalized === EDOCKET_CASE_SEARCH_URL) {
+      return { isValid: true, normalized };
+    }
+  } catch {
+    return { isValid: false, normalized, repairUrl: EDOCKET_CASE_SEARCH_URL };
+  }
+
+  return { isValid: false, normalized, repairUrl: EDOCKET_CASE_SEARCH_URL };
 }
 
 // Check if a URL is active on the internet using quick HEAD/GET fetch
@@ -128,9 +426,8 @@ async function postProcessChatReply(
 
     const normalized = normalizeUrl(urlToVerify);
 
-    // Direct bypass for official DC PSC / eDocket domains to prevent false-negative active-probe blocks
-    if (normalized.includes('dcpsc.org') || normalized.includes('edocket.dcpsc.org')) {
-      urlStatusMap.set(rawUrl, { isValid: true, normalized });
+    if (normalized.includes('edocket.dcpsc.org')) {
+      urlStatusMap.set(rawUrl, await verifyEdocketUrl(normalized));
       return;
     }
 
@@ -169,9 +466,9 @@ async function postProcessChatReply(
         repairUrl = normalizeUrl(matchedVerified.uri);
       } else {
         if (normalized.includes('edocket.dcpsc.org')) {
-          repairUrl = 'https://edocket.dcpsc.org/Search/CaseSearch';
+          repairUrl = EDOCKET_CASE_SEARCH_URL;
         } else {
-          repairUrl = 'https://dcpsc.org/Newsroom.aspx';
+          repairUrl = DC_PSC_NEWSROOM_URL;
         }
       }
 
@@ -198,8 +495,6 @@ async function postProcessChatReply(
 let cachedNews: any[] | null = null;
 let lastNewsFetchTime = 0;
 const CACHE_TTL = 30 * 60 * 1000; // 30 minutes cache duration
-let apiCoolOffUntil = 0; // Epoch timestamp in ms
-const COOL_OFF_DURATION = 15 * 60 * 1000; // 15 minutes of quiet time on 429 error
 
 async function startServer() {
   const app = express();
@@ -215,147 +510,73 @@ async function startServer() {
 
   // API Route: Retrieve latest news/announcements securely
   app.get("/api/news", async (req, res) => {
-    // Highly polished fallback news data to keep utility active even during upstream API quota issues
+    // Real official DCPSC links captured from Current PSC News, used only if the source page is temporarily unavailable.
     const fallbackNews = [
       {
-        title: "DC Public Service Commission Approves Triennial Review of Pepco's Capital Grid Project",
-        date: "May 14, 2026",
-        summary: "The Commission released a comprehensive update approving ongoing monitoring protocols and phase reviews for Pepco's long-term system reliability sub-stations.",
-        url: "https://edocket.dcpsc.org/Search/CaseDetail?caseNumber=1139"
+        title: "Open Commission Meeting - Friday, June 12, 2026, at 12:00 P.M.",
+        date: "June 10, 2026",
+        summary: "Open Commission Meeting - Friday, June 12, 2026, at 12:00 P.M.",
+        url: "https://dcpsc.org/CMSPages/GetFile.aspx?guid=3d831595-442e-4df0-9989-aafdf4d24c01",
+        source: "DCPSC Current PSC News"
       },
       {
-        title: "DC PSC Establishes Formal Proceeding to Investigate Virtual Power Plant (VPP) Integration",
-        date: "April 28, 2026",
-        summary: "In line with D.C.'s clean energy goals, the Commission has created a new formal case to study the framework for aggregated distributed energy resources (VPPs) acting on the grid.",
-        url: "https://edocket.dcpsc.org/Search/CaseDetail?caseNumber=1130"
+        title: "GDCS-2026-01-M-2 - Supplemental Public Notice of Cybersecurity Briefing",
+        date: "June 03, 2026",
+        summary: "GDCS-2026-01-M-2 - Supplemental Public Notice of Cybersecurity Briefing",
+        url: "https://dcpsc.org/CMSPages/GetFile.aspx?guid=5f38bc22-2f81-4e7b-b455-58f7435ac5fe",
+        source: "DCPSC Current PSC News"
       },
       {
-        title: "Commission Announces Public Hearings on Proposed Gas System Upgrades and Project Pipes Phase 3",
-        date: "March 11, 2026",
-        summary: "The PSC invites public comments and announced schedules for community townhalls regarding safety and emissions updates for Washington Gas infrastructure under Formal Case 1182.",
-        url: "https://edocket.dcpsc.org/Search/CaseDetail?caseNumber=1182"
+        title: "Open Commission Meeting - Wednesday, June 3, 2026, at 11:00 A.M.",
+        date: "June 01, 2026",
+        summary: "Open Commission Meeting - Wednesday, June 3, 2026, at 11:00 A.M.",
+        url: "https://dcpsc.org/CMSPages/GetFile.aspx?guid=30902a58-0f69-466d-a91b-0bbd71896529",
+        source: "DCPSC Current PSC News"
       },
       {
-        title: "PSC Receives National Recognition for Grid Modernization and Community Solar Programs",
-        date: "February 18, 2026",
-        summary: "DC Public Service Commission was lauded for its community solar subscription model and progress under Formal Case 1130 and Formal Case 1167.",
-        url: "https://edocket.dcpsc.org/Search/CaseDetail?caseNumber=1167"
+        title: "FC1017, FC1183 and FC1186 - Supplemental Notice of Legislative-Style (Informational) Hearing for Wednesday, June 3, 2026, at 11:00 A.M.",
+        date: "May 27, 2026",
+        summary: "FC1017, FC1183 and FC1186 - Supplemental Notice of Legislative-Style (Informational) Hearing for Wednesday, June 3, 2026, at 11:00 A.M.",
+        url: "https://dcpsc.org/CMSPages/GetFile.aspx?guid=9f79863e-aed8-4ab8-a2ce-7dfed1314cf7",
+        source: "DCPSC Current PSC News"
+      },
+      {
+        title: "FC1125-2026-T-729 - Public Notice of Department of Energy and Environment FY2026 Second Quarter UDP Invoices",
+        date: "May 26, 2026",
+        summary: "FC1125-2026-T-729 - Public Notice of Department of Energy and Environment FY2026 Second Quarter UDP Invoices",
+        url: "https://dcpsc.org/CMSPages/GetFile.aspx?guid=53fa619c-7d92-4cf6-9bfc-cd82c0581862",
+        source: "DCPSC Current PSC News"
       }
     ];
 
     const now = Date.now();
-
-    // 1. If we are in the middle of a cool-off period because of a previous 429 quota error, immediately bypass to avoid redundant API errors
-    if (now < apiCoolOffUntil) {
-      console.log("[News Route] API in rate-limiting cool-off. Serving fallback or cached news instantly.");
-      if (cachedNews && cachedNews.length > 0) {
-        return res.json(cachedNews);
-      }
-      return res.json(fallbackNews);
-    }
-
-    // 2. Serve cached news if it hasn't expired and exists
     if (cachedNews && (now - lastNewsFetchTime < CACHE_TTL)) {
-      console.log("[News Route] Serving fresh cached news.");
+      console.log("[News Route] Serving cached official DCPSC news.");
       return res.json(cachedNews);
     }
 
     try {
-      if (!process.env.GEMINI_API_KEY) {
-        console.warn("GEMINI_API_KEY environment variable is not defined, using news fallback");
-        return res.json(fallbackNews);
-      }
-
-      // We use gemini-3.5-flash since it's the recommended, non-deprecated model.
-      // We also do not specify responseMimeType: "application/json" because Google Search tools
-      // are mutually exclusive with responseMimeType in the current API. Instead, we instruct the model
-      // to yield a markdown code block and parse it on the server.
-      const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: `Find the 4-5 most recent news updates, press releases, or announcements from the official Public Service Commission of the District of Columbia (DC PSC) website (dcpsc.org). 
-        For each item, provide:
-        1. Title
-        2. Date (e.g., "April 15, 2024")
-        3. A brief 2-3 sentence summary.
-        4. The EXACT, DIRECT URL to the specific news article page on dcpsc.org. 
-        
-        STRICT ACCURACY RULES:
-        - ZERO HALLUCINATION: You are FORBIDDEN from guessing or constructing URLs. 
-        - VERIFIED LINKS ONLY: Every URL provided must be a real, verified link to a specific article on dcpsc.org.
-        - FALLBACK: If a direct article link is not available, use "https://dcpsc.org/Newsroom.aspx" as the fallback. Never make up a link.
-        
-        You MUST respond ONLY with a valid JSON array of objects conforming to this schema, wrapped in a markdown code block starting with \`\`\`json and ending with \`\`\`. Do not include any other text output outside of the json code block.
-        
-        JSON schema details:
-        [
-          {
-            "title": "the title",
-            "date": "the date of release",
-            "summary": "the summary explanation",
-            "url": "the direct link"
-          }
-        ]`,
-        config: {
-          tools: [{ googleSearch: {} }]
+      const response = await fetch(DC_PSC_CURRENT_NEWS_URL, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; PSC-Docket-Helper/1.0; +https://dcpsc.org/)"
         }
       });
 
-      const rawText = response.text || "";
-      let jsonStr = rawText.trim();
-      
-      // Extract the JSON block from the markdown block robustly
-      const jsonBlockRegex = /```json\s*([\s\S]*?)\s*```/i;
-      const match = rawText.match(jsonBlockRegex);
-      if (match) {
-        jsonStr = match[1];
-      } else {
-        const startIdx = rawText.indexOf("[");
-        const endIdx = rawText.lastIndexOf("]");
-        if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-          jsonStr = rawText.substring(startIdx, endIdx + 1);
-        }
+      if (!response.ok) {
+        throw new Error(`DCPSC Current News returned ${response.status}`);
       }
 
-      const newsList = JSON.parse(jsonStr.trim() || "[]");
-      const listToVerify = Array.isArray(newsList) ? newsList : [];
+      const html = await response.text();
+      const officialNews = parseOfficialNews(html).slice(0, 5);
+      if (officialNews.length === 0) {
+        throw new Error("No official DCPSC news items found");
+      }
 
-      // Validate all returned news links structurally first to prevent server-side bot blocks
-      const verifiedNewsList = await Promise.all(listToVerify.map(async (item: any) => {
-        const itemUrl = item.url || "";
-        const normalized = normalizeUrl(itemUrl);
-        if (!normalized) {
-          return { ...item, url: "https://dcpsc.org/Newsroom.aspx" };
-        }
-
-        // If it's a structurally valid DC PSC or eDocket link, we can trust it.
-        // Doing strict live fetching on government domains from a cloud container almost always
-        // results in timeout or block, turning a perfectly valid searched URL into the newsroom fallback.
-        const lowerUrl = normalized.toLowerCase();
-        if (lowerUrl.includes("dcpsc.org") || lowerUrl.includes("edocket.dcpsc.org")) {
-          return { ...item, url: normalized };
-        }
-
-        // For external domains (e.g., utility blogs, press portals), check if they are live
-        const isLive = await checkUrlLive(normalized);
-        return {
-          ...item,
-          url: isLive ? normalized : "https://dcpsc.org/Newsroom.aspx"
-        };
-      }));
-
-      cachedNews = verifiedNewsList;
+      cachedNews = officialNews;
       lastNewsFetchTime = Date.now();
-      res.json(verifiedNewsList);
+      res.json(officialNews);
     } catch (error: any) {
-      const isQuotaExceeded = error?.message?.includes("quota") || error?.status === "RESOURCE_EXHAUSTED" || error?.code === 429;
-      if (isQuotaExceeded) {
-        apiCoolOffUntil = Date.now() + COOL_OFF_DURATION;
-        console.warn(`[News Route] Gemini API Quota exceeded. Activating ${COOL_OFF_DURATION / 60000} mins news route cooling off.`);
-      } else {
-        console.warn("Failing over to offline fallback updates due to Gemini API rate limits or quota:", error?.message || error);
-      }
-      
-      // Return high quality cached or fallback updates instantly so the user experience doesn't break
+      console.warn("Failing over to bundled official DCPSC news links:", error?.message || error);
       if (cachedNews && cachedNews.length > 0) {
         res.json(cachedNews);
       } else {
@@ -394,8 +615,8 @@ async function startServer() {
             1. ZERO HALLUCINATION: You are strictly FORBIDDEN from guessing, making up, or constructing URLs. Links must be 100% correct, verified, and functional.
             2. PREFER DIRECT LINKING TO FILINGS: Instead of just summarizing or quoting case numbers/dates, you MUST locate and provide direct links to the physical filings, commission orders, applications, or PDF records. Search Google specifically for e-Docket filings, using queries with "site:dcpsc.org" or "site:edocket.dcpsc.org" and filetype:pdf. Always present direct hyperlinks so the user doesn't have to search manually.
             3. E-DOCKET CASE SEARCH FALLBACK: Always provide the official, case-sensitive link [e-Docket Search](https://edocket.dcpsc.org/Search/CaseSearch) (note correct capitalization 'Search' and 'CaseSearch'). Advise the user to enter the case/docket number (e.g., "1156" or "1167") in the "Case Number" field to find more filings.
-            4. CASE-SENSITIVE PATHS: Paths are strictly case-sensitive. Always write e-Docket Search as "https://edocket.dcpsc.org/Search/CaseSearch" and Case Detail as "https://edocket.dcpsc.org/Search/CaseDetail?caseNumber=...". DO NOT use lowercase "search/casesearch" or "search/casedetail" as Microsoft IIS yields a 404.
-            5. FORMAT ALL LINKS IN MARKDOWN: Format your verified links elegantly in Markdown, e.g., [FC 1156 - Formal Case Docket Details](URL) or [FC 1167 - Commission Order 20734 (PDF)](URL). Any PDF or document link must be verified in your search results.`,
+            4. DO NOT manually construct e-Docket detail URLs. If you know a case number, mention it plainly (for example, FC 1167). The server will append verified e-Docket case and filing links from the official e-Docket API.
+            5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: Any PDF or document link you include must come directly from search grounding or an official source result. If you are not certain, provide the case number instead of a URL.`,
             tools: [{ googleSearch: {} }]
           }
         });
@@ -419,18 +640,24 @@ async function startServer() {
         // Intercept and resolve all links in markdown output
         let replyText = response.text || "";
         replyText = await postProcessChatReply(replyText, verifiedUrls);
+        const verifiedDocketLinks = await buildVerifiedDocketLinks(`${message}\n${replyText}`);
 
         // Append clean, official verifiably source links as footnotes for supreme trust
         if (verifiedUrls.length > 0) {
           const uniqueVerified = Array.from(new Set(verifiedUrls.map(v => normalizeUrl(v.uri))))
             .map(uri => verifiedUrls.find(v => normalizeUrl(v.uri) === uri)!)
-            .filter(v => v.uri.includes('dcpsc.org'))
+            .filter(v => isOfficialPscUrl(v.uri) && !normalizeUrl(v.uri).includes("edocket.dcpsc.org"))
             .slice(0, 3);
 
           if (uniqueVerified.length > 0) {
             replyText += `\n\n---\n🌐 **Official Verifiable Sources Found:**\n` + 
               uniqueVerified.map(uv => `- [${uv.title || "Public Service Commission Live Record"}](${normalizeUrl(uv.uri)})`).join("\n");
           }
+        }
+
+        if (verifiedDocketLinks.length > 0) {
+          replyText += `\n\n---\n**Verified e-Docket Records:**\n` +
+            verifiedDocketLinks.map(link => `- [${link.label}](${link.url})`).join("\n");
         }
 
         res.json({ reply: replyText });
@@ -441,8 +668,7 @@ async function startServer() {
         const isQuotaExceeded = geminiError?.message?.includes("quota") || geminiError?.status === "RESOURCE_EXHAUSTED" || geminiError?.code === 429;
         
         if (isQuotaExceeded) {
-          apiCoolOffUntil = Date.now() + COOL_OFF_DURATION; // Set cooling off immediately
-          console.warn(`[Chat Route] Gemini API Quota exceeded. Activating api cooling off for ${COOL_OFF_DURATION / 60000} mins.`);
+          console.warn("[Chat Route] Gemini API quota exceeded.");
           res.json({
             reply: `⚠️ **API Rate Limit Notice:** The Public Service Commission search engine is currently experiencing heavy load. 
   
@@ -457,7 +683,7 @@ Please try your chat query again in a moment once the quota resets!`
           res.json({
             reply: `⚠️ **Service Access Intermission:** Under pressure, our direct connection with the DC PSC servers momentarily reset. 
 
-For instant dockets, enter your formal case or docket number manually in the main [e-Docket Case Search](https://edocket.dcpsc.org/Search/CaseSearch) database, or read updates at the [DC PSC Newsroom](https://dcpsc.org/Newsroom.aspx).`
+For instant dockets, enter your formal case or docket number manually in the main [e-Docket Case Search](${EDOCKET_CASE_SEARCH_URL}) database, or read updates at the [DC PSC Newsroom](${DC_PSC_NEWSROOM_URL}).`
           });
         }
       }
@@ -480,9 +706,28 @@ For instant dockets, enter your formal case or docket number manually in the mai
         return res.json({ valid: false, reason: "Invalid protocol" });
       }
 
-      // Direct bypass for official DC PSC / eDocket domains to avoid false-negative bot-blocks or timeouts
-      if (url.href.includes('dcpsc.org') || url.href.includes('edocket.dcpsc.org')) {
+      const normalizedUrl = normalizeUrl(url.href);
+
+      if (isKnownStablePscUrl(normalizedUrl)) {
         return res.json({ valid: true, status: 200 });
+      }
+
+      if (normalizedUrl.includes("edocket.dcpsc.org")) {
+        const result = await verifyEdocketUrl(normalizedUrl);
+        return res.json({
+          valid: result.isValid,
+          status: result.isValid ? 200 : 404,
+          fallbackUrl: result.repairUrl || EDOCKET_CASE_SEARCH_URL
+        });
+      }
+
+      if (isOfficialPscUrl(normalizedUrl)) {
+        const isLive = await checkUrlLive(normalizedUrl);
+        return res.json({
+          valid: isLive,
+          status: isLive ? 200 : 404,
+          fallbackUrl: DC_PSC_NEWSROOM_URL
+        });
       }
 
       // 1. Establish short AbortController for first quick HEAD request attempt

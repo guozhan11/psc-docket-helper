@@ -36,9 +36,10 @@ interface VerifiedLinkProps {
   href: string;
   children: React.ReactNode;
   className?: string;
+  fallbackHref?: string;
 }
 
-export default function VerifiedLink({ href, children, className }: VerifiedLinkProps) {
+export default function VerifiedLink({ href, children, className, fallbackHref = 'https://edocket.dcpsc.org/Search/CaseSearch' }: VerifiedLinkProps) {
   const normalized = normalizeUrl(href || '');
   
   const [status, setStatus] = useState(() => {
@@ -58,20 +59,6 @@ export default function VerifiedLink({ href, children, className }: VerifiedLink
     const checkLink = async () => {
       setStatus({ valid: true, checked: false, checking: true });
       verifiedLinksCache.set(normalized, { valid: true, checked: false, checking: true });
-
-      // Direct bypass for official DC PSC / eDocket domains to prevent false-negative fallback replacements
-      if (normalized.includes('dcpsc.org') || normalized.includes('edocket.dcpsc.org')) {
-        const result = {
-          valid: true,
-          checked: true,
-          checking: false
-        };
-        if (isMounted) {
-          setStatus(result);
-        }
-        verifiedLinksCache.set(normalized, result);
-        return;
-      }
 
       try {
         const response = await fetch(`/api/verify-link?url=${encodeURIComponent(normalized)}`);
@@ -110,7 +97,7 @@ export default function VerifiedLink({ href, children, className }: VerifiedLink
 
   // If the link is verified as broken, fallback to eDocket Case Search
   const finalHref = status.checked && !status.valid 
-    ? 'https://edocket.dcpsc.org/Search/CaseSearch' 
+    ? fallbackHref
     : normalized;
 
   return (

@@ -5,7 +5,6 @@ import {
   Send, 
   Newspaper, 
   MessageSquare, 
-  ExternalLink, 
   ChevronRight, 
   Loader2, 
   Scale, 
@@ -368,14 +367,13 @@ export default function App() {
                     <p className="text-slate-600 mb-8 flex-grow line-clamp-4 leading-relaxed">
                       {item.summary}
                     </p>
-                    <a 
-                      href={normalizeUrl(item.url)} 
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-2 text-psc-blue font-bold text-sm hover:gap-3 transition-all"
+                    <VerifiedLink
+                      href={normalizeUrl(item.url)}
+                      fallbackHref="https://dcpsc.org/Newsroom.aspx"
+                      className="inline-flex items-center gap-2 text-psc-blue font-bold text-sm no-underline hover:gap-3 transition-all"
                     >
-                      Read Full Update <ExternalLink className="w-4 h-4" />
-                    </a>
+                      Read Full Update
+                    </VerifiedLink>
                   </motion.div>
                 ))}
               </div>
