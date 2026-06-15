@@ -330,6 +330,160 @@ function buildConversationTranscript(history: any[], message: string): string {
   return `${priorTurns}\n\nUser: ${message}`;
 }
 
+function isShortQuery(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  const wordCount = trimmed.split(/\s+/).filter(Boolean).length;
+  return wordCount <= 4 || trimmed.length <= 32;
+}
+
+function isRelevantToDcPsc(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (isSimpleCaseNumberQuery(text) || extractCaseNumbers(text).length > 0) {
+    return true;
+  }
+
+  return [
+    "psc",
+    "public service commission",
+    "docket",
+    "formal case",
+    "rate case",
+    "pepco",
+    "washington gas",
+    "dc water",
+    "utility",
+    "utilities",
+    "energy",
+    "renewable",
+    "solar",
+    "electric",
+    "electricity",
+    "gas",
+    "telecom",
+    "water",
+    "complaint",
+    "consumer",
+    "hearing",
+    "grid"
+  ].some(keyword => normalized.includes(keyword));
+}
+
+function getShortQueryKeywords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .map(part => part.trim())
+    .filter(part => part.length >= 3);
+}
+
+async function getOfficialCurrentNewsItems(limit = 5) {
+  const now = Date.now();
+  if (cachedNews && (now - lastNewsFetchTime < CACHE_TTL)) {
+    return cachedNews.slice(0, limit);
+  }
+
+  try {
+    const response = await fetch(DC_PSC_CURRENT_NEWS_URL, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; PSC-Docket-Helper/1.0; +https://dcpsc.org/)"
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`DCPSC Current News returned ${response.status}`);
+    }
+
+    const html = await response.text();
+    const officialNews = parseOfficialNews(html);
+    if (officialNews.length > 0) {
+      cachedNews = officialNews;
+      lastNewsFetchTime = Date.now();
+      return officialNews.slice(0, limit);
+    }
+  } catch (error: any) {
+    console.warn("Unable to fetch official current news for short-query context:", error?.message || error);
+  }
+
+  return (cachedNews || []).slice(0, limit);
+}
+
+async function buildShortQueryOfficialContext(message: string): Promise<{ context: string; verifiedUrls: { uri: string; title: string }[] }> {
+  if (!isShortQuery(message) || !isRelevantToDcPsc(message)) {
+    return { context: "", verifiedUrls: [] };
+  }
+
+  const keywords = getShortQueryKeywords(message);
+  const verifiedUrls: { uri: string; title: string }[] = [
+    { uri: EDOCKET_CASE_SEARCH_URL, title: "e-Docket Case Search" },
+    { uri: DC_PSC_NEWSROOM_URL, title: "DC PSC Newsroom" },
+    {
+      uri: "https://dcpsc.org/Consumers-Corner/Information/Utility-Consumer-Complaints-Mediation-Inquiries.aspx",
+      title: "Utility Consumer Complaints, Mediation, and Inquiries"
+    }
+  ];
+
+  const currentNews = await getOfficialCurrentNewsItems(6);
+  const matchedNews = currentNews.filter(item => {
+    const haystack = `${item.title} ${item.summary}`.toLowerCase();
+    return keywords.some(keyword => haystack.includes(keyword));
+  }).slice(0, 3);
+
+  for (const item of matchedNews) {
+    verifiedUrls.push({ uri: item.url, title: item.title });
+  }
+
+  const utilityHints = [
+    {
+      test: /(pepco|potomac electric)/i,
+      text: `Utility hint: Pepco refers to Potomac Electric Power Company. Prioritize electric distribution, reliability, multiyear rate plan, grid modernization, and climate/clean-energy compliance context when relevant.`
+    },
+    {
+      test: /(washington gas|wgl)/i,
+      text: `Utility hint: Washington Gas matters usually connect to gas system upgrades, pipeline safety, emissions, rate design, and public hearings.`
+    },
+    {
+      test: /(dc water|water)/i,
+      text: `Utility hint: Water-related questions may overlap with DC Water proceedings, infrastructure, and utility oversight records.`
+    },
+    {
+      test: /(renewable|solar|clean energy|climate)/i,
+      text: `Topic hint: Renewable-energy questions often connect to clean-energy goals, distributed energy resources, virtual power plants, interconnection, and climate commitments.`
+    },
+    {
+      test: /(rate|rates)/i,
+      text: `Topic hint: Rate questions should mention how to identify the relevant formal case, current status, recent filings, hearings, and where to monitor official updates.`
+    }
+  ].filter(item => item.test.test(message)).map(item => item.text);
+
+  const searchSuggestions = keywords.length > 0
+    ? `Suggested e-Docket search terms: ${keywords.map(keyword => `"${keyword}"`).join(", ")}.`
+    : "";
+
+  const newsContext = matchedNews.length > 0
+    ? `Recent official DC PSC items related to this query:\n${matchedNews.map(item => `- ${item.title} (${item.date})`).join("\n")}`
+    : `Recent official DC PSC items available now:\n${currentNews.slice(0, 3).map(item => `- ${item.title} (${item.date})`).join("\n")}`;
+
+  const context = [
+    "SHORT-QUERY ENRICHMENT:",
+    "The user's message is brief but relevant to the DC PSC. Be proactively helpful rather than minimal.",
+    "Give a compact overview, then add the most useful next places to look, likely records or proceeding types, and official links.",
+    "If you mention a recent official news item from the context below, use the exact title text so the server can link it inline.",
+    searchSuggestions,
+    ...utilityHints,
+    newsContext
+  ].filter(Boolean).join("\n");
+
+  return { context, verifiedUrls };
+}
+
 function extractOpenAIText(response: any): string {
   if (typeof response?.output_text === "string" && response.output_text.trim()) {
     return response.output_text.trim();
@@ -348,7 +502,7 @@ function extractOpenAIText(response: any): string {
   return messageParts.join("\n").trim();
 }
 
-async function createOpenAIChatResponse(history: any[], message: string) {
+async function createOpenAIChatResponse(history: any[], message: string, extraContext = "") {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     throw new Error("OPENAI_API_KEY is missing");
@@ -363,7 +517,8 @@ STRICT LINKING & ACCURACY RULES:
 2. PREFER OFFICIAL SOURCES: Base factual claims on the official DC PSC and e-Docket materials provided in the conversation context.
 3. E-DOCKET CASE SEARCH FALLBACK: Always provide the official public e-Docket search link [e-Docket Search](https://edocket.dcpsc.org/public/search). Advise the user to enter the case/docket number directly when needed.
 4. DO NOT manually construct e-Docket detail URLs. If you know a case number, mention it plainly (for example, FC 1167). The server will append verified e-Docket case and filing links from the official e-Docket API.
-5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: If you are not certain about a URL, provide the case number instead of a link.`;
+5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: If you are not certain about a URL, provide the case number instead of a link.
+6. FOR SHORT, RELEVANT QUERIES: If the user gives only a short phrase or a utility/topic name, do not give a thin answer. Offer the most useful overview you can, likely case/proceeding angles to check, recent official items when provided, and several concrete next steps or official links.`;
 
   const response = await fetch(OPENAI_RESPONSES_URL, {
     method: "POST",
@@ -374,7 +529,9 @@ STRICT LINKING & ACCURACY RULES:
     body: JSON.stringify({
       model: OPENAI_MODEL,
       instructions,
-      input: buildConversationTranscript(history, message),
+      input: extraContext
+        ? `${extraContext}\n\n${buildConversationTranscript(history, message)}`
+        : buildConversationTranscript(history, message),
       text: {
         format: {
           type: "text"
@@ -919,8 +1076,9 @@ async function startServer() {
       }
 
       try {
-        const response = await createOpenAIChatResponse(history, message);
-        const verifiedUrls: { uri: string; title: string }[] = [];
+        const shortQueryContext = await buildShortQueryOfficialContext(message);
+        const response = await createOpenAIChatResponse(history, message, shortQueryContext.context);
+        const verifiedUrls: { uri: string; title: string }[] = [...shortQueryContext.verifiedUrls];
 
         // Intercept and resolve all links in markdown output
         let replyText = extractOpenAIText(response);
