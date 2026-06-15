@@ -1,0 +1,6 @@
+{
+  "name": "DC PSC Information Portal",
+  "description": "A non-official AI assistant for navigating Public Service Commission of the District of Columbia information, featuring real-time updates and a docket assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
