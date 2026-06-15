@@ -445,6 +445,146 @@ async function buildVerifiedDocketLinks(text: string) {
   }).slice(0, 8);
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function replaceOutsideMarkdownLinks(
+  text: string,
+  transform: (segment: string) => string
+): string {
+  const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
+  let result = "";
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = linkRegex.exec(text)) !== null) {
+    result += transform(text.slice(lastIndex, match.index));
+    result += match[0];
+    lastIndex = match.index + match[0].length;
+  }
+
+  result += transform(text.slice(lastIndex));
+  return result;
+}
+
+type InlineSourceSpec = {
+  url: string;
+  patterns: RegExp[];
+  priority: number;
+};
+
+function buildInlineSourceSpecs(
+  verifiedDocketLinks: { label: string; url: string }[],
+  verifiedUrls: { uri: string; title: string }[]
+): InlineSourceSpec[] {
+  const specs: InlineSourceSpec[] = [];
+
+  for (const link of verifiedDocketLinks) {
+    if (/\/public\/search\/casenumber\//i.test(link.url)) {
+      const urlMatch = link.url.match(/\/public\/search\/casenumber\/(\d{3,5})\/?$/i);
+      const labelMatch = link.label.match(/^([A-Z]{1,8})\s?(\d{3,5})\b/i);
+      const digits = urlMatch?.[1] || labelMatch?.[2];
+      if (!digits) {
+        continue;
+      }
+
+      const prefix = (labelMatch?.[1] || "FC").toUpperCase();
+      const compactCode = `${prefix}${digits}`;
+      const spacedCode = `${prefix} ${digits}`;
+      specs.push({
+        url: link.url,
+        priority: 4,
+        patterns: [
+          new RegExp(`\\bFormal\\s+Case\\s+(?:No\\.?|Number)?\\s*${digits}\\s*\\((?:${escapeRegExp(spacedCode)}|${escapeRegExp(compactCode)})\\)`, "gi"),
+          new RegExp(`\\bFormal\\s+Case\\s+(?:No\\.?|Number)?\\s*${digits}\\b`, "gi"),
+          new RegExp(`\\b${escapeRegExp(spacedCode)}\\b`, "gi"),
+          new RegExp(`\\b${escapeRegExp(compactCode)}\\b`, "gi")
+        ]
+      });
+      continue;
+    }
+
+    if (/\/public\/search\/details\//i.test(link.url)) {
+      const docketReference = link.label.split(" - ")[0]?.trim();
+      if (!docketReference) {
+        continue;
+      }
+
+      specs.push({
+        url: link.url,
+        priority: 3,
+        patterns: [new RegExp(`\\b${escapeRegExp(docketReference)}\\b`, "gi")]
+      });
+      continue;
+    }
+
+    if (/\/apis\/api\/Filing\/download/i.test(link.url)) {
+      const labelParts = link.label.split(" - ");
+      const docketReference = labelParts[0]?.trim();
+      const attachmentName = labelParts.slice(1).join(" - ").trim();
+      const patterns: RegExp[] = [];
+
+      if (attachmentName) {
+        patterns.push(new RegExp(escapeRegExp(attachmentName), "gi"));
+      }
+
+      if (docketReference) {
+        patterns.push(new RegExp(`\\b${escapeRegExp(docketReference)}\\b`, "gi"));
+      }
+
+      if (patterns.length > 0) {
+        specs.push({
+          url: link.url,
+          priority: 1,
+          patterns
+        });
+      }
+    }
+  }
+
+  for (const source of verifiedUrls) {
+    const title = source.title?.trim();
+    const uri = normalizeUrl(source.uri);
+    if (!title || !uri) {
+      continue;
+    }
+
+    specs.push({
+      url: uri,
+      priority: 2,
+      patterns: [new RegExp(escapeRegExp(title), "gi")]
+    });
+  }
+
+  return specs.sort((a, b) => b.priority - a.priority);
+}
+
+function inlineVerifiedSources(
+  replyText: string,
+  verifiedDocketLinks: { label: string; url: string }[],
+  verifiedUrls: { uri: string; title: string }[]
+): string {
+  const sourceSpecs = buildInlineSourceSpecs(verifiedDocketLinks, verifiedUrls);
+  if (sourceSpecs.length === 0) {
+    return replyText;
+  }
+
+  return replaceOutsideMarkdownLinks(replyText, (segment) => {
+    let updatedSegment = segment;
+
+    for (const sourceSpec of sourceSpecs) {
+      for (const pattern of sourceSpec.patterns) {
+        updatedSegment = replaceOutsideMarkdownLinks(updatedSegment, (plainText) =>
+          plainText.replace(pattern, (match) => `[${match}](${sourceSpec.url})`)
+        );
+      }
+    }
+
+    return updatedSegment;
+  });
+}
+
 async function verifyEdocketUrl(urlStr: string): Promise<{ isValid: boolean; normalized: string; repairUrl?: string }> {
   const normalized = normalizeUrl(urlStr);
 
@@ -784,8 +924,9 @@ async function startServer() {
 
         // Intercept and resolve all links in markdown output
         let replyText = extractOpenAIText(response);
-        replyText = await postProcessChatReply(replyText, verifiedUrls);
         const verifiedDocketLinks = await buildVerifiedDocketLinks(`${message}\n${replyText}`);
+        replyText = inlineVerifiedSources(replyText, verifiedDocketLinks, verifiedUrls);
+        replyText = await postProcessChatReply(replyText, verifiedUrls);
 
         // Append clean, official verifiably source links as footnotes for supreme trust
         if (verifiedUrls.length > 0) {
@@ -798,11 +939,6 @@ async function startServer() {
             replyText += `\n\n---\n🌐 **Official Verifiable Sources Found:**\n` + 
               uniqueVerified.map(uv => `- [${uv.title || "Public Service Commission Live Record"}](${normalizeUrl(uv.uri)})`).join("\n");
           }
-        }
-
-        if (verifiedDocketLinks.length > 0) {
-          replyText += `\n\n---\n**Verified e-Docket Records:**\n` +
-            verifiedDocketLinks.map(link => `- [${link.label}](${link.url})`).join("\n");
         }
 
         res.json({ reply: replyText });
