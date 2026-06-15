@@ -136,6 +136,27 @@ function extractCaseNumbers(text: string): string[] {
   return Array.from(candidates);
 }
 
+function isSimpleCaseNumberQuery(text: string): boolean {
+  return /^(?:\s*(?:fc|formal\s+case|case|docket)\s*(?:no\.?|number)?\s*[-#:]*\s*)?\d{3,5}\s*$/i.test(text.trim());
+}
+
+function formatEdocketDate(value: string | undefined): string {
+  if (!value) {
+    return "Unknown";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+
+  return parsed.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric"
+  });
+}
+
 async function fetchEdocketJson(endpoint: string, params: Record<string, string | number | boolean>) {
   const url = new URL(endpoint, EDOCKET_API_URL);
   for (const [key, value] of Object.entries(params)) {
@@ -221,6 +242,89 @@ async function getOfficialFilingsByCaseNumber(caseNumber: string): Promise<any[]
   });
 
   return Array.isArray(data?.resultsSet) ? data.resultsSet : [];
+}
+
+function pickPrimaryCase(message: string, cases: any[]) {
+  const upperMessage = message.toUpperCase();
+  const requestedFormalCase = /\bFC\b/.test(upperMessage);
+
+  if (requestedFormalCase) {
+    return cases.find(item => String(item.caseNumber || "").toUpperCase().startsWith("FC")) || cases[0];
+  }
+
+  return cases.find(item => String(item.caseNumber || "").toUpperCase().startsWith("FC")) || cases[0];
+}
+
+function filterRelevantFilings(primaryCase: any, filings: any[]) {
+  const primaryPrefix = String(primaryCase?.caseNumber || "").toUpperCase();
+  if (!primaryPrefix) {
+    return filings;
+  }
+
+  const matching = filings.filter(filing => String(filing.docketNumber || "").toUpperCase().startsWith(`${primaryPrefix} -`));
+  return matching.length > 0 ? matching : filings;
+}
+
+async function buildDetailedCaseNumberReply(message: string): Promise<string | null> {
+  if (!isSimpleCaseNumberQuery(message)) {
+    return null;
+  }
+
+  const [caseNumber] = extractCaseNumbers(message);
+  const fallbackMatch = message.trim().match(/(\d{3,5})/);
+  const resolvedCaseNumber = caseNumber || fallbackMatch?.[1];
+  if (!resolvedCaseNumber) {
+    return null;
+  }
+
+  const cases = await getOfficialCasesByNumber(resolvedCaseNumber);
+  if (cases.length === 0) {
+    return `I couldn't find an official e-Docket record for case number \`${resolvedCaseNumber}\`.
+
+Use [e-Docket Case Search](${EDOCKET_CASE_SEARCH_URL}) and enter \`${resolvedCaseNumber}\` in the Case Number field to double-check alternate prefixes or archived records.`;
+  }
+
+  const primaryCase = pickPrimaryCase(message, cases);
+  const relatedCases = cases.filter(item => item !== primaryCase).slice(0, 4);
+  const filings = filterRelevantFilings(primaryCase, await getOfficialFilingsByCaseNumber(resolvedCaseNumber))
+    .filter(filing => !filing.isArchived)
+    .slice(0, 5);
+
+  const caseLabel = String(primaryCase.caseNumber || `Case ${caseNumber}`);
+  const status = primaryCase.isOpen ? "Open" : "Closed";
+  let reply = `**${caseLabel}**\n\n`;
+  reply += `${stripHtml(primaryCase.caseCaption || primaryCase.companyIndividual || "Official e-Docket case record.")}\n\n`;
+  reply += `- Status: ${status}\n`;
+  reply += `- Case type: ${primaryCase.caseTypeTitle || "Unknown"}\n`;
+  reply += `- Industry: ${primaryCase.industryTypeTitle || "Unknown"}\n`;
+  reply += `- Opened: ${formatEdocketDate(primaryCase.dateOpen)}\n`;
+  reply += `- Official search: [View this case in e-Docket](${getEdocketCaseSearchUrl(resolvedCaseNumber)})\n`;
+
+  if (relatedCases.length > 0) {
+    reply += `\n**Other records using ${resolvedCaseNumber}:**\n`;
+    reply += relatedCases
+      .map(item => `- ${item.caseNumber}: ${stripHtml(item.caseCaption || item.companyIndividual || item.caseTypeTitle || "Related e-Docket record")}`)
+      .join("\n");
+  }
+
+  if (filings.length > 0) {
+    reply += `\n\n**Recent public filings:**\n`;
+    reply += filings.map(filing => {
+      const detailUrl = getEdocketFilingDetailUrl(filing);
+      const attachmentUrl = getEdocketAttachmentUrl(filing);
+      const links = [
+        detailUrl ? `[Detail](${detailUrl})` : null,
+        attachmentUrl ? `[PDF](${attachmentUrl})` : null
+      ].filter(Boolean).join(" | ");
+
+      return `- ${filing.docketNumber} (${formatEdocketDate(filing.receivedDate)}): ${stripHtml(filing.filingType || filing.description || "Filing")} by ${filing.companyOrIndividual || "Unknown filer"}${links ? ` - ${links}` : ""}`;
+    }).join("\n");
+  } else {
+    reply += `\n\nNo recent public filings were returned for this case number from the official e-Docket API.`;
+  }
+
+  reply += `\n\nAll links above come from the official e-Docket public API.`;
+  return reply;
 }
 
 async function buildVerifiedDocketLinks(text: string) {
@@ -591,6 +695,15 @@ async function startServer() {
       const { history = [], message } = req.body;
       if (!message) {
         return res.status(400).json({ error: "Missing message body" });
+      }
+
+      try {
+        const directCaseReply = await buildDetailedCaseNumberReply(message);
+        if (directCaseReply) {
+          return res.status(200).json({ reply: directCaseReply });
+        }
+      } catch (directCaseError: any) {
+        console.warn("Direct e-Docket case lookup failed, falling back to Gemini:", directCaseError?.message || directCaseError);
       }
 
       if (!process.env.GEMINI_API_KEY) {
