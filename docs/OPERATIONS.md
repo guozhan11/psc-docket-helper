@@ -38,7 +38,7 @@ Add these GitHub Actions secrets:
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 
-The `Ingest DC PSC dockets` workflow runs daily after the Cloudflare UTC quota reset. It ingests recent filings and then resumes the oldest-first all-case backfill. Progress is stored in D1 so an interrupted run can continue from its last checkpoint.
+The `Ingest DC PSC dockets` workflow runs daily after the Cloudflare UTC reset. It refreshes recent filings and then resumes the oldest-first all-case backfill with eight parallel PDF workers. Compressed HTML, case manifests, the cursor, and a failed-filing list are stored in R2, so an interrupted run can continue from its last checkpoint without consuming D1's per-row daily write allowance.
 
 To resume the backfill manually without OCR:
 
@@ -46,7 +46,7 @@ To resume the backfill manually without OCR:
 npm run rag:ingest-all-cloud
 ```
 
-The ingestion script stops before crossing project safety ceilings: 8 GiB in R2, an estimated 400 MiB in any D1 shard, 5,000 new documents per run, 80,000 D1 rows written per UTC day, or 5,000 R2 objects written per UTC day. These safeguards leave headroom but are not billing guarantees; monitor the Cloudflare dashboard as the corpus grows.
+The fast ingestion script stops before 8 GiB of tracked R2 storage or 700,000 tracked R2 writes in one calendar month. The monthly ceiling leaves headroom below the expected free Class A operation allowance, but it is a project safeguard rather than a billing guarantee. Monitor the Cloudflare dashboard as the corpus grows.
 
 When `OPENAI_API_KEY` is absent, the Worker returns verified excerpts, page numbers, and official PDF links without model synthesis. When OpenAI is enabled, pair it with an AI Gateway spend limit.
 

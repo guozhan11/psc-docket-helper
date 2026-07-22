@@ -21,13 +21,12 @@ No installation is required.
 
 - `In FC1176, what drove Pepco's 2025 O&M expense variance?`
 - `Which FC1176 filings discuss bad debt or uncollectible accounts?`
-- `What do FC1176 filings say about FERC Account 904?`
 
 Questions that identify a formal case and a specific issue generally produce the strongest results while the corpus is still expanding.
 
 ## How It Works
 
-Public filing PDFs are downloaded temporarily, converted into searchable page-level text, and stored as compressed HTML in Cloudflare R2. Cloudflare D1 stores compact document metadata and search filters. The Worker verifies exact matches against the stored text before OpenAI prepares an answer, and every citation links back to the official PDF.
+Public filing PDFs are downloaded temporarily and in parallel, converted into searchable page-level text, and stored as compressed HTML in Cloudflare R2. Compact per-case manifests in R2 hold filing metadata and search filters. The Worker verifies exact matches against the stored text before OpenAI prepares an answer, and every citation links back to the official PDF.
 
 The original PDFs are not permanently duplicated in project storage. Scheduled ingestion resumes from its previous checkpoint and stays within conservative Cloudflare free-plan safety limits.
 

@@ -26,8 +26,7 @@ import VerifiedLink, { normalizeUrl } from './components/VerifiedLink';
 
 const EXAMPLE_QUESTIONS = [
   "In FC1176, what drove Pepco's 2025 O&M expense variance?",
-  'Which FC1176 filings discuss bad debt or uncollectible accounts?',
-  'What do FC1176 filings say about FERC Account 904?'
+  'Which FC1176 filings discuss bad debt or uncollectible accounts?'
 ];
 
 export default function App() {

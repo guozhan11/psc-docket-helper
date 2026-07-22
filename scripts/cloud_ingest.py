@@ -149,7 +149,9 @@ def download_pdf(filing: dict[str, Any], destination: Path) -> str:
         with destination.open("wb") as output:
             for block in response.iter_content(1024 * 1024):
                 output.write(block)
-    if not destination.read_bytes()[:5].startswith(b"%PDF-"):
+    with destination.open("rb") as downloaded:
+        signature = downloaded.read(5)
+    if not signature.startswith(b"%PDF-"):
         raise RuntimeError("Downloaded attachment is not a PDF")
     return url
 

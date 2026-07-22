@@ -2,39 +2,33 @@ name: Ingest DC PSC dockets
 
 on:
   schedule:
-    # Cloudflare D1 daily allowances reset at 00:00 UTC.
+    # Cloudflare usage windows reset at 00:00 UTC.
     - cron: "17 0 * * *"
   workflow_dispatch:
     inputs:
-      cases:
-        description: "Comma-separated formal case numbers for a backfill (example: 1176,1183)"
-        required: false
-        type: string
-      since_days:
-        description: "Recent-day window; used when cases is blank"
-        required: false
-        default: "3"
-        type: string
+      scope:
+        description: "Resume the full backfill or refresh recent filings"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - recent
       limit:
-        description: "Safety cap on filings processed in this run"
+        description: "Maximum eligible filings; 0 means run until the time limit"
         required: false
-        default: "100"
+        default: "0"
         type: string
-      enable_ocr:
-        description: "OCR pages that have no usable text layer"
+      concurrency:
+        description: "Parallel PDF extraction workers"
         required: false
-        default: true
-        type: boolean
-      force:
-        description: "Replace filings that are already indexed"
+        default: "8"
+        type: string
+      max_hours:
+        description: "Stop cleanly before the GitHub Actions timeout"
         required: false
-        default: false
-        type: boolean
-      all_cases:
-        description: "Resume the oldest-first backfill of every PSC case"
-        required: false
-        default: false
-        type: boolean
+        default: "5"
+        type: string
 
 concurrency:
   group: psc-docket-ingestion
@@ -43,13 +37,11 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 350
     permissions:
       contents: read
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_D1_DATABASE_IDS: 6bd27dcd-20e2-4731-acd4-b624fc970829,0009f827-5783-4b40-a338-890d61ec15ea,53cfbe00-c267-4b1b-87c9-c9fa97d79556
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
@@ -60,37 +52,34 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: scripts/requirements-cloud.txt
-      - name: Install extractor and OCR
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes ocrmypdf tesseract-ocr
-          python -m pip install --requirement scripts/requirements-cloud.txt
-      - name: Ingest recent or selected filings
+      - name: Install the PDF extractor
+        run: python -m pip install --requirement scripts/requirements-cloud.txt
+      - name: Refresh recent public filings
+        if: github.event_name == 'schedule'
+        run: >-
+          python scripts/fast_r2_ingest.py
+          --since-days 3
+          --limit 300
+          --concurrency 8
+          --max-hours 0.5
+      - name: Resume fast all-case backfill
+        if: github.event_name == 'schedule'
+        run: >-
+          python scripts/fast_r2_ingest.py
+          --all
+          --concurrency 8
+          --max-hours 4.75
+      - name: Run manual ingestion
+        if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
-          INPUT_CASES: ${{ github.event.inputs.cases }}
-          INPUT_SINCE_DAYS: ${{ github.event.inputs.since_days }}
-          INPUT_LIMIT: ${{ github.event.inputs.limit }}
-          INPUT_ENABLE_OCR: ${{ github.event.inputs.enable_ocr }}
-          INPUT_FORCE: ${{ github.event.inputs.force }}
-          INPUT_ALL_CASES: ${{ github.event.inputs.all_cases }}
+          INPUT_SCOPE: ${{ inputs.scope }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+          INPUT_MAX_HOURS: ${{ inputs.max_hours }}
         run: |
-          cases="${INPUT_CASES:-}"
-          since_days="${INPUT_SINCE_DAYS:-3}"
-          limit="${INPUT_LIMIT:-100}"
-          ocr_flag=""
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ] || [ "${INPUT_ENABLE_OCR:-true}" = "false" ]; then
-            ocr_flag="--no-ocr"
-          fi
-          force_flag=""
-          if [ "${INPUT_FORCE:-false}" = "true" ]; then force_flag="--force"; fi
-          if [ "${INPUT_ALL_CASES:-false}" = "true" ]; then
-            python scripts/cloud_ingest.py --all --limit "$limit" $ocr_flag $force_flag
-          elif [ -n "$cases" ]; then
-            python scripts/cloud_ingest.py --cases "$cases" --limit "$limit" $ocr_flag $force_flag
+          if [ "$INPUT_SCOPE" = "recent" ]; then
+            python scripts/fast_r2_ingest.py --since-days 3 --limit "$INPUT_LIMIT" --concurrency "$INPUT_CONCURRENCY" --max-hours "$INPUT_MAX_HOURS"
           else
-            python scripts/cloud_ingest.py --since-days "$since_days" --limit "$limit" $ocr_flag $force_flag
+            python scripts/fast_r2_ingest.py --all --limit "$INPUT_LIMIT" --concurrency "$INPUT_CONCURRENCY" --max-hours "$INPUT_MAX_HOURS"
           fi
-      - name: Resume compact all-case backfill within the daily free budget
-        if: github.event_name == 'schedule'
-        run: python scripts/cloud_ingest.py --all --limit 5000 --no-ocr

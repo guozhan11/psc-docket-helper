@@ -30,7 +30,24 @@ interface CompactDocumentRow {
   received_date: string | null;
   official_pdf_url: string;
   r2_key: string;
-  term_filter: ArrayBuffer | number[];
+  term_filter: ArrayBuffer | number[] | string;
+}
+
+interface ManifestDocumentRow {
+  filing_id: number;
+  case_number: string;
+  docket_number: string | null;
+  title: string;
+  received_date: string | null;
+  official_pdf_url: string;
+  r2_key: string;
+  term_filter_b64: string;
+}
+
+interface CaseManifest {
+  version: number;
+  caseNumber: string;
+  documents: ManifestDocumentRow[];
 }
 
 interface OfficialCase {
@@ -317,8 +334,36 @@ function buildSearchTerms(message: string): string[] {
     .slice(0, 12);
 }
 
-function toFilterBytes(value: ArrayBuffer | number[]): Uint8Array {
+function toFilterBytes(value: ArrayBuffer | number[] | string): Uint8Array {
+  if (typeof value === "string") {
+    const binary = atob(value);
+    return Uint8Array.from(binary, character => character.charCodeAt(0));
+  }
   return new Uint8Array(value);
+}
+
+async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<CompactDocumentRow[]> {
+  if (!/^[A-Z][A-Z0-9-]{2,30}$/.test(caseNumber)) return [];
+  const object = await env.DOCUMENTS.get(`manifests/${caseNumber}.json.gz`);
+  if (!object) return [];
+  if (object.size > 32 * 1024 * 1024) {
+    throw new Error(`Case manifest is too large: ${caseNumber} (${object.size} bytes)`);
+  }
+  const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
+  const payload = JSON.parse(await new Response(stream).text()) as CaseManifest;
+  if (payload.version !== 1 || payload.caseNumber !== caseNumber || !Array.isArray(payload.documents)) {
+    throw new Error(`Invalid case manifest: ${caseNumber}`);
+  }
+  return payload.documents.map(document => ({
+    filing_id: Number(document.filing_id),
+    case_number: document.case_number,
+    docket_number: document.docket_number,
+    title: document.title,
+    received_date: document.received_date,
+    official_pdf_url: document.official_pdf_url,
+    r2_key: document.r2_key,
+    term_filter: document.term_filter_b64
+  }));
 }
 
 function findPageExcerpts(html: string, terms: string[], document: CompactDocumentRow): SearchRow[] {
@@ -352,7 +397,24 @@ async function searchCompactDocuments(
   caseNumber: string,
   terms: string[]
 ): Promise<SearchRow[]> {
-  const candidates: Array<CompactDocumentRow & { filterHits: number }> = [];
+  const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
+  const addCandidate = (document: CompactDocumentRow) => {
+    const filter = toFilterBytes(document.term_filter);
+    const filterHits = terms.filter(term => termMayExist(filter, term)).length;
+    if (filterHits <= 0) return;
+    const existing = candidateMap.get(document.filing_id);
+    if (!existing || filterHits > existing.filterHits) {
+      candidateMap.set(document.filing_id, { ...document, filterHits });
+    }
+  };
+
+  try {
+    const manifestDocuments = await loadCaseManifest(env, caseNumber);
+    for (const document of manifestDocuments) addCandidate(document);
+  } catch (error) {
+    console.error(JSON.stringify({ message: "R2 case manifest unavailable", error: String(error), caseNumber }));
+  }
+
   const pageSize = 750;
   for (const database of searchDatabases(env)) {
     for (let offset = 0; offset < 7500; offset += pageSize) {
@@ -364,14 +426,11 @@ async function searchCompactDocuments(
          WHERE dc.case_number = ? AND d.term_filter IS NOT NULL
          ORDER BY d.received_date DESC
          LIMIT ? OFFSET ?`).bind(caseNumber, pageSize, offset).all<CompactDocumentRow>();
-      for (const document of result.results ?? []) {
-        const filter = toFilterBytes(document.term_filter);
-        const filterHits = terms.filter(term => termMayExist(filter, term)).length;
-        if (filterHits > 0) candidates.push({ ...document, filterHits });
-      }
+      for (const document of result.results ?? []) addCandidate(document);
       if ((result.results?.length ?? 0) < pageSize) break;
     }
   }
+  const candidates = Array.from(candidateMap.values());
   candidates.sort((left, right) => right.filterHits - left.filterHits
     || String(right.received_date || "").localeCompare(String(left.received_date || "")));
 
