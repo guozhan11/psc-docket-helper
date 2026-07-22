@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   Search, 
@@ -129,6 +129,7 @@ export default function App() {
   };
 
   const handleNewChat = () => {
+    shouldAutoScrollRef.current = true;
     const newId = 'session_' + Date.now();
     const newSession: ChatSession = {
       id: newId,
@@ -144,6 +145,7 @@ export default function App() {
 
   const handleDeleteChat = (idToDelete: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    shouldAutoScrollRef.current = true;
     if (sessions.length <= 1) {
       const defaultId = 'session_' + Date.now();
       setSessions([
@@ -168,6 +170,7 @@ export default function App() {
 
   const handleClearChat = () => {
     if (confirmClear) {
+      shouldAutoScrollRef.current = true;
       setSessions(prevSessions => prevSessions.map(session => {
         if (session.id === activeSessionId) {
           return {
@@ -187,6 +190,28 @@ export default function App() {
   };
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
+
+  const handleMessagesScroll = () => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    shouldAutoScrollRef.current = distanceFromBottom <= 64;
+  };
+
+  useLayoutEffect(() => {
+    if (!shouldAutoScrollRef.current) return;
+
+    const frame = requestAnimationFrame(() => {
+      const container = messagesContainerRef.current;
+      if (container) {
+        container.scrollTop = container.scrollHeight;
+      }
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [activeSessionId, messages, isTyping]);
   
   useEffect(() => {
     async function fetchNews() {
@@ -203,6 +228,7 @@ export default function App() {
 
     const userMessage = input.trim();
     setInput('');
+    shouldAutoScrollRef.current = true;
     
     const targetSessionId = activeSessionId;
     const isFirstUserMessage = messages.filter(m => m.role === 'user').length === 0;
@@ -456,6 +482,7 @@ export default function App() {
                           <div
                             key={session.id}
                             onClick={() => {
+                              shouldAutoScrollRef.current = true;
                               setActiveSessionId(session.id);
                               setSidebarOpen(false);
                             }}
@@ -539,7 +566,12 @@ export default function App() {
                     </div>
 
                     {/* Messages Area */}
-                    <div ref={messagesContainerRef} className="flex-grow overflow-y-auto p-6 space-y-6 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] bg-fixed">
+                    <div
+                      ref={messagesContainerRef}
+                      data-testid="messages-container"
+                      onScroll={handleMessagesScroll}
+                      className="flex-grow overflow-y-auto p-6 space-y-6 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] bg-fixed"
+                    >
                       {messages.map((msg, idx) => (
                         <motion.div
                           key={idx}
