@@ -107,6 +107,30 @@ function officialPdfPageUrl(row: Pick<SearchRow, "official_pdf_url" | "page_numb
   }
 }
 
+function citationTitle(title: string): string {
+  const clean = title.replace(/[\[\]\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  return clean.length > 120 ? `${clean.slice(0, 117).trimEnd()}...` : clean;
+}
+
+function filingCitation(row: SearchRow): string {
+  return `[${citationTitle(row.title)} — p. ${row.page_number}](${officialPdfPageUrl(row)})`;
+}
+
+function replaceOpaqueSourceLabels(reply: string, rows: SearchRow[]): string {
+  return rows.reduce((updated, row, index) => {
+    const sourceNumber = index + 1;
+    const pageSuffix = "(?:\\s*,?\\s*p(?:age)?\\.?\\s*\\d+)?";
+    const linkedOrBracketed = new RegExp(
+      `\\[\\s*Source\\s+${sourceNumber}${pageSuffix}\\s*\\](?:\\([^\\n)]+\\))?`,
+      "gi"
+    );
+    const plain = new RegExp(`\\bSource\\s+${sourceNumber}${pageSuffix}\\b`, "gi");
+    return updated
+      .replace(linkedOrBracketed, filingCitation(row))
+      .replace(plain, filingCitation(row));
+  }, reply);
+}
+
 function decodeHtml(value: string): string {
   return value
     .replace(/&nbsp;/gi, " ")
@@ -424,7 +448,8 @@ function sourceContext(rows: SearchRow[]): string {
     return "No matching indexed filing excerpts were found. Do not claim that the corpus proves an answer.";
   }
   return rows.map((row, index) => [
-    `[Source ${index + 1}]`,
+    `Internal evidence record ${index + 1} (do not expose this number to the user)`,
+    `Required citation: ${filingCitation(row)}`,
     `Case: ${row.case_number}`,
     `Filing: ${row.title}`,
     `Date: ${row.received_date ?? "unknown"}`,
@@ -479,7 +504,8 @@ async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message:
       model: env.OPENAI_MODEL || "gpt-4.1",
       instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
-Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using the supplied direct PDF page URL, for example [Source 1, p. 12](official PDF page URL).
+Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
+Never show labels such as Source 1, Source 2, or Evidence 1 to the user. A citation must identify the filing by title and PDF page, for example [Pepco Updated Remand Testimony — p. 374](official PDF page URL).
 Never invent a filing, quotation, page, date, or URL. If evidence is insufficient, say so and suggest a narrower search.
 Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
       input: `INDEXED E-DOCKET EXCERPTS:\n${sourceContext(rows)}\n\nCONVERSATION:\n${buildTranscript(history, message)}`,
@@ -489,8 +515,9 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
   if (!response.ok) {
     throw new Error(`OpenAI Responses API returned ${response.status}: ${await response.text()}`);
   }
-  const reply = extractOpenAiText(await response.json());
-  if (!reply) throw new Error("OpenAI returned no text");
+  const rawReply = extractOpenAiText(await response.json());
+  if (!rawReply) throw new Error("OpenAI returned no text");
+  const reply = replaceOpaqueSourceLabels(rawReply, rows);
   const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
   if (!sources.length) return reply;
   return `${reply}\n\n---\n**Official filing sources**\n${sources.map(row =>

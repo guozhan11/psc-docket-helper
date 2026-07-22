@@ -5,6 +5,7 @@ import {
   buildLocalRagContext,
   formatLocalRagSources,
   getLocalRagStatus,
+  replaceLocalRagSourceLabels,
   searchLocalRag
 } from "./rag/localRag.ts";
 
@@ -527,7 +528,7 @@ STRICT LINKING & ACCURACY RULES:
 6. FOR SHORT, RELEVANT QUERIES: If the user gives only a short phrase or a utility/topic name, do not give a thin answer. Offer the most useful overview you can, likely case/proceeding angles to check, recent official items when provided, and several concrete next steps or official links.`;
 
   const ragInstructions = `
-7. LOCAL RAG EVIDENCE: When LOCAL E-DOCKET RETRIEVAL RESULTS are present, ground document-content claims in those excerpts. Cite the relevant excerpt marker such as [Local Source 1]. If the excerpts do not establish the answer, say that the local index did not find enough evidence instead of guessing.
+7. LOCAL RAG EVIDENCE: When LOCAL E-DOCKET RETRIEVAL RESULTS are present, ground document-content claims in those excerpts. Use each record's Required citation exactly. Never display Local Source N labels. If the excerpts do not establish the answer, say that the local index did not find enough evidence instead of guessing.
 8. SEARCH SCOPE: Never imply that a local result covers every filing unless the supplied context explicitly says so. Distinguish exact keyword matches from broader semantic conclusions.`;
 
   const response = await fetch(OPENAI_RESPONSES_URL, {
@@ -1098,6 +1099,7 @@ async function startServer() {
         const verifiedDocketLinks = await buildVerifiedDocketLinks(`${message}\n${replyText}`);
         replyText = inlineVerifiedSources(replyText, verifiedDocketLinks, verifiedUrls);
         replyText = await postProcessChatReply(replyText, verifiedUrls);
+        replyText = replaceLocalRagSourceLabels(replyText, localRagResults);
         replyText += formatLocalRagSources(localRagResults);
 
         // Append clean, official verifiably source links as footnotes for supreme trust

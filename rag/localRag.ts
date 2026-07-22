@@ -32,6 +32,25 @@ export type RagSearchResult = RagChunk & {
   exactPhraseMatch: boolean;
 };
 
+function localPdfPageUrl(result: Pick<RagSearchResult, "pdfUrl" | "page">): string {
+  try {
+    const url = new URL(result.pdfUrl);
+    url.hash = `page=${Math.max(1, Math.trunc(result.page))}`;
+    return url.href;
+  } catch {
+    return result.pdfUrl;
+  }
+}
+
+function localCitationLabel(result: RagSearchResult): string {
+  const filename = result.filename.replace(/[\[\]\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+  return `${filename} — p. ${result.page}`;
+}
+
+function localCitation(result: RagSearchResult): string {
+  return `[${localCitationLabel(result)}](${localPdfPageUrl(result)})`;
+}
+
 const SEARCH_OPTIONS = {
   fields: ["text", "filename", "filingType", "filer", "docketNumber", "caseNumber"],
   storeFields: [
@@ -141,9 +160,10 @@ export function buildLocalRagContext(results: RagSearchResult[]): string {
   if (results.length === 0) return "";
   return [
     "LOCAL E-DOCKET RETRIEVAL RESULTS:",
-    "Use these excerpts as the primary evidence for claims about filing contents. Do not claim that an excerpt says something it does not say. Refer to evidence as [Local Source N].",
+    "Use these excerpts as the primary evidence for claims about filing contents. Do not claim that an excerpt says something it does not say. Use each record's Required citation exactly; never display Local Source N labels.",
     ...results.map((result, index) => [
-      `[Local Source ${index + 1}]`,
+      `Internal evidence record ${index + 1} (do not expose this number to the user)`,
+      `Required citation: ${localCitation(result)}`,
       `Case: ${result.caseNumber}`,
       `Docket: ${result.docketNumber}`,
       `Document: ${result.filename}`,
@@ -153,10 +173,25 @@ export function buildLocalRagContext(results: RagSearchResult[]): string {
       `Page: ${result.page}`,
       `Matched terms: ${result.matchedTerms.join(", ") || "metadata match"}`,
       `Full cleaned query appears as an exact phrase: ${result.exactPhraseMatch ? "yes" : "no"}`,
-      `Official PDF: ${result.pdfUrl}`,
+      `Official PDF: ${localPdfPageUrl(result)}`,
       `Excerpt: ${result.text}`
     ].join("\n"))
   ].join("\n\n");
+}
+
+export function replaceLocalRagSourceLabels(reply: string, results: RagSearchResult[]): string {
+  return results.reduce((updated, result, index) => {
+    const sourceNumber = index + 1;
+    const pageSuffix = "(?:\\s*,?\\s*p(?:age)?\\.?\\s*\\d+)?";
+    const linkedOrBracketed = new RegExp(
+      `\\[\\s*Local\\s+Source\\s+${sourceNumber}${pageSuffix}\\s*\\](?:\\([^\\n)]+\\))?`,
+      "gi"
+    );
+    const plain = new RegExp(`\\bLocal\\s+Source\\s+${sourceNumber}${pageSuffix}\\b`, "gi");
+    return updated
+      .replace(linkedOrBracketed, localCitation(result))
+      .replace(plain, localCitation(result));
+  }, reply);
 }
 
 export function formatLocalRagSources(results: RagSearchResult[]): string {
@@ -167,7 +202,7 @@ export function formatLocalRagSources(results: RagSearchResult[]): string {
     if (seen.has(key)) return [];
     seen.add(key);
     const label = `${result.docketNumber || result.caseNumber} — ${result.filename}, p. ${result.page}`;
-    return [`- [${label}](${result.pdfUrl})`];
+    return [`- [${label}](${localPdfPageUrl(result)})`];
   });
   return sourceLines.length > 0
     ? `\n\n---\n**Retrieved from the local e-Docket index:**\n${sourceLines.join("\n")}`
