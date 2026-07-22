@@ -24,6 +24,12 @@ import { getLatestPSCUpdates, chatWithDocketAssistant } from './services/geminiS
 import { Message, NewsUpdate, ChatSession } from './types';
 import VerifiedLink, { normalizeUrl } from './components/VerifiedLink';
 
+const EXAMPLE_QUESTIONS = [
+  "In FC1176, what drove Pepco's 2025 O&M expense variance?",
+  'Which FC1176 filings discuss bad debt or uncollectible accounts?',
+  'What do FC1176 filings say about FERC Account 904?'
+];
+
 export default function App() {
   const [news, setNews] = useState<NewsUpdate[]>([]);
   const [loadingNews, setLoadingNews] = useState(true);
@@ -664,14 +670,14 @@ export default function App() {
                         </button>
                       </div>
                       <div className="mt-4 flex flex-wrap gap-2">
-                        {['FC 1167', 'Rate Case Status', 'Renewable Energy'].map((tag) => (
+                        {EXAMPLE_QUESTIONS.map((question) => (
                           <button
-                            key={tag}
+                            key={question}
                             type="button"
-                            onClick={() => setInput(tag)}
-                            className="text-[10px] font-bold uppercase tracking-wider bg-white border border-slate-200 px-3 py-1.5 rounded-full text-slate-500 hover:border-psc-gold hover:text-psc-gold transition-all cursor-pointer"
+                            onClick={() => setInput(question)}
+                            className="text-xs font-semibold text-left bg-white border border-slate-200 px-3 py-2 rounded-xl text-slate-600 hover:border-psc-gold hover:text-psc-gold transition-all cursor-pointer"
                           >
-                            {tag}
+                            {question}
                           </button>
                         ))}
                       </div>
