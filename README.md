@@ -1,123 +1,76 @@
 # PSC Docket Helper
 
-A React and Express web app for finding District of Columbia Public Service Commission news, notices, dockets, and regulatory records.
+An AI-assisted way to explore District of Columbia Public Service Commission news, utility dockets, regulatory filings, and public records.
 
-The app has two main parts:
+## Try the Live Website
 
-- **Latest Regulatory Updates**: pulls real links from the official DCPSC Current PSC News page.
-- **Docket Assistant**: uses OpenAI on the server to help users search and understand DCPSC dockets and filings.
+### [Open the PSC Docket Helper](https://psc-docket-helper.onrender.com/)
 
-## Data Sources
+Explore recent regulatory updates or ask the PSC Assistant about a DC utility case. No installation is required.
 
-News cards are not AI-generated. The server fetches and parses the official DCPSC Current PSC News page:
+> The PSC Docket Helper is a non-official experimental tool. Because the demo uses Render's free hosting tier, the first visit after a period of inactivity may take about a minute to load.
 
-https://dcpsc.org/Newsroom/Current-PSC-News.aspx
+## What You Can Do
 
-The app extracts the latest titles, dates, summaries, and official `dcpsc.org` document links. Results are cached for 30 minutes. If the DCPSC page is temporarily unavailable, the server falls back to a bundled list of verified official DCPSC links.
+- **Follow recent PSC updates.** Browse current notices, meetings, hearings, and other regulatory news collected from the official DCPSC website.
+- **Ask about a docket.** Enter a formal case number or ask a plain-language question about a utility proceeding.
+- **Find official records.** Follow links back to DCPSC and e-Docket sources to review the underlying public information.
+- **Keep inquiries organized.** Create separate conversations and return to recent chat sessions saved in your browser.
 
-The chat assistant uses OpenAI for explanation and synthesis. Official case facts and verified docket links come from the DCPSC and e-Docket public sources.
+## Questions to Try
 
-## Tech Stack
+- `What is FC 1167 about?`
+- `Show me recent utility rate cases.`
+- `What are DC's renewable energy goals?`
+- `Where can I find the official filings for a formal case?`
 
-- React
-- TypeScript
-- Vite
-- Tailwind CSS
-- Express
-- OpenAI API
+## Why This Project Exists
 
-## Local Setup
+Public utility proceedings can involve long dockets, formal case numbers, technical filings, and information spread across multiple public systems. PSC Docket Helper provides a simpler starting point: users can ask a question in everyday language, review a concise explanation, and continue to the official source when they need the complete record.
 
-Prerequisites:
+## Information and Sources
+
+The regulatory update cards are not AI-generated. The server retrieves news from the [DCPSC Current PSC News](https://dcpsc.org/Newsroom/Current-PSC-News.aspx) page and links users to official `dcpsc.org` records. Results are cached briefly for performance, with a bundled set of verified official links available if the source page is temporarily unavailable.
+
+The PSC Assistant uses OpenAI for explanation and synthesis. Case facts and docket links are gathered from public DCPSC and [e-Docket](https://edocket.dcpsc.org/public/search) sources whenever available.
+
+This project is not affiliated with or endorsed by the Public Service Commission of the District of Columbia. AI-generated explanations may be incomplete or inaccurate and should not be treated as legal advice or an official agency record. Verify important information against the original filing or the [official DCPSC website](https://dcpsc.org/).
+
+## For Developers
+
+The application uses React, TypeScript, Vite, Tailwind CSS, Express, and the OpenAI API. The Express server provides the API routes and serves the built frontend in production.
+
+### Run Locally
+
+Requirements:
 
 - Node.js
 - npm
-- An OpenAI API key
-
-Install dependencies:
+- An OpenAI API key for AI-generated answers
 
 ```bash
 npm install
-```
-
-Create a local environment file:
-
-```bash
-cp .env.example .env.local
-```
-
-Set your API key in `.env.local`:
-
-```bash
-OPENAI_API_KEY="your_api_key_here"
-```
-
-Run the development server:
-
-```bash
+export OPENAI_API_KEY="your_api_key_here"
 npm run dev
 ```
 
-The app runs at:
+Open [http://localhost:3000](http://localhost:3000). Without an OpenAI API key, the public news experience remains available and the assistant displays links to official search tools.
 
-```text
-http://localhost:3000
-```
-
-## Production Build
-
-Build the frontend and bundled Express server:
+### Validate and Build
 
 ```bash
+npm run lint
 npm run build
-```
-
-Start the production server:
-
-```bash
 npm start
 ```
 
-## Deploying on Render
+### Deploy on Render
 
-Create a Render **Web Service** connected to this GitHub repository.
-
-Use these settings:
+Create a Render Web Service connected to this repository and use:
 
 ```text
-Language: Node
 Build Command: npm install && npm run build
 Start Command: npm start
 ```
 
-Add this environment variable in the Render dashboard:
-
-```text
-OPENAI_API_KEY=your_api_key_here
-```
-
-Do not commit real API keys to the repository.
-
-After setup, every push to the connected branch will trigger a Render deploy.
-
-## Updating the Live Site
-
-Make changes locally, then commit and push:
-
-```bash
-git add .
-git commit -m "Describe your change"
-git push
-```
-
-Render will rebuild and redeploy automatically.
-
-## Scripts
-
-```bash
-npm run dev      # Start local Express + Vite dev server
-npm run build    # Build frontend and server bundle
-npm start        # Start production server
-npm run lint     # Type-check the project
-npm run clean    # Remove dist
-```
+Add `OPENAI_API_KEY` in the Render environment settings. Pushes to the connected branch will then trigger automatic deployments.
