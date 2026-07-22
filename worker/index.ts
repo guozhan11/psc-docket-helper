@@ -82,6 +82,31 @@ function isOfficialPscUrl(value: string): boolean {
   }
 }
 
+function isOfficialEdocketAttachmentUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const guidFileName = (url.searchParams.get("guidFileName") ?? "")
+      .replace(/(?:#|%23).*$/i, "");
+    return url.protocol === "https:"
+      && url.hostname.toLowerCase() === "edocket.dcpsc.org"
+      && url.pathname.toLowerCase() === "/apis/api/filing/download"
+      && /^\d+$/.test(url.searchParams.get("attachId") ?? "")
+      && /^[\w.-]+\.pdf$/i.test(guidFileName);
+  } catch {
+    return false;
+  }
+}
+
+function officialPdfPageUrl(row: Pick<SearchRow, "official_pdf_url" | "page_number">): string {
+  try {
+    const url = new URL(row.official_pdf_url);
+    url.hash = `page=${Math.max(1, Math.trunc(row.page_number))}`;
+    return url.href;
+  } catch {
+    return row.official_pdf_url;
+  }
+}
+
 function decodeHtml(value: string): string {
   return value
     .replace(/&nbsp;/gi, " ")
@@ -404,7 +429,7 @@ function sourceContext(rows: SearchRow[]): string {
     `Filing: ${row.title}`,
     `Date: ${row.received_date ?? "unknown"}`,
     `Page: ${row.page_number}`,
-    `Official PDF: ${row.official_pdf_url}`,
+    `Official PDF page URL: ${officialPdfPageUrl(row)}`,
     `Excerpt: ${row.text.slice(0, 2200)}`
   ].join("\n")).join("\n\n");
 }
@@ -437,7 +462,7 @@ async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message:
       ...rows.map((row, index) => [
         `**${index + 1}. ${row.case_number}: ${row.title} — page ${row.page_number}**`,
         row.text.slice(0, 700),
-        `[Open the official PDF](${row.official_pdf_url})`
+        `[Open the official PDF at page ${row.page_number}](${officialPdfPageUrl(row)})`
       ].join("\n\n")),
       `[Search the complete official e-Docket](${EDOCKET_SEARCH_URL})`
     ].join("\n\n---\n\n");
@@ -454,7 +479,7 @@ async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message:
       model: env.OPENAI_MODEL || "gpt-4.1",
       instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
-Ground document-content claims in the supplied indexed excerpts. Cite evidence inline as [Source 1], [Source 2], etc.
+Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using the supplied direct PDF page URL, for example [Source 1, p. 12](official PDF page URL).
 Never invent a filing, quotation, page, date, or URL. If evidence is insufficient, say so and suggest a narrower search.
 Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
       input: `INDEXED E-DOCKET EXCERPTS:\n${sourceContext(rows)}\n\nCONVERSATION:\n${buildTranscript(history, message)}`,
@@ -469,7 +494,7 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
   const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
   if (!sources.length) return reply;
   return `${reply}\n\n---\n**Official filing sources**\n${sources.map(row =>
-    `- [${row.case_number}: ${row.title} — page ${row.page_number}](${row.official_pdf_url})`
+    `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
   ).join("\n")}`;
 }
 
@@ -507,9 +532,17 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   if (url.pathname === "/api/verify-link" && request.method === "GET") {
     const candidate = url.searchParams.get("url") ?? "";
     if (!isOfficialPscUrl(candidate)) return json({ valid: false, reason: "Only official DC PSC links are accepted" });
+    // The official attachment endpoint only implements GET and returns 405 for
+    // HEAD, even when the PDF exists. These URLs originate from the official
+    // filing API and are validated structurally to avoid downloading a large
+    // PDF merely to verify its link.
+    if (isOfficialEdocketAttachmentUrl(candidate)) return json({ valid: true, status: 200 });
     try {
       const response = await fetch(candidate, { method: "HEAD", redirect: "follow" });
-      return json({ valid: response.ok, status: response.status, fallbackUrl: response.ok ? undefined : NEWSROOM_URL });
+      const fallbackUrl = new URL(candidate).hostname.toLowerCase() === "edocket.dcpsc.org"
+        ? EDOCKET_SEARCH_URL
+        : NEWSROOM_URL;
+      return json({ valid: response.ok, status: response.status, fallbackUrl: response.ok ? undefined : fallbackUrl });
     } catch {
       return json({ valid: false, fallbackUrl: NEWSROOM_URL });
     }

@@ -41,6 +41,9 @@ interface VerifiedLinkProps {
 
 export default function VerifiedLink({ href, children, className, fallbackHref = 'https://edocket.dcpsc.org/public/search' }: VerifiedLinkProps) {
   const normalized = normalizeUrl(href || '');
+  // URL fragments such as #page=374 are interpreted by the browser's PDF
+  // viewer and are never part of the server resource being verified.
+  const verificationTarget = normalized.replace(/#.*$/, '');
   
   const [status, setStatus] = useState(() => {
     return verifiedLinksCache.get(normalized) || { valid: true, checked: false, checking: false };
@@ -61,7 +64,7 @@ export default function VerifiedLink({ href, children, className, fallbackHref =
       verifiedLinksCache.set(normalized, { valid: true, checked: false, checking: true });
 
       try {
-        const response = await fetch(`/api/verify-link?url=${encodeURIComponent(normalized)}`);
+        const response = await fetch(`/api/verify-link?url=${encodeURIComponent(verificationTarget)}`);
         if (!response.ok) throw new Error("Verification failed");
         
         const data = await response.json();
@@ -93,7 +96,7 @@ export default function VerifiedLink({ href, children, className, fallbackHref =
     return () => {
       isMounted = false;
     };
-  }, [normalized]);
+  }, [normalized, verificationTarget]);
 
   // If the link is verified as broken, fallback to eDocket Case Search
   const finalHref = status.checked && !status.valid 
