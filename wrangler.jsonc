@@ -1,0 +1,47 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "psc-docket-assistant",
+	"main": "./worker/index.ts",
+	"compatibility_date": "2026-07-22",
+	"workers_dev": true,
+	"preview_urls": false,
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "psc-docket-search",
+			"database_id": "6bd27dcd-20e2-4731-acd4-b624fc970829"
+		},
+		{
+			"binding": "DB_1",
+			"database_name": "psc-docket-search-1",
+			"database_id": "0009f827-5783-4b40-a338-890d61ec15ea"
+		},
+		{
+			"binding": "DB_2",
+			"database_name": "psc-docket-search-2",
+			"database_id": "53cfbe00-c267-4b1b-87c9-c9fa97d79556"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "DOCUMENTS",
+			"bucket_name": "psc-docket-assistant-documents"
+		}
+	],
+	"vars": {
+		"OPENAI_MODEL": "gpt-4.1",
+		"AI_GATEWAY_ID": "default",
+		"CLOUDFLARE_ACCOUNT_ID": "ec47eefb8bdd84301fd0dba3c74578b8"
+	},
+	"observability": {
+		"enabled": true
+	}
+}

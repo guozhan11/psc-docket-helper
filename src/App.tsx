@@ -190,6 +190,7 @@ export default function App() {
   };
 
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const shouldAutoScrollRef = useRef(true);
 
   const handleMessagesScroll = () => {
@@ -212,6 +213,15 @@ export default function App() {
 
     return () => cancelAnimationFrame(frame);
   }, [activeSessionId, messages, isTyping]);
+
+  useLayoutEffect(() => {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 160)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > 160 ? 'auto' : 'hidden';
+  }, [input]);
   
   useEffect(() => {
     async function fetchNews() {
@@ -408,11 +418,11 @@ export default function App() {
         </section>
 
         {/* Chatbot Section */}
-        <section id="assistant" className="py-24 bg-psc-light">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 items-start">
+        <section id="assistant" className="scroll-mt-20 py-8 bg-psc-light">
+          <div className="max-w-[1536px] mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 xl:gap-10 items-start">
               {/* Info Sidebar */}
-              <div className="lg:col-span-4">
+              <div className="lg:col-span-4 xl:col-span-3">
                 <div className="sticky top-28">
                   <div className="bg-psc-blue text-white p-8 rounded-3xl shadow-2xl mb-8">
                     <div className="bg-psc-gold/20 p-3 rounded-2xl w-fit mb-6">
@@ -456,8 +466,8 @@ export default function App() {
               </div>
 
               {/* Chat Interface */}
-              <div className="lg:col-span-8">
-                <div className="bg-white rounded-3xl shadow-xl border border-slate-200 flex h-[600px] overflow-hidden relative z-10">
+              <div className="lg:col-span-8 xl:col-span-9">
+                <div className="bg-white rounded-3xl shadow-xl border border-slate-200 flex h-[calc(100dvh-7rem)] min-h-[520px] max-h-[760px] overflow-hidden relative z-10">
                   {/* Left Chat History Pane */}
                   <div className={cn(
                     "w-64 bg-slate-900 border-r border-slate-800 flex flex-col h-full flex-shrink-0 transition-transform duration-300 md:translate-x-0 absolute md:relative z-30 md:z-auto",
@@ -627,19 +637,28 @@ export default function App() {
                     </div>
 
                     {/* Input Area */}
-                    <form onSubmit={handleSendMessage} className="p-6 border-t border-slate-100 bg-slate-50/50">
+                    <form onSubmit={handleSendMessage} className="p-4 sm:p-5 border-t border-slate-100 bg-slate-50/50">
                       <div className="relative">
-                        <input
-                          type="text"
+                        <textarea
+                          ref={inputRef}
+                          rows={2}
                           value={input}
                           onChange={(e) => setInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                              e.preventDefault();
+                              e.currentTarget.form?.requestSubmit();
+                            }
+                          }}
                           placeholder="Ask about a docket number or utility case..."
-                          className="w-full bg-white border border-slate-200 rounded-2xl py-4 pl-6 pr-14 focus:outline-none focus:ring-2 focus:ring-psc-blue/20 focus:border-psc-blue transition-all shadow-inner"
+                          aria-label="Message PSC Assistant"
+                          className="block w-full min-h-[76px] max-h-40 resize-none bg-white border border-slate-200 rounded-2xl py-4 pl-5 pr-20 leading-6 focus:outline-none focus:ring-2 focus:ring-psc-blue/20 focus:border-psc-blue transition-[border-color,box-shadow] shadow-inner"
                         />
                         <button
                           type="submit"
                           disabled={!input.trim() || isTyping}
-                          className="absolute right-2 top-2 bottom-2 bg-psc-blue text-white px-4 rounded-xl hover:bg-psc-blue/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center cursor-pointer"
+                          aria-label="Send message"
+                          className="absolute right-3 bottom-3 w-12 h-12 bg-psc-blue text-white rounded-xl hover:bg-psc-blue/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center cursor-pointer"
                         >
                           <Send className="w-5 h-5" />
                         </button>

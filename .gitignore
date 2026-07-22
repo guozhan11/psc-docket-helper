@@ -1,8 +1,13 @@
 node_modules/
 build/
+__pycache__/
+*.py[cod]
+.wrangler/
+.dev.vars
 dist/
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
+.rag-data/

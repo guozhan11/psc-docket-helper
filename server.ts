@@ -1,6 +1,12 @@
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
+import {
+  buildLocalRagContext,
+  formatLocalRagSources,
+  getLocalRagStatus,
+  searchLocalRag
+} from "./rag/localRag.ts";
 
 const DC_PSC_NEWSROOM_URL = "https://dcpsc.org/Newsroom.aspx";
 const EDOCKET_CASE_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
@@ -520,6 +526,10 @@ STRICT LINKING & ACCURACY RULES:
 5. FORMAT ONLY VERIFIED LINKS IN MARKDOWN: If you are not certain about a URL, provide the case number instead of a link.
 6. FOR SHORT, RELEVANT QUERIES: If the user gives only a short phrase or a utility/topic name, do not give a thin answer. Offer the most useful overview you can, likely case/proceeding angles to check, recent official items when provided, and several concrete next steps or official links.`;
 
+  const ragInstructions = `
+7. LOCAL RAG EVIDENCE: When LOCAL E-DOCKET RETRIEVAL RESULTS are present, ground document-content claims in those excerpts. Cite the relevant excerpt marker such as [Local Source 1]. If the excerpts do not establish the answer, say that the local index did not find enough evidence instead of guessing.
+8. SEARCH SCOPE: Never imply that a local result covers every filing unless the supplied context explicitly says so. Distinguish exact keyword matches from broader semantic conclusions.`;
+
   const response = await fetch(OPENAI_RESPONSES_URL, {
     method: "POST",
     headers: {
@@ -528,7 +538,7 @@ STRICT LINKING & ACCURACY RULES:
     },
     body: JSON.stringify({
       model: OPENAI_MODEL,
-      instructions,
+      instructions: `${instructions}${ragInstructions}`,
       input: extraContext
         ? `${extraContext}\n\n${buildConversationTranscript(history, message)}`
         : buildConversationTranscript(history, message),
@@ -972,7 +982,7 @@ async function startServer() {
 
   // API Route: Server status checking
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok" });
+    res.json({ status: "ok", localRag: getLocalRagStatus() });
   });
 
   // API Route: Retrieve latest news/announcements securely
@@ -1077,7 +1087,10 @@ async function startServer() {
 
       try {
         const shortQueryContext = await buildShortQueryOfficialContext(message);
-        const response = await createOpenAIChatResponse(history, message, shortQueryContext.context);
+        const localRagResults = searchLocalRag(message, 6);
+        const localRagContext = buildLocalRagContext(localRagResults);
+        const combinedContext = [shortQueryContext.context, localRagContext].filter(Boolean).join("\n\n");
+        const response = await createOpenAIChatResponse(history, message, combinedContext);
         const verifiedUrls: { uri: string; title: string }[] = [...shortQueryContext.verifiedUrls];
 
         // Intercept and resolve all links in markdown output
@@ -1085,6 +1098,7 @@ async function startServer() {
         const verifiedDocketLinks = await buildVerifiedDocketLinks(`${message}\n${replyText}`);
         replyText = inlineVerifiedSources(replyText, verifiedDocketLinks, verifiedUrls);
         replyText = await postProcessChatReply(replyText, verifiedUrls);
+        replyText += formatLocalRagSources(localRagResults);
 
         // Append clean, official verifiably source links as footnotes for supreme trust
         if (verifiedUrls.length > 0) {
