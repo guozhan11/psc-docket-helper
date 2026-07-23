@@ -2,32 +2,33 @@ name: Ingest DC PSC dockets
 
 on:
   schedule:
-    # Cloudflare usage windows reset at 00:00 UTC.
-    - cron: "17 0 * * *"
+    # Four near-continuous windows per day; each extraction job stops before
+    # GitHub's hosted-runner job limit.
+    - cron: "17 0,6,12,18 * * *"
   workflow_dispatch:
     inputs:
       scope:
-        description: "Resume the full backfill or refresh recent filings"
+        description: "Build metadata only or build metadata then resume full text"
         required: true
         default: all
         type: choice
         options:
           - all
-          - recent
+          - metadata
       limit:
         description: "Maximum eligible filings; 0 means run until the time limit"
         required: false
         default: "0"
         type: string
       concurrency:
-        description: "Parallel PDF extraction workers"
+        description: "PDF workers per shard (4 shards run in parallel)"
         required: false
-        default: "8"
+        default: "4"
         type: string
       max_hours:
         description: "Stop cleanly before the GitHub Actions timeout"
         required: false
-        default: "5"
+        default: "5.25"
         type: string
 
 concurrency:
@@ -35,9 +36,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ingest:
+  metadata:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
@@ -67,32 +68,52 @@ jobs:
           fi
       - name: Install the PDF extractor
         run: python -m pip install --requirement scripts/requirements-cloud.txt
-      - name: Refresh recent public filings
-        if: github.event_name == 'schedule'
-        run: >-
-          python scripts/fast_r2_ingest.py
-          --since-days 3
-          --limit 300
-          --concurrency 8
-          --max-hours 0.5
-      - name: Resume fast all-case backfill
-        if: github.event_name == 'schedule'
-        run: >-
-          python scripts/fast_r2_ingest.py
-          --all
-          --concurrency 8
-          --max-hours 4.75
-      - name: Run manual ingestion
-        if: github.event_name == 'workflow_dispatch'
+      - name: Publish filing metadata and official links first
         shell: bash
         env:
           INPUT_SCOPE: ${{ inputs.scope }}
-          INPUT_LIMIT: ${{ inputs.limit }}
-          INPUT_CONCURRENCY: ${{ inputs.concurrency }}
-          INPUT_MAX_HOURS: ${{ inputs.max_hours }}
         run: |
-          if [ "$INPUT_SCOPE" = "recent" ]; then
-            python scripts/fast_r2_ingest.py --since-days 3 --limit "$INPUT_LIMIT" --concurrency "$INPUT_CONCURRENCY" --max-hours "$INPUT_MAX_HOURS"
+          if [ "$INPUT_SCOPE" = "metadata" ]; then
+            python scripts/metadata_r2_ingest.py --mode full --shard-count 4
           else
-            python scripts/fast_r2_ingest.py --all --limit "$INPUT_LIMIT" --concurrency "$INPUT_CONCURRENCY" --max-hours "$INPUT_MAX_HOURS"
+            python scripts/metadata_r2_ingest.py --mode auto --since-days 3 --shard-count 4
           fi
+
+  ingest:
+    needs: metadata
+    if: github.event_name == 'schedule' || inputs.scope == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      INPUT_LIMIT: ${{ inputs.limit || '0' }}
+      INPUT_CONCURRENCY: ${{ inputs.concurrency || '4' }}
+      INPUT_MAX_HOURS: ${{ inputs.max_hours || '5.25' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements-cloud.txt
+      - name: Install the PDF extractor
+        run: python -m pip install --requirement scripts/requirements-cloud.txt
+      - name: Extract one non-overlapping filing range without OCR
+        run: >-
+          python scripts/fast_r2_ingest.py
+          --all
+          --limit "$INPUT_LIMIT"
+          --concurrency "$INPUT_CONCURRENCY"
+          --max-hours "$INPUT_MAX_HOURS"
+          --shard-index "${{ matrix.shard }}"
+          --shard-count 4

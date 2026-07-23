@@ -74,12 +74,31 @@ def pdf_url(filing: dict[str, Any]) -> str:
     return requests.Request("GET", f"{EDOCKET_API}Filing/download", params=params).prepare().url
 
 
+def official_filing_total() -> int:
+    response = requests.get(
+        f"{EDOCKET_API}Filing/GetFilings",
+        params={
+            "caseNumber": "",
+            "isAdmin": "false",
+            "orderByColumn": "receivedDate",
+            "sortBy": "asc",
+            "recordsToSkip": 0,
+            "recordsToShow": 1,
+        },
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return int(response.json().get("totalRecords") or 0)
+
+
 def iter_filings(
     case_numbers: list[str],
     since_days: int,
     limit: int,
     start_offset: int = 0,
     oldest_first: bool = False,
+    end_offset: int | None = None,
 ) -> Iterable[tuple[str, dict[str, Any], int]]:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "User-Agent": USER_AGENT})
@@ -90,7 +109,7 @@ def iter_filings(
     for case_number in scopes:
         offset = start_offset if not case_numbers else 0
         total = 1
-        while offset < total:
+        while offset < total and (end_offset is None or offset < end_offset):
             response = session.get(
                 f"{EDOCKET_API}Filing/GetFilings",
                 params={
@@ -111,6 +130,9 @@ def iter_filings(
                 break
             reached_cutoff = False
             for record_index, filing in enumerate(records):
+                absolute_offset = offset + record_index
+                if end_offset is not None and absolute_offset >= end_offset:
+                    return
                 received = filing.get("receivedDate") or ""
                 if cutoff and received:
                     try:
@@ -133,7 +155,7 @@ def iter_filings(
                 docket = str(filing.get("docketNumber") or case_number or "")
                 docket_cases = docket_case_numbers(docket)
                 normalized = docket_cases[0] if docket_cases else normalize_case_number(case_number)
-                yield normalized, filing, offset + record_index + 1
+                yield normalized, filing, absolute_offset + 1
                 emitted += 1
                 if limit and emitted >= limit:
                     return

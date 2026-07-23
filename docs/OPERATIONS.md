@@ -37,15 +37,21 @@ Add these GitHub Actions secrets:
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 
-The `Ingest DC PSC dockets` workflow runs daily after the Cloudflare UTC reset. It refreshes recent filings and then resumes the oldest-first all-case backfill with eight parallel PDF workers. Compressed HTML, case manifests, the cursor, and a failed-filing list are stored in R2, so an interrupted run can continue from its last checkpoint without consuming D1's per-row daily write allowance.
+The `Ingest DC PSC dockets` workflow starts at 00:17, 06:17, 12:17, and 18:17 UTC. A metadata job first publishes all public PDF filing records and official links; later runs refresh the newest three days. Four extraction jobs then process non-overlapping record ranges in parallel, with four PDF workers per range. Compressed HTML, sharded case manifests, independent cursors, and failed-filing lists are stored in R2, so interrupted runs continue from their checkpoints without consuming D1's per-row daily write allowance.
 
-To resume the backfill manually without OCR:
+To build or refresh metadata locally:
 
 ```bash
-npm run rag:ingest-all-cloud
+npm run rag:metadata-cloud
 ```
 
-The fast ingestion script stops before 8 GiB of tracked R2 storage or 700,000 tracked R2 writes in one calendar month. The monthly ceiling leaves headroom below the expected free Class A operation allowance, but it is a project safeguard rather than a billing guarantee. Monitor the Cloudflare dashboard as the corpus grows.
+GitHub Actions is the supported way to run all four extraction shards. For a diagnostic run of shard zero:
+
+```bash
+npm run rag:ingest-shard-0-cloud
+```
+
+The four shard states collectively stop before 8 GiB of tracked R2 storage or 700,000 tracked R2 writes in one calendar month. These are project safeguards rather than billing guarantees. Monitor the Cloudflare dashboard as the corpus grows.
 
 When `OPENAI_API_KEY` is absent, the Worker returns verified excerpts, page numbers, and official PDF links without model synthesis. When OpenAI is enabled, pair it with an AI Gateway spend limit.
 

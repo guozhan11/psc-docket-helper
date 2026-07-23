@@ -20,6 +20,7 @@ interface SearchRow {
   page_number: number;
   text: string;
   rank: number;
+  evidence_kind?: "content" | "metadata";
 }
 
 interface CompactDocumentRow {
@@ -29,8 +30,8 @@ interface CompactDocumentRow {
   title: string;
   received_date: string | null;
   official_pdf_url: string;
-  r2_key: string;
-  term_filter: ArrayBuffer | number[] | string;
+  r2_key: string | null;
+  term_filter: ArrayBuffer | number[] | string | null;
 }
 
 interface ManifestDocumentRow {
@@ -40,8 +41,9 @@ interface ManifestDocumentRow {
   title: string;
   received_date: string | null;
   official_pdf_url: string;
-  r2_key: string;
-  term_filter_b64: string;
+  r2_key?: string | null;
+  term_filter_b64?: string | null;
+  metadata_only?: boolean;
 }
 
 interface CaseManifest {
@@ -130,6 +132,9 @@ function citationTitle(title: string): string {
 }
 
 function filingCitation(row: SearchRow): string {
+  if (row.evidence_kind === "metadata") {
+    return `[${citationTitle(row.title)} — filing record](${row.official_pdf_url})`;
+  }
   return `[${citationTitle(row.title)} — p. ${row.page_number}](${officialPdfPageUrl(row)})`;
 }
 
@@ -342,17 +347,20 @@ function toFilterBytes(value: ArrayBuffer | number[] | string): Uint8Array {
   return new Uint8Array(value);
 }
 
-async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<CompactDocumentRow[]> {
-  if (!/^[A-Z][A-Z0-9-]{2,30}$/.test(caseNumber)) return [];
-  const object = await env.DOCUMENTS.get(`manifests/${caseNumber}.json.gz`);
+async function loadManifestObject(
+  env: WorkerEnv,
+  caseNumber: string,
+  key: string
+): Promise<CompactDocumentRow[]> {
+  const object = await env.DOCUMENTS.get(key);
   if (!object) return [];
   if (object.size > 32 * 1024 * 1024) {
-    throw new Error(`Case manifest is too large: ${caseNumber} (${object.size} bytes)`);
+    throw new Error(`Case manifest is too large: ${key} (${object.size} bytes)`);
   }
   const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
   const payload = JSON.parse(await new Response(stream).text()) as CaseManifest;
-  if (payload.version !== 1 || payload.caseNumber !== caseNumber || !Array.isArray(payload.documents)) {
-    throw new Error(`Invalid case manifest: ${caseNumber}`);
+  if (![1, 2].includes(payload.version) || payload.caseNumber !== caseNumber || !Array.isArray(payload.documents)) {
+    throw new Error(`Invalid case manifest: ${key}`);
   }
   return payload.documents.map(document => ({
     filing_id: Number(document.filing_id),
@@ -361,9 +369,39 @@ async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<Com
     title: document.title,
     received_date: document.received_date,
     official_pdf_url: document.official_pdf_url,
-    r2_key: document.r2_key,
-    term_filter: document.term_filter_b64
+    r2_key: document.r2_key ?? null,
+    term_filter: document.term_filter_b64 ?? null
   }));
+}
+
+async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<CompactDocumentRow[]> {
+  if (!/^[A-Z][A-Z0-9-]{2,30}$/.test(caseNumber)) return [];
+  const keys = [
+    `manifests/${caseNumber}.json.gz`,
+    ...Array.from(
+      { length: 4 },
+      (_, shardIndex) => `manifests-v2/${caseNumber}/part-${shardIndex}-of-4.json.gz`
+    )
+  ];
+  const groups = await Promise.all(keys.map(key =>
+    loadManifestObject(env, caseNumber, key).catch(error => {
+      console.error(JSON.stringify({
+        message: "R2 manifest shard unavailable",
+        error: String(error),
+        caseNumber,
+        key
+      }));
+      return [];
+    })
+  ));
+  const documents = new Map<number, CompactDocumentRow>();
+  for (const document of groups.flat()) {
+    const existing = documents.get(document.filing_id);
+    if (!existing || (!existing.r2_key && document.r2_key)) {
+      documents.set(document.filing_id, document);
+    }
+  }
+  return Array.from(documents.values());
 }
 
 function findPageExcerpts(html: string, terms: string[], document: CompactDocumentRow): SearchRow[] {
@@ -399,6 +437,7 @@ async function searchCompactDocuments(
 ): Promise<SearchRow[]> {
   const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
   const addCandidate = (document: CompactDocumentRow) => {
+    if (!document.r2_key || !document.term_filter) return;
     const filter = toFilterBytes(document.term_filter);
     const filterHits = terms.filter(term => termMayExist(filter, term)).length;
     if (filterHits <= 0) return;
@@ -408,12 +447,8 @@ async function searchCompactDocuments(
     }
   };
 
-  try {
-    const manifestDocuments = await loadCaseManifest(env, caseNumber);
-    for (const document of manifestDocuments) addCandidate(document);
-  } catch (error) {
-    console.error(JSON.stringify({ message: "R2 case manifest unavailable", error: String(error), caseNumber }));
-  }
+  const manifestDocuments = await loadCaseManifest(env, caseNumber);
+  for (const document of manifestDocuments) addCandidate(document);
 
   const pageSize = 750;
   for (const database of searchDatabases(env)) {
@@ -439,6 +474,7 @@ async function searchCompactDocuments(
   for (let start = 0; start < selected.length; start += 4) {
     const batch = selected.slice(start, start + 4);
     const batchRows = await Promise.all(batch.map(async document => {
+      if (!document.r2_key) return [];
       const object = await env.DOCUMENTS.get(document.r2_key);
       if (!object || object.size > 3 * 1024 * 1024) return [];
       const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
@@ -447,7 +483,32 @@ async function searchCompactDocuments(
     }));
     rows.push(...batchRows.flat());
   }
-  return rows.sort((left, right) => left.rank - right.rank).slice(0, 8);
+  const contentRows = rows.sort((left, right) => left.rank - right.rank).slice(0, 8);
+  if (contentRows.length) return contentRows;
+
+  const metadataRows = manifestDocuments
+    .map(document => {
+      const haystack = `${document.title} ${document.docket_number ?? ""}`.toLowerCase();
+      const matchingTerms = terms.filter(term => haystack.includes(term));
+      return { document, score: matchingTerms.length };
+    })
+    .filter(item => terms.length === 0 || item.score > 0)
+    .sort((left, right) => right.score - left.score
+      || String(right.document.received_date || "").localeCompare(String(left.document.received_date || "")))
+    .slice(0, 8);
+  return metadataRows.map(({ document, score }) => ({
+    filing_id: document.filing_id,
+    case_number: document.case_number,
+    docket_number: document.docket_number,
+    title: document.title,
+    received_date: document.received_date,
+    official_pdf_url: document.official_pdf_url,
+    page_number: 1,
+    text: `Metadata-only public filing record. Filing title/description: ${document.title}. `
+      + "The document body has not been extracted yet; do not claim that this record proves its contents.",
+    rank: -score,
+    evidence_kind: "metadata"
+  }));
 }
 
 async function searchLegacyFts(env: WorkerEnv, caseNumber: string | null, terms: string[]): Promise<SearchRow[]> {
@@ -483,7 +544,7 @@ async function searchLegacyFts(env: WorkerEnv, caseNumber: string | null, terms:
 async function searchDockets(env: WorkerEnv, message: string): Promise<SearchRow[]> {
   const terms = buildSearchTerms(message);
   const caseNumber = extractCaseIdentifier(message);
-  if (caseNumber && terms.length) {
+  if (caseNumber) {
     try {
       const compactRows = await searchCompactDocuments(env, caseNumber, terms);
       if (compactRows.length) return compactRows;
@@ -506,7 +567,15 @@ function sourceContext(rows: SearchRow[]): string {
   if (!rows.length) {
     return "No matching indexed filing excerpts were found. Do not claim that the corpus proves an answer.";
   }
-  return rows.map((row, index) => [
+  return rows.map((row, index) => row.evidence_kind === "metadata" ? [
+    `Internal metadata record ${index + 1} (do not expose this number to the user)`,
+    `Required citation: ${filingCitation(row)}`,
+    `Case: ${row.case_number}`,
+    `Filing title/description: ${row.title}`,
+    `Date: ${row.received_date ?? "unknown"}`,
+    `Official PDF URL: ${row.official_pdf_url}`,
+    "Important: only filing metadata is indexed. Do not claim that the document body contains a fact or keyword."
+  ].join("\n") : [
     `Internal evidence record ${index + 1} (do not expose this number to the user)`,
     `Required citation: ${filingCitation(row)}`,
     `Case: ${row.case_number}`,
@@ -543,11 +612,15 @@ async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message:
     }
     return [
       `I found ${rows.length} matching excerpt(s) in the indexed filings. AI synthesis is disabled, so these results are shown directly without any model/API charge.`,
-      ...rows.map((row, index) => [
-        `**${index + 1}. ${row.case_number}: ${row.title} — page ${row.page_number}**`,
-        row.text.slice(0, 700),
-        `[Open the official PDF at page ${row.page_number}](${officialPdfPageUrl(row)})`
-      ].join("\n\n")),
+      ...rows.map((row, index) => row.evidence_kind === "metadata" ? [
+        `**${index + 1}. ${row.case_number}: ${row.title}**`,
+        "This filing is covered by metadata; full-text extraction is still pending.",
+        `[Open the official PDF](${row.official_pdf_url})`
+      ].join("\n\n") : [
+          `**${index + 1}. ${row.case_number}: ${row.title} — page ${row.page_number}**`,
+          row.text.slice(0, 700),
+          `[Open the official PDF at page ${row.page_number}](${officialPdfPageUrl(row)})`
+        ].join("\n\n")),
       `[Search the complete official e-Docket](${EDOCKET_SEARCH_URL})`
     ].join("\n\n---\n\n");
   }
@@ -564,7 +637,8 @@ async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message:
       instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
 Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
-Never show labels such as Source 1, Source 2, or Evidence 1 to the user. A citation must identify the filing by title and PDF page, for example [Pepco Updated Remand Testimony — p. 374](official PDF page URL).
+Metadata-only records may establish that a filing exists, its title, date, case, and official URL, but never what its document body says.
+Never show labels such as Source 1, Source 2, or Evidence 1 to the user. Content citations must identify the filing by title and PDF page; metadata citations must identify it as a filing record.
 Never invent a filing, quotation, page, date, or URL. If evidence is insufficient, say so and suggest a narrower search.
 Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
       input: `INDEXED E-DOCKET EXCERPTS:\n${sourceContext(rows)}\n\nCONVERSATION:\n${buildTranscript(history, message)}`,
@@ -580,7 +654,9 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
   const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
   if (!sources.length) return reply;
   return `${reply}\n\n---\n**Official filing sources**\n${sources.map(row =>
-    `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
+    row.evidence_kind === "metadata"
+      ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
+      : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
   ).join("\n")}`;
 }
 
@@ -589,18 +665,36 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
 
   if (url.pathname === "/api/health" && request.method === "GET") {
-    const shardCounts = await Promise.all(searchDatabases(env).map(database => database.prepare(
+    const [shardCounts, metadataObject, ...ingestionObjects] = await Promise.all([
+      Promise.all(searchDatabases(env).map(database => database.prepare(
       `SELECT COUNT(*) AS documents,
               COUNT(term_filter) AS compactDocuments,
               (SELECT COUNT(DISTINCT case_number) FROM document_cases) AS cases
          FROM documents`
-    ).first<{ documents: number; compactDocuments: number; cases: number }>().catch(() => null)));
+      ).first<{ documents: number; compactDocuments: number; cases: number }>().catch(() => null))),
+      env.DOCUMENTS.get("ingestion/metadata-coverage-v2.json"),
+      ...Array.from({ length: 4 }, (_, shardIndex) =>
+        env.DOCUMENTS.get(`ingestion/fast-r2-state-v2-${shardIndex}-of-4.json`)
+      )
+    ]);
     const counts = shardCounts.reduce((total, shard) => ({
       documents: total.documents + (shard?.documents ?? 0),
       compactDocuments: total.compactDocuments + (shard?.compactDocuments ?? 0),
       cases: total.cases + (shard?.cases ?? 0)
     }), { documents: 0, compactDocuments: 0, cases: 0 });
-    return json({ status: "ok", cloudRag: counts, shards: shardCounts });
+    const metadataCoverage = metadataObject
+      ? await metadataObject.json<Record<string, unknown>>().catch(() => null)
+      : null;
+    const ingestionShards = await Promise.all(ingestionObjects.map(object =>
+      object ? object.json<Record<string, unknown>>().catch(() => null) : null
+    ));
+    return json({
+      status: "ok",
+      cloudRag: counts,
+      shards: shardCounts,
+      metadataCoverage,
+      ingestionShards
+    });
   }
 
   if (url.pathname === "/api/news" && request.method === "GET") {

@@ -8,7 +8,7 @@ An experimental AI assistant for exploring District of Columbia Public Service C
 
 No installation is required.
 
-> **RAG coverage is still in progress.** The searchable filing corpus does not yet include every PSC case. The current index is centered on FC1176, and an automated backfill is gradually adding public filings from other cases. A missing answer may reflect incomplete data coverage rather than the absence of an official record.
+> **RAG coverage is still in progress.** Public filing metadata and official PDF links are indexed first, while four parallel cloud jobs gradually add page-level full text. A filing may therefore be discoverable before its contents are searchable. A missing content answer may reflect incomplete full-text coverage rather than the absence of an official record.
 
 ## What It Does
 
@@ -26,7 +26,7 @@ Questions that identify a formal case and a specific issue generally produce the
 
 ## How It Works
 
-Public filing PDFs are downloaded temporarily and in parallel, converted into searchable page-level text, and stored as compressed HTML in Cloudflare R2. Compact per-case manifests in R2 hold filing metadata and search filters. The Worker verifies exact matches against the stored text before OpenAI prepares an answer, and every citation links back to the official PDF.
+Public filing metadata and official links are published first. Four non-overlapping cloud jobs then download PDFs temporarily, convert them into searchable page-level text, and store compressed HTML in Cloudflare R2. Sharded per-case manifests hold metadata and search filters without concurrent-write conflicts. The Worker verifies exact matches against stored text before OpenAI prepares an answer, and every citation links back to the official PDF.
 
 The original PDFs are not permanently duplicated in project storage. Scheduled ingestion resumes from its previous checkpoint and stays within conservative Cloudflare free-plan safety limits.
 
