@@ -33,7 +33,6 @@ npm run cloudflare:dev
 Add these GitHub Actions secrets:
 
 - `CLOUDFLARE_ACCOUNT_ID`
-- `CLOUDFLARE_API_TOKEN`
 - `R2_BUCKET_NAME`
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
