@@ -23,7 +23,7 @@ on:
       concurrency:
         description: "PDF workers per shard (4 shards run in parallel)"
         required: false
-        default: "4"
+        default: "2"
         type: string
       max_hours:
         description: "Stop cleanly before the GitHub Actions timeout"
@@ -93,9 +93,9 @@ jobs:
 
   ingest:
     needs: metadata
-    # Metadata shards stop cleanly before their timeout. A transient failure in
-    # one shard must not prevent the independent full-text cursors from moving.
-    if: ${{ always() && !cancelled() && (github.event_name == 'schedule' || inputs.scope == 'all') }}
+    # A clean time-budget exit is a success and permits ingestion. A hard
+    # metadata/API failure must not launch more traffic against DC PSC.
+    if: ${{ needs.metadata.result == 'success' && (github.event_name == 'schedule' || inputs.scope == 'all') }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
@@ -111,7 +111,7 @@ jobs:
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       INPUT_LIMIT: ${{ inputs.limit || '0' }}
-      INPUT_CONCURRENCY: ${{ inputs.concurrency || '4' }}
+      INPUT_CONCURRENCY: ${{ inputs.concurrency || '2' }}
       INPUT_MAX_HOURS: ${{ inputs.max_hours || '5.25' }}
     steps:
       - uses: actions/checkout@v4

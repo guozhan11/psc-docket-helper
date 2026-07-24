@@ -13,13 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import requests
-
 from cloud_ingest import (
     EDOCKET_API,
     PAGE_SIZE,
     USER_AGENT,
     clean_text,
+    dcpsc_request,
     docket_case_numbers,
     iter_filings,
     normalize_case_number,
@@ -30,7 +29,7 @@ from cloud_ingest import (
 from fast_r2_ingest import FastR2Store, SHARD_RECORD_CAPACITY
 
 METADATA_STATE_VERSION = 3
-METADATA_PAGE_CONCURRENCY = 12
+METADATA_PAGE_CONCURRENCY = 3
 DEFAULT_CHECKPOINT_RECORDS = 5_000
 
 
@@ -83,28 +82,21 @@ def save_status(store: FastR2Store, key: str, status: dict[str, Any]) -> None:
 
 
 def fetch_metadata_page(offset: int) -> tuple[int, list[dict[str, Any]]]:
-    for attempt in range(3):
-        try:
-            response = requests.get(
-                f"{EDOCKET_API}Filing/GetFilings",
-                params={
-                    "caseNumber": "",
-                    "isAdmin": "false",
-                    "orderByColumn": "receivedDate",
-                    "sortBy": "asc",
-                    "recordsToSkip": offset,
-                    "recordsToShow": PAGE_SIZE,
-                },
-                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-                timeout=60,
-            )
-            response.raise_for_status()
-            return offset, response.json().get("resultsSet") or []
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(2 ** attempt)
-    raise RuntimeError("unreachable")
+    with dcpsc_request(
+        "GET",
+        f"{EDOCKET_API}Filing/GetFilings",
+        params={
+            "caseNumber": "",
+            "isAdmin": "false",
+            "orderByColumn": "receivedDate",
+            "sortBy": "asc",
+            "recordsToSkip": offset,
+            "recordsToShow": PAGE_SIZE,
+        },
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        timeout=60,
+    ) as response:
+        return offset, response.json().get("resultsSet") or []
 
 
 def public_pdf_metadata_pages(

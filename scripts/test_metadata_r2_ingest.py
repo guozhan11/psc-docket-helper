@@ -13,6 +13,9 @@ import metadata_r2_ingest as metadata
 
 
 class MetadataShardTests(unittest.TestCase):
+    def test_metadata_api_concurrency_stays_conservative(self) -> None:
+        self.assertLessEqual(metadata.METADATA_PAGE_CONCURRENCY, 3)
+
     def test_shard_bounds_match_full_text_ranges(self) -> None:
         total = 204_191
         self.assertEqual(metadata.shard_bounds(total, 0, 4), (0, 62_500))

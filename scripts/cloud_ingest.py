@@ -9,9 +9,11 @@ import hashlib
 import html
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -30,6 +32,8 @@ MAX_D1_ESTIMATED_BYTES = 400 * 1024 * 1024
 MAX_DOCUMENTS_PER_RUN = 5_000
 MAX_D1_ROWS_WRITTEN_PER_DAY = 80_000
 MAX_R2_OBJECTS_WRITTEN_PER_DAY = 5_000
+DCPSC_REQUEST_ATTEMPTS = 6
+DCPSC_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
 class FreeTierLimitReached(RuntimeError):
@@ -74,8 +78,62 @@ def pdf_url(filing: dict[str, Any]) -> str:
     return requests.Request("GET", f"{EDOCKET_API}Filing/download", params=params).prepare().url
 
 
+def dcpsc_retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    if retry_after:
+        try:
+            return min(60.0, max(0.0, float(retry_after)))
+        except ValueError:
+            pass
+    return min(30.0, 2.0 ** attempt) + random.uniform(0.0, 1.0)
+
+
+def dcpsc_request(
+    method: str,
+    url: str,
+    *,
+    session: requests.Session | None = None,
+    attempts: int = DCPSC_REQUEST_ATTEMPTS,
+    **kwargs: Any,
+) -> requests.Response:
+    """Call DC PSC with bounded exponential backoff for transient failures."""
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    client = session or requests
+    for attempt in range(attempts):
+        try:
+            response = client.request(method, url, **kwargs)
+        except requests.RequestException as error:
+            if attempt == attempts - 1:
+                raise
+            delay = dcpsc_retry_delay(attempt)
+            print(
+                f"DC PSC request failed ({type(error).__name__}); "
+                f"retrying in {delay:.1f}s ({attempt + 2}/{attempts}).",
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code not in DCPSC_RETRYABLE_STATUS_CODES:
+            response.raise_for_status()
+            return response
+        if attempt == attempts - 1:
+            response.raise_for_status()
+        delay = dcpsc_retry_delay(attempt, response.headers.get("Retry-After"))
+        status = response.status_code
+        response.close()
+        print(
+            f"DC PSC returned HTTP {status}; retrying in {delay:.1f}s "
+            f"({attempt + 2}/{attempts}).",
+            flush=True,
+        )
+        time.sleep(delay)
+    raise RuntimeError("unreachable")
+
+
 def official_filing_total() -> int:
-    response = requests.get(
+    with dcpsc_request(
+        "GET",
         f"{EDOCKET_API}Filing/GetFilings",
         params={
             "caseNumber": "",
@@ -87,9 +145,8 @@ def official_filing_total() -> int:
         },
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
         timeout=60,
-    )
-    response.raise_for_status()
-    return int(response.json().get("totalRecords") or 0)
+    ) as response:
+        return int(response.json().get("totalRecords") or 0)
 
 
 def iter_filings(
@@ -110,8 +167,10 @@ def iter_filings(
         offset = start_offset if not case_numbers else 0
         total = 1
         while offset < total and (end_offset is None or offset < end_offset):
-            response = session.get(
+            with dcpsc_request(
+                "GET",
                 f"{EDOCKET_API}Filing/GetFilings",
+                session=session,
                 params={
                     "caseNumber": case_number.replace("FC", ""),
                     "isAdmin": "false",
@@ -121,9 +180,8 @@ def iter_filings(
                     "recordsToShow": PAGE_SIZE,
                 },
                 timeout=60,
-            )
-            response.raise_for_status()
-            payload = response.json()
+            ) as response:
+                payload = response.json()
             total = int(payload.get("totalRecords") or 0)
             records = payload.get("resultsSet") or []
             if not records:
@@ -166,8 +224,13 @@ def iter_filings(
 
 def download_pdf(filing: dict[str, Any], destination: Path) -> str:
     url = pdf_url(filing)
-    with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=120, stream=True) as response:
-        response.raise_for_status()
+    with dcpsc_request(
+        "GET",
+        url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=120,
+        stream=True,
+    ) as response:
         with destination.open("wb") as output:
             for block in response.iter_content(1024 * 1024):
                 output.write(block)
