@@ -41,6 +41,11 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3]
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -74,14 +79,23 @@ jobs:
           INPUT_SCOPE: ${{ inputs.scope }}
         run: |
           if [ "$INPUT_SCOPE" = "metadata" ]; then
-            python scripts/metadata_r2_ingest.py --mode full --shard-count 4
+            MODE=full
           else
-            python scripts/metadata_r2_ingest.py --mode auto --since-days 3 --shard-count 4
+            MODE=auto
           fi
+          python -u scripts/metadata_r2_ingest.py \
+            --mode "$MODE" \
+            --since-days 3 \
+            --shard-index "${{ matrix.shard }}" \
+            --shard-count 4 \
+            --max-hours 1.0 \
+            --checkpoint-records 5000
 
   ingest:
     needs: metadata
-    if: github.event_name == 'schedule' || inputs.scope == 'all'
+    # Metadata shards stop cleanly before their timeout. A transient failure in
+    # one shard must not prevent the independent full-text cursors from moving.
+    if: ${{ always() && !cancelled() && (github.event_name == 'schedule' || inputs.scope == 'all') }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
