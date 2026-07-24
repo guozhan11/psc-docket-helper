@@ -665,7 +665,7 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
 
   if (url.pathname === "/api/health" && request.method === "GET") {
-    const [shardCounts, metadataObject, ...ingestionObjects] = await Promise.all([
+    const [shardCounts, legacyMetadataObject, ...progressObjects] = await Promise.all([
       Promise.all(searchDatabases(env).map(database => database.prepare(
       `SELECT COUNT(*) AS documents,
               COUNT(term_filter) AS compactDocuments,
@@ -673,6 +673,9 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
          FROM documents`
       ).first<{ documents: number; compactDocuments: number; cases: number }>().catch(() => null))),
       env.DOCUMENTS.get("ingestion/metadata-coverage-v2.json"),
+      ...Array.from({ length: 4 }, (_, shardIndex) =>
+        env.DOCUMENTS.get(`ingestion/metadata-coverage-v3-${shardIndex}-of-4.json`)
+      ),
       ...Array.from({ length: 4 }, (_, shardIndex) =>
         env.DOCUMENTS.get(`ingestion/fast-r2-state-v2-${shardIndex}-of-4.json`)
       )
@@ -682,9 +685,49 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
       compactDocuments: total.compactDocuments + (shard?.compactDocuments ?? 0),
       cases: total.cases + (shard?.cases ?? 0)
     }), { documents: 0, compactDocuments: 0, cases: 0 });
-    const metadataCoverage = metadataObject
-      ? await metadataObject.json<Record<string, unknown>>().catch(() => null)
+    const metadataObjects = progressObjects.slice(0, 4);
+    const ingestionObjects = progressObjects.slice(4);
+    const metadataCoverageShards = await Promise.all(metadataObjects.map(object =>
+      object ? object.json<Record<string, unknown>>().catch(() => null) : null
+    ));
+    const legacyMetadataCoverage = legacyMetadataObject
+      ? await legacyMetadataObject.json<Record<string, unknown>>().catch(() => null)
       : null;
+    const numberValue = (value: unknown) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const availableMetadataShards = metadataCoverageShards.filter(
+      (item): item is Record<string, unknown> => item !== null
+    );
+    const updatedAt = availableMetadataShards
+      .map(item => typeof item.updatedAt === "string" ? item.updatedAt : "")
+      .filter(Boolean)
+      .sort()
+      .at(-1) ?? null;
+    const metadataCoverage = availableMetadataShards.length
+      ? {
+          version: 3,
+          shardCount: 4,
+          officialRecords: Math.max(
+            0,
+            ...availableMetadataShards.map(item => numberValue(item.officialRecords))
+          ),
+          officialRecordsScanned: availableMetadataShards.reduce(
+            (total, item) => total + numberValue(item.officialRecordsScanned),
+            0
+          ),
+          publicPdfRecords: availableMetadataShards.reduce(
+            (total, item) => total + numberValue(item.publicPdfRecords),
+            0
+          ),
+          fullScanComplete: metadataCoverageShards.every(
+            item => item?.fullScanComplete === true
+          ),
+          updatedAt,
+          shards: metadataCoverageShards
+        }
+      : legacyMetadataCoverage;
     const ingestionShards = await Promise.all(ingestionObjects.map(object =>
       object ? object.json<Record<string, unknown>>().catch(() => null) : null
     ));
