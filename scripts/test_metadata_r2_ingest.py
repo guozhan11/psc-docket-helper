@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import metadata_r2_ingest as metadata
@@ -14,7 +16,7 @@ import metadata_r2_ingest as metadata
 
 class MetadataShardTests(unittest.TestCase):
     def test_metadata_api_concurrency_stays_conservative(self) -> None:
-        self.assertLessEqual(metadata.METADATA_PAGE_CONCURRENCY, 3)
+        self.assertEqual(metadata.METADATA_PAGE_CONCURRENCY, 1)
 
     def test_shard_bounds_match_full_text_ranges(self) -> None:
         total = 204_191
@@ -93,6 +95,53 @@ class MetadataShardTests(unittest.TestCase):
         self.assertEqual(status["nextOffset"], 67_500)
         self.assertEqual(status["officialRecordsScanned"], 5_000)
         self.assertFalse(status["fullScanComplete"])
+
+    def test_request_failure_checkpoints_contiguous_progress(self) -> None:
+        events: list[tuple[str, object]] = []
+
+        class FakeR2:
+            def put_object(self, **kwargs) -> None:
+                events.append(("status", json.loads(kwargs["Body"])))
+
+        class FakeStore:
+            shard_index = 0
+            shard_count = 4
+            bucket = "test-bucket"
+            r2 = FakeR2()
+
+            def flush_manifests(self) -> None:
+                events.append(("flush", None))
+
+            def save_state(self) -> None:
+                events.append(("save-write-accounting", None))
+
+            def add_metadata(self, cases, document) -> None:
+                raise AssertionError("The synthetic page should contain no filings")
+
+        def failing_pages(start_offset: int, end_offset: int):
+            del start_offset, end_offset
+            yield 100, []
+            raise requests.HTTPError("502 Bad Gateway")
+
+        with patch.object(
+            metadata,
+            "public_pdf_metadata_pages",
+            side_effect=failing_pages,
+        ):
+            with self.assertRaises(requests.HTTPError):
+                metadata.run_full_scan(
+                    FakeStore(),
+                    {},
+                    total_records=1_000,
+                    checkpoint_records=5_000,
+                    max_hours=1.0,
+                )
+
+        status_events = [value for name, value in events if name == "status"]
+        self.assertEqual(len(status_events), 1)
+        self.assertEqual(status_events[0]["nextOffset"], 100)
+        self.assertEqual(status_events[0]["officialRecordsScanned"], 100)
+        self.assertFalse(status_events[0]["fullScanComplete"])
 
     def test_local_coordinator_launches_all_four_shards(self) -> None:
         commands: list[list[str]] = []

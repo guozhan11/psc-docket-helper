@@ -43,7 +43,8 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Keep aggregate DC PSC metadata traffic to two sequential requests.
+      max-parallel: 2
       matrix:
         shard: [0, 1, 2, 3]
     env:

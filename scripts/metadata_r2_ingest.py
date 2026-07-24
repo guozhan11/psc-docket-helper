@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import requests
+
 from cloud_ingest import (
     EDOCKET_API,
     PAGE_SIZE,
@@ -29,7 +31,7 @@ from cloud_ingest import (
 from fast_r2_ingest import FastR2Store, SHARD_RECORD_CAPACITY
 
 METADATA_STATE_VERSION = 3
-METADATA_PAGE_CONCURRENCY = 3
+METADATA_PAGE_CONCURRENCY = 1
 DEFAULT_CHECKPOINT_RECORDS = 5_000
 
 
@@ -106,23 +108,31 @@ def public_pdf_metadata_pages(
 ) -> Iterable[tuple[int, list[tuple[str, dict[str, Any]]]]]:
     """Yield pages in offset order so a persisted cursor is always contiguous."""
     offsets = range(start_offset, end_offset, PAGE_SIZE)
-    with ThreadPoolExecutor(max_workers=page_concurrency) as executor:
-        for offset, records in executor.map(fetch_metadata_page, offsets):
-            rows: list[tuple[str, dict[str, Any]]] = []
-            for filing in records:
-                attachment = str(filing.get("attachment") or "")
-                if (
-                    filing.get("isConfidential")
-                    or filing.get("isArchived")
-                    or not filing.get("attachmentId")
-                    or not attachment.lower().endswith(".pdf")
-                ):
-                    continue
-                docket = str(filing.get("docketNumber") or "")
-                docket_cases = docket_case_numbers(docket)
-                case_number = docket_cases[0] if docket_cases else normalize_case_number("")
-                rows.append((case_number, filing))
-            yield min(offset + PAGE_SIZE, end_offset), rows
+
+    def fetched_pages() -> Iterable[tuple[int, list[dict[str, Any]]]]:
+        if page_concurrency <= 1:
+            for offset in offsets:
+                yield fetch_metadata_page(offset)
+            return
+        with ThreadPoolExecutor(max_workers=page_concurrency) as executor:
+            yield from executor.map(fetch_metadata_page, offsets)
+
+    for offset, records in fetched_pages():
+        rows: list[tuple[str, dict[str, Any]]] = []
+        for filing in records:
+            attachment = str(filing.get("attachment") or "")
+            if (
+                filing.get("isConfidential")
+                or filing.get("isArchived")
+                or not filing.get("attachmentId")
+                or not attachment.lower().endswith(".pdf")
+            ):
+                continue
+            docket = str(filing.get("docketNumber") or "")
+            docket_cases = docket_case_numbers(docket)
+            case_number = docket_cases[0] if docket_cases else normalize_case_number("")
+            rows.append((case_number, filing))
+        yield min(offset + PAGE_SIZE, end_offset), rows
 
 
 def checkpoint_full_scan(
@@ -194,38 +204,60 @@ def run_full_scan(
         flush=True,
     )
 
-    for next_offset, rows in public_pdf_metadata_pages(start_offset, shard_end):
-        for case_number, filing in rows:
-            cases = related_case_numbers(case_number, filing.get("docketNumber"))
-            store.add_metadata(cases, metadata_document(case_number, filing))
-            public_pdf_records += 1
+    try:
+        for next_offset, rows in public_pdf_metadata_pages(start_offset, shard_end):
+            for case_number, filing in rows:
+                cases = related_case_numbers(case_number, filing.get("docketNumber"))
+                store.add_metadata(cases, metadata_document(case_number, filing))
+                public_pdf_records += 1
 
-        elapsed_hours = (time.monotonic() - started) / 3600
-        checkpoint_due = next_offset - last_checkpoint_offset >= checkpoint_records
-        time_limit_reached = elapsed_hours >= max_hours
-        if checkpoint_due or time_limit_reached:
-            checkpoint_full_scan(
-                store,
-                state_key,
-                prior,
-                total_records=total_records,
-                shard_start=shard_start,
-                shard_end=shard_end,
-                next_offset=next_offset,
-                public_pdf_records=public_pdf_records,
-                complete=False,
-            )
-            last_checkpoint_offset = next_offset
-            print(
-                f"Metadata checkpoint shard {store.shard_index + 1}/"
-                f"{store.shard_count}: {next_offset - shard_start:,}/"
-                f"{shard_end - shard_start:,} official records; "
-                f"{public_pdf_records:,} public PDFs; {elapsed_hours:.2f}h.",
-                flush=True,
-            )
-        if time_limit_reached:
-            print("Metadata time budget reached; exiting cleanly for the next run.", flush=True)
-            return
+            elapsed_hours = (time.monotonic() - started) / 3600
+            checkpoint_due = next_offset - last_checkpoint_offset >= checkpoint_records
+            time_limit_reached = elapsed_hours >= max_hours
+            if checkpoint_due or time_limit_reached:
+                checkpoint_full_scan(
+                    store,
+                    state_key,
+                    prior,
+                    total_records=total_records,
+                    shard_start=shard_start,
+                    shard_end=shard_end,
+                    next_offset=next_offset,
+                    public_pdf_records=public_pdf_records,
+                    complete=False,
+                )
+                last_checkpoint_offset = next_offset
+                print(
+                    f"Metadata checkpoint shard {store.shard_index + 1}/"
+                    f"{store.shard_count}: {next_offset - shard_start:,}/"
+                    f"{shard_end - shard_start:,} official records; "
+                    f"{public_pdf_records:,} public PDFs; {elapsed_hours:.2f}h.",
+                    flush=True,
+                )
+            if time_limit_reached:
+                print(
+                    "Metadata time budget reached; exiting cleanly for the next run.",
+                    flush=True,
+                )
+                return
+    except requests.RequestException:
+        checkpoint_full_scan(
+            store,
+            state_key,
+            prior,
+            total_records=total_records,
+            shard_start=shard_start,
+            shard_end=shard_end,
+            next_offset=next_offset,
+            public_pdf_records=public_pdf_records,
+            complete=False,
+        )
+        print(
+            f"Metadata request failed; saved contiguous progress through "
+            f"offset {next_offset:,} before exiting.",
+            flush=True,
+        )
+        raise
 
     complete = next_offset >= shard_end
     checkpoint_full_scan(
