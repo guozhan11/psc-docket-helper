@@ -22,6 +22,7 @@ import boto3
 
 from cloud_ingest import (
     clean_text,
+    compact_document_html,
     download_pdf,
     extract_pages,
     iter_filings,
@@ -34,7 +35,30 @@ MAX_R2_BYTES = 8 * 1024 * 1024 * 1024
 MAX_R2_WRITES_PER_MONTH = 700_000
 MANIFEST_FLUSH_BATCH = 100
 MANIFEST_VERSION = 2
+INGEST_STATE_VERSION = 3
+CONTENT_FORMAT = "compact-text-v1"
 SHARD_RECORD_CAPACITY = 250_000
+
+
+def migrated_ingest_state(
+    legacy_state: dict[str, Any],
+    shard_index: int,
+    shard_count: int,
+) -> dict[str, Any]:
+    shard_width = SHARD_RECORD_CAPACITY // shard_count
+    return {
+        **legacy_state,
+        "version": INGEST_STATE_VERSION,
+        "shardIndex": shard_index,
+        "shardCount": shard_count,
+        # Restart at the shard boundary so legacy image-heavy objects are
+        # overwritten in place; already-compact objects are cheaply reused.
+        "nextOffset": shard_width * shard_index,
+        "documentsIndexed": int(legacy_state.get("documentsIndexed") or 0),
+        "documentsCompacted": 0,
+        "failedFilingIds": legacy_state.get("failedFilingIds") or [],
+        "migrationFromStateVersion": MANIFEST_VERSION,
+    }
 
 
 def require_env(name: str) -> str:
@@ -63,6 +87,10 @@ class FastR2Store:
         self.shard_index = shard_index
         self.shard_count = shard_count
         self.state_key = (
+            f"ingestion/fast-r2-state-v{INGEST_STATE_VERSION}-"
+            f"{shard_index}-of-{shard_count}.json"
+        )
+        self.legacy_state_key = (
             f"ingestion/fast-r2-state-v{MANIFEST_VERSION}-"
             f"{shard_index}-of-{shard_count}.json"
         )
@@ -90,14 +118,14 @@ class FastR2Store:
             if shared_connection
             else self._storage_bytes()
         )
-        self.state = self._load_json(self.state_key) or {
-            "version": MANIFEST_VERSION,
-            "shardIndex": shard_index,
-            "shardCount": shard_count,
-            "nextOffset": 0,
-            "documentsIndexed": 0,
-            "failedFilingIds": [],
-        }
+        self.state = self._load_json(self.state_key)
+        if not self.state:
+            legacy_state = self._load_json(self.legacy_state_key) or {}
+            self.state = migrated_ingest_state(
+                legacy_state,
+                shard_index,
+                shard_count,
+            )
         current_month = datetime.now(timezone.utc).strftime("%Y-%m")
         if self.state.get("writeMonth") != current_month:
             self.state["writeMonth"] = current_month
@@ -143,6 +171,15 @@ class FastR2Store:
             raise RuntimeError("R2 storage safety ceiling reached (8 GiB)")
         self.monthly_writes += 1
         self.storage_bytes += added_bytes
+
+    def _object_size(self, key: str) -> int:
+        try:
+            response = self.r2.head_object(Bucket=self.bucket, Key=key)
+            return int(response.get("ContentLength") or 0)
+        except Exception as error:
+            if "NoSuchKey" in str(error) or "404" in str(error) or "Not Found" in str(error):
+                return 0
+            raise
 
     def _manifest_key(self, case_number: str) -> str:
         return (
@@ -205,7 +242,8 @@ class FastR2Store:
         self.manifests[case_number] = documents
         return documents
 
-    def reuse_existing(self, case_numbers: list[str], filing_id: int) -> bool:
+    def existing_document_status(self, case_numbers: list[str], filing_id: int) -> str:
+        """Return missing, legacy, or compact while repairing case associations."""
         existing: dict[str, Any] | None = None
         loaded: list[tuple[str, dict[int, dict[str, Any]]]] = []
         for case_number in case_numbers:
@@ -215,12 +253,12 @@ class FastR2Store:
             if candidate and candidate.get("r2_key") and candidate.get("term_filter_b64"):
                 existing = candidate
         if not existing or not existing.get("r2_key"):
-            return False
+            return "missing"
         for case_number, manifest in loaded:
             if filing_id not in manifest:
                 manifest[filing_id] = existing
                 self.dirty_cases.add(case_number)
-        return True
+        return "compact" if existing.get("content_format") == CONTENT_FORMAT else "legacy"
 
     def add_document(self, case_numbers: list[str], document: dict[str, Any]) -> None:
         filing_id = int(document["filing_id"])
@@ -241,9 +279,10 @@ class FastR2Store:
                 manifest[filing_id] = document
             self.dirty_cases.add(safe_case_number(case_number))
 
-    def upload_html(self, key: str, compressed: bytes) -> None:
+    def upload_html(self, key: str, compressed: bytes) -> int:
+        previous_size = self._object_size(key)
         with self.lock:
-            self._reserve_write(len(compressed))
+            self._reserve_write(len(compressed) - previous_size)
             self.r2.put_object(
                 Bucket=self.bucket,
                 Key=key,
@@ -252,6 +291,7 @@ class FastR2Store:
                 ContentEncoding="gzip",
                 CacheControl="private, max-age=31536000, immutable",
             )
+        return previous_size
 
     def flush_manifests(self) -> None:
         for case_number in sorted(self.dirty_cases):
@@ -285,14 +325,15 @@ class FastR2Store:
             prior = [int(value) for value in self.state.get("failedFilingIds", [])]
             self.state["failedFilingIds"] = list(dict.fromkeys([*prior, *failures]))[-5000:]
         self.state["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        self.state["version"] = MANIFEST_VERSION
+        self.state["version"] = INGEST_STATE_VERSION
         self.state["shardIndex"] = self.shard_index
         self.state["shardCount"] = self.shard_count
         self.state["r2WritesThisMonth"] = self.monthly_writes + 1
         self.state["writeMonth"] = datetime.now(timezone.utc).strftime("%Y-%m")
         body = json.dumps(self.state, indent=2).encode("utf-8")
+        previous_size = self._object_size(self.state_key)
         with self.lock:
-            self._reserve_write(len(body))
+            self._reserve_write(len(body) - previous_size)
             self.r2.put_object(
                 Bucket=self.bucket,
                 Key=self.state_key,
@@ -312,15 +353,8 @@ def extract_and_upload(
         pdf_path = Path(temp_dir) / "source.pdf"
         source_url = download_pdf(filing, pdf_path)
         pages = extract_pages(pdf_path)
-        page_html = "\n".join(
-            f'<section data-page="{page["number"]}">{page["html"]}</section>' for page in pages
-        )
-        document_html = (
-            '<!doctype html><html><head><meta charset="utf-8"></head><body>'
-            f'<main data-filing-id="{filing_id}" data-case="{case_number}">'
-            f"{page_html}</main></body></html>"
-        ).encode("utf-8")
-        compressed = gzip.compress(document_html, compresslevel=6)
+        document_html = compact_document_html(filing_id, case_number, pages)
+        compressed = gzip.compress(document_html, compresslevel=9)
         year = str(filing.get("receivedDate") or "unknown")[:4]
         r2_key = f"filings/{year}/{filing_id}.html.gz"
         store.upload_html(r2_key, compressed)
@@ -339,6 +373,8 @@ def extract_and_upload(
             "r2_key": r2_key,
             "page_count": len(pages),
             "content_sha256": hashlib.sha256(document_html).hexdigest(),
+            "content_format": CONTENT_FORMAT,
+            "compressed_bytes": len(compressed),
             "term_filter_b64": base64.b64encode(create_term_filter(text)).decode("ascii"),
         }
         return cases, document
@@ -392,40 +428,61 @@ def main() -> None:
     started = time.monotonic()
     batch: list[tuple[str, dict[str, Any], int]] = []
     processed = 0
+    compacted = 0
     skipped = 0
     failed_total = 0
+    scanned_offset = start_offset
+    eligible_seen = False
+
+    def record_scanned_page(next_offset: int) -> None:
+        nonlocal scanned_offset
+        scanned_offset = max(scanned_offset, next_offset)
 
     def run_batch(items: list[tuple[str, dict[str, Any], int]]) -> bool:
-        nonlocal processed, skipped, failed_total
+        nonlocal processed, compacted, skipped, failed_total
         failures: list[int] = []
+        failure_offsets: list[int] = []
         futures = {}
         completed_offset = max(item[2] for item in items)
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             for case_number, filing, next_offset in items:
                 filing_id = int(filing["filingId"])
                 cases = related_case_numbers(case_number, filing.get("docketNumber"))
-                if store.reuse_existing(cases, filing_id):
+                status = store.existing_document_status(cases, filing_id)
+                if status == "compact":
                     skipped += 1
                     continue
                 future = executor.submit(extract_and_upload, store, case_number, filing)
-                futures[future] = (filing_id, next_offset)
+                futures[future] = (filing_id, next_offset, status == "legacy")
             for future in as_completed(futures):
-                filing_id, _ = futures[future]
+                filing_id, next_offset, was_legacy = futures[future]
                 try:
                     cases, document = future.result()
                     store.add_document(cases, document)
                     processed += 1
-                    store.state["documentsIndexed"] = int(store.state.get("documentsIndexed") or 0) + 1
+                    if was_legacy:
+                        compacted += 1
+                        store.state["documentsCompacted"] = int(
+                            store.state.get("documentsCompacted") or 0
+                        ) + 1
+                    else:
+                        store.state["documentsIndexed"] = int(
+                            store.state.get("documentsIndexed") or 0
+                        ) + 1
                     print(f"Indexed {document['case_number']} filing {filing_id} ({document['page_count']} pages)")
                 except Exception as error:
                     failures.append(filing_id)
+                    failure_offsets.append(next_offset)
                     failed_total += 1
                     print(f"FAILED filing {filing_id}: {error}")
         store.flush_manifests()
+        if failure_offsets:
+            completed_offset = min(completed_offset, min(failure_offsets) - 1)
         store.save_state(completed_offset if args.all else None, failures)
         elapsed_hours = (time.monotonic() - started) / 3600
         print(
-            f"Checkpoint: processed {processed:,}, skipped {skipped:,}, failed {failed_total:,}; "
+            f"Checkpoint: processed {processed:,}, compacted {compacted:,}, "
+            f"skipped {skipped:,}, failed {failed_total:,}; "
             f"offset {completed_offset:,}; elapsed {elapsed_hours:.2f}h."
         )
         return elapsed_hours < args.max_hours
@@ -437,7 +494,9 @@ def main() -> None:
         start_offset=start_offset,
         oldest_first=args.all,
         end_offset=shard_end,
+        on_page_scanned=record_scanned_page,
     ):
+        eligible_seen = True
         batch.append(item)
         if len(batch) >= MANIFEST_FLUSH_BATCH:
             if not run_batch(batch):
@@ -446,7 +505,20 @@ def main() -> None:
             batch = []
     if batch:
         run_batch(batch)
-    print(f"Fast R2 ingestion complete: {processed:,} new, {skipped:,} existing, {failed_total:,} failed.")
+    saved_offset = int(store.state.get("nextOffset") or start_offset)
+    if args.all and not failed_total and scanned_offset > saved_offset:
+        store.save_state(scanned_offset)
+    target_offset = min(shard_end, total_records) if shard_end is not None else total_records
+    if args.all and not eligible_seen and scanned_offset == start_offset < target_offset:
+        raise RuntimeError(
+            f"DC PSC returned no pages for incomplete shard at offset {start_offset:,}"
+        )
+    print(
+        f"Fast R2 ingestion complete: {processed:,} written, {compacted:,} compacted, "
+        f"{skipped:,} existing, {failed_total:,} failed."
+    )
+    if failed_total:
+        raise RuntimeError(f"Fast R2 ingestion completed with {failed_total:,} failed filing(s)")
 
 
 if __name__ == "__main__":

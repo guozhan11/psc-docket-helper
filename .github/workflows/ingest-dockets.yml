@@ -16,9 +16,9 @@ on:
           - all
           - metadata
       limit:
-        description: "Maximum eligible filings; 0 means run until the time limit"
+        description: "Maximum eligible filings per shard; use 100 for a free-tier canary"
         required: false
-        default: "0"
+        default: "100"
         type: string
       concurrency:
         description: "PDF workers per shard (4 shards run in parallel)"
@@ -94,16 +94,21 @@ jobs:
 
   ingest:
     needs: metadata
-    # A clean time-budget exit is a success and permits ingestion. A hard
-    # metadata/API failure must not launch more traffic against DC PSC.
-    if: ${{ needs.metadata.result == 'success' && (github.event_name == 'schedule' || inputs.scope == 'all') }}
+    # Scheduled full-text work stays paused during compact-format migration.
+    # Set repository variable ENABLE_SCHEDULED_INGEST=true after a manual
+    # canary confirms storage is shrinking and search remains healthy.
+    if: >-
+      ${{ needs.metadata.result == 'success' &&
+          ((github.event_name == 'workflow_dispatch' && inputs.scope == 'all') ||
+           (github.event_name == 'schedule' && vars.ENABLE_SCHEDULED_INGEST == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # One shard at a time keeps API and free-tier growth observable.
+      max-parallel: 1
       matrix:
         shard: [0, 1, 2, 3]
     env:

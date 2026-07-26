@@ -665,7 +665,13 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
 
   if (url.pathname === "/api/health" && request.method === "GET") {
-    const [shardCounts, legacyMetadataObject, ...progressObjects] = await Promise.all([
+    const [
+      shardCounts,
+      legacyMetadataObject,
+      metadataObjects,
+      ingestionV3Objects,
+      ingestionV2Objects
+    ] = await Promise.all([
       Promise.all(searchDatabases(env).map(database => database.prepare(
       `SELECT COUNT(*) AS documents,
               COUNT(term_filter) AS compactDocuments,
@@ -673,20 +679,21 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
          FROM documents`
       ).first<{ documents: number; compactDocuments: number; cases: number }>().catch(() => null))),
       env.DOCUMENTS.get("ingestion/metadata-coverage-v2.json"),
-      ...Array.from({ length: 4 }, (_, shardIndex) =>
+      Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
         env.DOCUMENTS.get(`ingestion/metadata-coverage-v3-${shardIndex}-of-4.json`)
-      ),
-      ...Array.from({ length: 4 }, (_, shardIndex) =>
+      )),
+      Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
+        env.DOCUMENTS.get(`ingestion/fast-r2-state-v3-${shardIndex}-of-4.json`)
+      )),
+      Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
         env.DOCUMENTS.get(`ingestion/fast-r2-state-v2-${shardIndex}-of-4.json`)
-      )
+      ))
     ]);
     const counts = shardCounts.reduce((total, shard) => ({
       documents: total.documents + (shard?.documents ?? 0),
       compactDocuments: total.compactDocuments + (shard?.compactDocuments ?? 0),
       cases: total.cases + (shard?.cases ?? 0)
     }), { documents: 0, compactDocuments: 0, cases: 0 });
-    const metadataObjects = progressObjects.slice(0, 4);
-    const ingestionObjects = progressObjects.slice(4);
     const metadataCoverageShards = await Promise.all(metadataObjects.map(object =>
       object ? object.json<Record<string, unknown>>().catch(() => null) : null
     ));
@@ -728,8 +735,13 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
           shards: metadataCoverageShards
         }
       : legacyMetadataCoverage;
-    const ingestionShards = await Promise.all(ingestionObjects.map(object =>
-      object ? object.json<Record<string, unknown>>().catch(() => null) : null
+    const ingestionShards = await Promise.all(ingestionV3Objects.map(
+      async (object, shardIndex) => {
+        const selected = object ?? ingestionV2Objects[shardIndex];
+        return selected
+          ? selected.json<Record<string, unknown>>().catch(() => null)
+          : null;
+      }
     ));
     return json({
       status: "ok",

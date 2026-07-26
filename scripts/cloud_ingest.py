@@ -16,7 +16,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import boto3
 import fitz
@@ -156,6 +156,7 @@ def iter_filings(
     start_offset: int = 0,
     oldest_first: bool = False,
     end_offset: int | None = None,
+    on_page_scanned: Callable[[int], None] | None = None,
 ) -> Iterable[tuple[str, dict[str, Any], int]]:
     session = requests.Session()
     session.headers.update({"Accept": "application/json", "User-Agent": USER_AGENT})
@@ -165,8 +166,10 @@ def iter_filings(
 
     for case_number in scopes:
         offset = start_offset if not case_numbers else 0
-        total = 1
-        while offset < total and (end_offset is None or offset < end_offset):
+        total: int | None = None
+        while (total is None or offset < total) and (
+            end_offset is None or offset < end_offset
+        ):
             with dcpsc_request(
                 "GET",
                 f"{EDOCKET_API}Filing/GetFilings",
@@ -186,11 +189,16 @@ def iter_filings(
             records = payload.get("resultsSet") or []
             if not records:
                 break
+            page_end = min(
+                offset + len(records),
+                total,
+                end_offset if end_offset is not None else total,
+            )
             reached_cutoff = False
             for record_index, filing in enumerate(records):
                 absolute_offset = offset + record_index
                 if end_offset is not None and absolute_offset >= end_offset:
-                    return
+                    break
                 received = filing.get("receivedDate") or ""
                 if cutoff and received:
                     try:
@@ -217,6 +225,10 @@ def iter_filings(
                 emitted += 1
                 if limit and emitted >= limit:
                     return
+            if on_page_scanned:
+                on_page_scanned(page_end)
+            if end_offset is not None and page_end >= end_offset:
+                return
             if reached_cutoff and not case_numbers:
                 break
             offset += PAGE_SIZE
@@ -247,10 +259,28 @@ def extract_pages(pdf_path: Path) -> list[dict[str, Any]]:
     try:
         for number, page in enumerate(document, start=1):
             text_value = page.get_text("text", sort=True).strip()
-            pages.append({"number": number, "text": text_value, "html": page.get_text("html")})
+            pages.append({"number": number, "text": text_value})
     finally:
         document.close()
     return pages
+
+
+def compact_document_html(
+    filing_id: int,
+    case_number: str,
+    pages: list[dict[str, Any]],
+) -> bytes:
+    """Build searchable page HTML without PDF images, fonts, or positioned spans."""
+    page_html = "\n".join(
+        f'<section data-page="{int(page["number"])}"><pre>'
+        f'{html.escape(str(page.get("text") or ""))}</pre></section>'
+        for page in pages
+    )
+    return (
+        '<!doctype html><html><head><meta charset="utf-8"></head><body>'
+        f'<main data-filing-id="{filing_id}" data-case="{html.escape(case_number)}">'
+        f"{page_html}</main></body></html>"
+    ).encode("utf-8")
 
 
 def maybe_ocr(pdf_path: Path, pages: list[dict[str, Any]], enabled: bool) -> tuple[Path, int]:
@@ -523,14 +553,7 @@ def process_filing(
         initial_pages = extract_pages(original)
         searchable_pdf, ocr_count = maybe_ocr(original, initial_pages, use_ocr)
         pages = extract_pages(searchable_pdf) if searchable_pdf != original else initial_pages
-        page_html = "\n".join(
-            f'<section data-page="{page["number"]}">{page["html"]}</section>' for page in pages
-        )
-        document_html = (
-            '<!doctype html><html><head><meta charset="utf-8"></head><body>'
-            f'<main data-filing-id="{filing_id}" data-case="{html.escape(case_number)}">'
-            f"{page_html}</main></body></html>"
-        ).encode("utf-8")
+        document_html = compact_document_html(filing_id, case_number, pages)
         compressed = gzip.compress(document_html, compresslevel=9)
         digest = hashlib.sha256(document_html).hexdigest()
         year = str(filing.get("receivedDate") or "unknown")[:4]

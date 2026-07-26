@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -100,6 +101,87 @@ class DcpscRequestTests(unittest.TestCase):
 
         self.assertEqual(session.request.call_count, 1)
         sleep.assert_not_called()
+
+
+class FilingIteratorTests(unittest.TestCase):
+    def test_resumes_from_nonzero_offset(self) -> None:
+        response = Mock()
+        response.json.return_value = {
+            "totalRecords": 62_501,
+            "resultsSet": [{
+                "filingId": 9001,
+                "docketNumber": "FC1176",
+                "attachment": "filing.pdf",
+                "attachmentId": 77,
+                "isConfidential": False,
+                "isArchived": False,
+            }],
+        }
+
+        with patch.object(
+            cloud_ingest,
+            "dcpsc_request",
+            return_value=nullcontext(response),
+        ) as request:
+            rows = list(cloud_ingest.iter_filings(
+                [],
+                0,
+                0,
+                start_offset=62_500,
+                oldest_first=True,
+                end_offset=62_501,
+            ))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][2], 62_501)
+        self.assertEqual(request.call_args.kwargs["params"]["recordsToSkip"], 62_500)
+
+    def test_reports_scanned_page_without_eligible_filings(self) -> None:
+        response = Mock()
+        response.json.return_value = {
+            "totalRecords": 62_600,
+            "resultsSet": [
+                {
+                    "filingId": index,
+                    "attachment": "filing.pdf",
+                    "attachmentId": index,
+                    "isConfidential": False,
+                    "isArchived": True,
+                }
+                for index in range(100)
+            ],
+        }
+        scanned: list[int] = []
+
+        with patch.object(
+            cloud_ingest,
+            "dcpsc_request",
+            return_value=nullcontext(response),
+        ):
+            rows = list(cloud_ingest.iter_filings(
+                [],
+                0,
+                0,
+                start_offset=62_500,
+                oldest_first=True,
+                end_offset=62_600,
+                on_page_scanned=scanned.append,
+            ))
+
+        self.assertEqual(rows, [])
+        self.assertEqual(scanned, [62_600])
+
+    def test_compact_html_keeps_text_and_omits_pdf_layout_data(self) -> None:
+        body = cloud_ingest.compact_document_html(
+            42,
+            "FC1176",
+            [{"number": 1, "text": "Rate < increase & review"}],
+        ).decode("utf-8")
+
+        self.assertIn('<section data-page="1"><pre>', body)
+        self.assertIn("Rate &lt; increase &amp; review", body)
+        self.assertNotIn("data:image", body)
+        self.assertNotIn("position:absolute", body)
 
 
 if __name__ == "__main__":
