@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -182,6 +183,64 @@ class FilingIteratorTests(unittest.TestCase):
         self.assertIn("Rate &lt; increase &amp; review", body)
         self.assertNotIn("data:image", body)
         self.assertNotIn("position:absolute", body)
+
+
+class PdfDownloadTests(unittest.TestCase):
+    @patch.object(cloud_ingest.time, "sleep")
+    @patch.object(cloud_ingest, "dcpsc_retry_delay", return_value=1.5)
+    def test_retries_an_incomplete_stream(
+        self,
+        _retry_delay: Mock,
+        sleep: Mock,
+    ) -> None:
+        broken = Mock()
+        broken.__enter__ = Mock(return_value=broken)
+        broken.__exit__ = Mock(return_value=False)
+        broken.iter_content.return_value = iter([
+            b"%PDF-partial",
+        ])
+        good = Mock()
+        good.__enter__ = Mock(return_value=good)
+        good.__exit__ = Mock(return_value=False)
+        good.iter_content.return_value = iter([b"%PDF-complete"])
+
+        def first_stream(_size: int):
+            yield b"%PDF-partial"
+            raise requests.exceptions.ChunkedEncodingError("incomplete")
+
+        broken.iter_content.side_effect = first_stream
+        filing = {"attachmentId": 1, "attachment": "document.pdf"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "document.pdf"
+            with patch.object(
+                cloud_ingest,
+                "dcpsc_request",
+                side_effect=[broken, good],
+            ) as request:
+                cloud_ingest.download_pdf(filing, destination, attempts=2)
+
+            self.assertEqual(destination.read_bytes(), b"%PDF-complete")
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1.5)
+
+    def test_non_pdf_is_permanently_unavailable_without_retry(self) -> None:
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.iter_content.return_value = iter([b"<html>missing</html>"])
+        filing = {"attachmentId": 1, "attachment": "document.pdf"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "document.pdf"
+            with patch.object(
+                cloud_ingest,
+                "dcpsc_request",
+                return_value=response,
+            ) as request:
+                with self.assertRaises(cloud_ingest.PermanentFilingError):
+                    cloud_ingest.download_pdf(filing, destination, attempts=3)
+
+        request.assert_called_once()
 
 
 if __name__ == "__main__":

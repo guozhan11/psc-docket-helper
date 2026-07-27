@@ -21,6 +21,7 @@ from typing import Any
 import boto3
 
 from cloud_ingest import (
+    PermanentFilingError,
     clean_text,
     compact_document_html,
     download_pdf,
@@ -318,12 +319,25 @@ class FastR2Store:
             self.manifest_sizes[case_number] = len(body)
         self.dirty_cases.clear()
 
-    def save_state(self, next_offset: int | None = None, failures: list[int] | None = None) -> None:
+    def save_state(
+        self,
+        next_offset: int | None = None,
+        failures: list[int] | None = None,
+        resolved: list[int] | None = None,
+        unavailable: list[int] | None = None,
+    ) -> None:
         if next_offset is not None:
             self.state["nextOffset"] = next_offset
-        if failures:
-            prior = [int(value) for value in self.state.get("failedFilingIds", [])]
-            self.state["failedFilingIds"] = list(dict.fromkeys([*prior, *failures]))[-5000:]
+        pending = {int(value) for value in self.state.get("failedFilingIds", [])}
+        pending.update(int(value) for value in failures or [])
+        pending.difference_update(int(value) for value in resolved or [])
+        pending.difference_update(int(value) for value in unavailable or [])
+        self.state["failedFilingIds"] = sorted(pending)[-5000:]
+        unavailable_ids = {
+            int(value) for value in self.state.get("unavailableFilingIds", [])
+        }
+        unavailable_ids.update(int(value) for value in unavailable or [])
+        self.state["unavailableFilingIds"] = sorted(unavailable_ids)[-5000:]
         self.state["updatedAt"] = datetime.now(timezone.utc).isoformat()
         self.state["version"] = INGEST_STATE_VERSION
         self.state["shardIndex"] = self.shard_index
@@ -407,11 +421,20 @@ def main() -> None:
         if args.all and args.shard_index == args.shard_count - 1
         else shard_width * (args.shard_index + 1) if args.all else None
     )
-    start_offset = (
+    resume_offset = (
         max(int(store.state.get("nextOffset") or 0), shard_start)
         if args.all
         else 0
     )
+    pending_retry_ids = {
+        int(value) for value in store.state.get("failedFilingIds", [])
+    }
+    start_offset = shard_start if args.all and pending_retry_ids else resume_offset
+    if pending_retry_ids:
+        print(
+            f"Retry recovery: rescanning shard for {len(pending_retry_ids):,} "
+            "previously failed filing(s); compact documents will be skipped."
+        )
     total_records = official_filing_total()
     if args.all and start_offset >= total_records:
         print(
@@ -431,17 +454,22 @@ def main() -> None:
     compacted = 0
     skipped = 0
     failed_total = 0
+    unavailable_total = 0
     scanned_offset = start_offset
     eligible_seen = False
+    earliest_retry_offset: int | None = None
 
     def record_scanned_page(next_offset: int) -> None:
         nonlocal scanned_offset
         scanned_offset = max(scanned_offset, next_offset)
 
     def run_batch(items: list[tuple[str, dict[str, Any], int]]) -> bool:
-        nonlocal processed, compacted, skipped, failed_total
+        nonlocal processed, compacted, skipped, failed_total, unavailable_total
+        nonlocal earliest_retry_offset
         failures: list[int] = []
         failure_offsets: list[int] = []
+        resolved: list[int] = []
+        unavailable: list[int] = []
         futures = {}
         completed_offset = max(item[2] for item in items)
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
@@ -469,7 +497,12 @@ def main() -> None:
                         store.state["documentsIndexed"] = int(
                             store.state.get("documentsIndexed") or 0
                         ) + 1
+                    resolved.append(filing_id)
                     print(f"Indexed {document['case_number']} filing {filing_id} ({document['page_count']} pages)")
+                except PermanentFilingError as error:
+                    unavailable.append(filing_id)
+                    unavailable_total += 1
+                    print(f"UNAVAILABLE filing {filing_id}: {error}")
                 except Exception as error:
                     failures.append(filing_id)
                     failure_offsets.append(next_offset)
@@ -477,12 +510,25 @@ def main() -> None:
                     print(f"FAILED filing {filing_id}: {error}")
         store.flush_manifests()
         if failure_offsets:
-            completed_offset = min(completed_offset, min(failure_offsets) - 1)
-        store.save_state(completed_offset if args.all else None, failures)
+            batch_retry_offset = min(failure_offsets) - 1
+            earliest_retry_offset = (
+                batch_retry_offset
+                if earliest_retry_offset is None
+                else min(earliest_retry_offset, batch_retry_offset)
+            )
+        if earliest_retry_offset is not None:
+            completed_offset = min(completed_offset, earliest_retry_offset)
+        store.save_state(
+            completed_offset if args.all else None,
+            failures,
+            resolved,
+            unavailable,
+        )
         elapsed_hours = (time.monotonic() - started) / 3600
         print(
             f"Checkpoint: processed {processed:,}, compacted {compacted:,}, "
-            f"skipped {skipped:,}, failed {failed_total:,}; "
+            f"skipped {skipped:,}, retryable failed {failed_total:,}, "
+            f"unavailable {unavailable_total:,}; "
             f"offset {completed_offset:,}; elapsed {elapsed_hours:.2f}h."
         )
         return elapsed_hours < args.max_hours
@@ -515,10 +561,14 @@ def main() -> None:
         )
     print(
         f"Fast R2 ingestion complete: {processed:,} written, {compacted:,} compacted, "
-        f"{skipped:,} existing, {failed_total:,} failed."
+        f"{skipped:,} existing, {failed_total:,} queued for retry, "
+        f"{unavailable_total:,} unavailable."
     )
     if failed_total:
-        raise RuntimeError(f"Fast R2 ingestion completed with {failed_total:,} failed filing(s)")
+        print(
+            "Retryable filing failures were checkpointed; the next scheduled run "
+            "will retry them without failing this shard."
+        )
 
 
 if __name__ == "__main__":

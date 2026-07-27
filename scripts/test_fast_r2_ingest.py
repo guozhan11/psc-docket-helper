@@ -74,6 +74,42 @@ class FastR2MigrationTests(unittest.TestCase):
         self.assertEqual(store.monthly_writes, 1)
         self.assertEqual(len(writes), 1)
 
+    def test_save_state_tracks_retryable_and_unavailable_filings(self) -> None:
+        writes: list[dict[str, object]] = []
+
+        class FakeR2:
+            def head_object(self, **_kwargs):
+                raise RuntimeError("404")
+
+            def put_object(self, **kwargs) -> None:
+                writes.append(kwargs)
+
+        store = fast.FastR2Store.__new__(fast.FastR2Store)
+        store.bucket = "test"
+        store.r2 = FakeR2()
+        store.lock = threading.Lock()
+        store.state_key = "state.json"
+        store.shard_index = 0
+        store.shard_count = 4
+        store.monthly_writes = 0
+        store.storage_bytes = 0
+        store.state = {
+            "failedFilingIds": [10, 11],
+            "unavailableFilingIds": [],
+        }
+
+        store.save_state(
+            100,
+            failures=[12],
+            resolved=[10],
+            unavailable=[11],
+        )
+
+        self.assertEqual(store.state["failedFilingIds"], [12])
+        self.assertEqual(store.state["unavailableFilingIds"], [11])
+        self.assertEqual(store.state["nextOffset"], 100)
+        self.assertEqual(len(writes), 1)
+
     def test_incomplete_shard_cannot_report_success_without_scanning(self) -> None:
         class FakeStore:
             shard_index = 1

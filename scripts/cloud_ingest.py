@@ -40,6 +40,10 @@ class FreeTierLimitReached(RuntimeError):
     """Raised before a write that would cross this project's safety budget."""
 
 
+class PermanentFilingError(RuntimeError):
+    """Raised when an official attachment cannot become searchable PDF text."""
+
+
 def require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -234,32 +238,62 @@ def iter_filings(
             offset += PAGE_SIZE
 
 
-def download_pdf(filing: dict[str, Any], destination: Path) -> str:
+def download_pdf(
+    filing: dict[str, Any],
+    destination: Path,
+    attempts: int = DCPSC_REQUEST_ATTEMPTS,
+) -> str:
+    """Download a complete PDF, retrying both HTTP and streamed-body failures."""
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
     url = pdf_url(filing)
-    with dcpsc_request(
-        "GET",
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=120,
-        stream=True,
-    ) as response:
-        with destination.open("wb") as output:
-            for block in response.iter_content(1024 * 1024):
-                output.write(block)
-    with destination.open("rb") as downloaded:
-        signature = downloaded.read(5)
-    if not signature.startswith(b"%PDF-"):
-        raise RuntimeError("Downloaded attachment is not a PDF")
-    return url
+    for attempt in range(attempts):
+        try:
+            with dcpsc_request(
+                "GET",
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=120,
+                stream=True,
+                attempts=1,
+            ) as response:
+                with destination.open("wb") as output:
+                    for block in response.iter_content(1024 * 1024):
+                        output.write(block)
+            with destination.open("rb") as downloaded:
+                signature = downloaded.read(5)
+            if not signature.startswith(b"%PDF-"):
+                raise PermanentFilingError("Downloaded attachment is not a PDF")
+            return url
+        except PermanentFilingError:
+            destination.unlink(missing_ok=True)
+            raise
+        except (requests.RequestException, OSError) as error:
+            destination.unlink(missing_ok=True)
+            if attempt == attempts - 1:
+                raise
+            delay = dcpsc_retry_delay(attempt)
+            print(
+                f"PDF download failed ({type(error).__name__}); "
+                f"retrying in {delay:.1f}s ({attempt + 2}/{attempts}).",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 def extract_pages(pdf_path: Path) -> list[dict[str, Any]]:
-    document = fitz.open(pdf_path)
+    try:
+        document = fitz.open(pdf_path)
+    except Exception as error:
+        raise PermanentFilingError(f"Downloaded PDF cannot be opened: {error}") from error
     pages = []
     try:
         for number, page in enumerate(document, start=1):
             text_value = page.get_text("text", sort=True).strip()
             pages.append({"number": number, "text": text_value})
+    except Exception as error:
+        raise PermanentFilingError(f"Downloaded PDF cannot be read: {error}") from error
     finally:
         document.close()
     return pages
