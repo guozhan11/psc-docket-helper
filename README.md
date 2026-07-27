@@ -8,7 +8,7 @@ An experimental AI assistant for exploring District of Columbia Public Service C
 
 No installation is required.
 
-> **RAG coverage is still in progress.** Public filing metadata and official PDF links are indexed first, while four parallel cloud jobs gradually add page-level full text. A filing may therefore be discoverable before its contents are searchable. A missing content answer may reflect incomplete full-text coverage rather than the absence of an official record.
+> **Full-text RAG coverage is still in progress.** Public filing metadata and official PDF links have been indexed, while four non-overlapping ingestion shards gradually add page-level full text. To stay within free-tier limits, the shards are currently processed one at a time. A filing may therefore be discoverable before its contents are searchable. A missing content answer may reflect incomplete full-text coverage rather than the absence of an official record. Current ingestion status is available from the [health endpoint](https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health).
 
 ## What It Does
 
@@ -26,9 +26,9 @@ Questions that identify a formal case and a specific issue generally produce the
 
 ## How It Works
 
-Public filing metadata and official links are published first. Four non-overlapping cloud jobs then download PDFs temporarily, convert them into searchable page-level text, and store compressed HTML in Cloudflare R2. Sharded per-case manifests hold metadata and search filters without concurrent-write conflicts. The Worker verifies exact matches against stored text before OpenAI prepares an answer, and every citation links back to the official PDF.
+Public filing metadata and official links are published first. Four non-overlapping ingestion shards then download PDFs temporarily, convert them into searchable page-level text, and store gzip-compressed, text-only HTML in Cloudflare R2. PDF images, embedded fonts, and layout data are not retained. Sharded per-case manifests hold metadata and search filters without concurrent-write conflicts. The Worker verifies exact matches against stored text before OpenAI prepares an answer, and every citation links back to the official PDF.
 
-The original PDFs are not permanently duplicated in project storage. Scheduled ingestion resumes from its previous checkpoint and stays within conservative Cloudflare free-plan safety limits.
+The original PDFs are not permanently duplicated in project storage. Scheduled ingestion processes one shard at a time, resumes from its previous checkpoint, and stops cleanly at conservative Cloudflare free-plan safety limits.
 
 ## Run Locally
 
