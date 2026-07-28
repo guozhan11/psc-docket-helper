@@ -34,6 +34,7 @@ from compact_search import create_term_filter
 
 MAX_R2_BYTES = 8 * 1024 * 1024 * 1024
 MAX_R2_WRITES_PER_MONTH = 700_000
+MAX_FILING_ATTEMPTS = 3
 MANIFEST_FLUSH_BATCH = 100
 MANIFEST_VERSION = 2
 INGEST_STATE_VERSION = 3
@@ -47,6 +48,9 @@ def migrated_ingest_state(
     shard_count: int,
 ) -> dict[str, Any]:
     shard_width = SHARD_RECORD_CAPACITY // shard_count
+    failed_filing_ids = [
+        int(value) for value in legacy_state.get("failedFilingIds") or []
+    ]
     return {
         **legacy_state,
         "version": INGEST_STATE_VERSION,
@@ -57,7 +61,10 @@ def migrated_ingest_state(
         "nextOffset": shard_width * shard_index,
         "documentsIndexed": int(legacy_state.get("documentsIndexed") or 0),
         "documentsCompacted": 0,
-        "failedFilingIds": legacy_state.get("failedFilingIds") or [],
+        "failedFilingIds": failed_filing_ids,
+        "failureAttempts": legacy_state.get("failureAttempts") or {
+            str(filing_id): 1 for filing_id in failed_filing_ids
+        },
         "migrationFromStateVersion": MANIFEST_VERSION,
     }
 
@@ -319,25 +326,56 @@ class FastR2Store:
             self.manifest_sizes[case_number] = len(body)
         self.dirty_cases.clear()
 
-    def save_state(
+    def update_filing_failures(
         self,
-        next_offset: int | None = None,
         failures: list[int] | None = None,
         resolved: list[int] | None = None,
         unavailable: list[int] | None = None,
-    ) -> None:
-        if next_offset is not None:
-            self.state["nextOffset"] = next_offset
+    ) -> list[int]:
         pending = {int(value) for value in self.state.get("failedFilingIds", [])}
-        pending.update(int(value) for value in failures or [])
-        pending.difference_update(int(value) for value in resolved or [])
-        pending.difference_update(int(value) for value in unavailable or [])
-        self.state["failedFilingIds"] = sorted(pending)[-5000:]
+        raw_attempts = self.state.get("failureAttempts")
+        attempts = {
+            int(filing_id): max(1, int(value))
+            for filing_id, value in (
+                raw_attempts.items() if isinstance(raw_attempts, dict) else []
+            )
+            if str(filing_id).isdigit()
+        }
+        for filing_id in pending:
+            attempts.setdefault(filing_id, 1)
+
+        resolved_ids = {int(value) for value in resolved or []}
+        permanent_ids = {int(value) for value in unavailable or []}
+        pending.difference_update(resolved_ids | permanent_ids)
+        for filing_id in resolved_ids | permanent_ids:
+            attempts.pop(filing_id, None)
+
+        exhausted: set[int] = set()
+        for filing_id in (int(value) for value in failures or []):
+            attempt_count = attempts.get(filing_id, 0) + 1
+            if attempt_count >= MAX_FILING_ATTEMPTS:
+                exhausted.add(filing_id)
+                pending.discard(filing_id)
+                attempts.pop(filing_id, None)
+            else:
+                pending.add(filing_id)
+                attempts[filing_id] = attempt_count
+
         unavailable_ids = {
             int(value) for value in self.state.get("unavailableFilingIds", [])
         }
-        unavailable_ids.update(int(value) for value in unavailable or [])
+        unavailable_ids.update(permanent_ids | exhausted)
+        self.state["failedFilingIds"] = sorted(pending)[-5000:]
+        self.state["failureAttempts"] = {
+            str(filing_id): attempts[filing_id]
+            for filing_id in self.state["failedFilingIds"]
+        }
         self.state["unavailableFilingIds"] = sorted(unavailable_ids)[-5000:]
+        return sorted(exhausted)
+
+    def save_state(self, next_offset: int | None = None) -> None:
+        if next_offset is not None:
+            self.state["nextOffset"] = next_offset
         self.state["updatedAt"] = datetime.now(timezone.utc).isoformat()
         self.state["version"] = INGEST_STATE_VERSION
         self.state["shardIndex"] = self.shard_index
@@ -453,21 +491,20 @@ def main() -> None:
     processed = 0
     compacted = 0
     skipped = 0
-    failed_total = 0
+    failure_total = 0
     unavailable_total = 0
     scanned_offset = start_offset
     eligible_seen = False
-    earliest_retry_offset: int | None = None
+    retry_offsets: dict[int, int] = {}
 
     def record_scanned_page(next_offset: int) -> None:
         nonlocal scanned_offset
         scanned_offset = max(scanned_offset, next_offset)
 
     def run_batch(items: list[tuple[str, dict[str, Any], int]]) -> bool:
-        nonlocal processed, compacted, skipped, failed_total, unavailable_total
-        nonlocal earliest_retry_offset
+        nonlocal processed, compacted, skipped, failure_total, unavailable_total
         failures: list[int] = []
-        failure_offsets: list[int] = []
+        failure_offsets: dict[int, int] = {}
         resolved: list[int] = []
         unavailable: list[int] = []
         futures = {}
@@ -479,6 +516,7 @@ def main() -> None:
                 status = store.existing_document_status(cases, filing_id)
                 if status == "compact":
                     skipped += 1
+                    resolved.append(filing_id)
                     continue
                 future = executor.submit(extract_and_upload, store, case_number, filing)
                 futures[future] = (filing_id, next_offset, status == "legacy")
@@ -505,29 +543,35 @@ def main() -> None:
                     print(f"UNAVAILABLE filing {filing_id}: {error}")
                 except Exception as error:
                     failures.append(filing_id)
-                    failure_offsets.append(next_offset)
-                    failed_total += 1
+                    failure_offsets[filing_id] = next_offset
+                    failure_total += 1
                     print(f"FAILED filing {filing_id}: {error}")
         store.flush_manifests()
-        if failure_offsets:
-            batch_retry_offset = min(failure_offsets) - 1
-            earliest_retry_offset = (
-                batch_retry_offset
-                if earliest_retry_offset is None
-                else min(earliest_retry_offset, batch_retry_offset)
-            )
-        if earliest_retry_offset is not None:
-            completed_offset = min(completed_offset, earliest_retry_offset)
-        store.save_state(
-            completed_offset if args.all else None,
+        exhausted = store.update_filing_failures(
             failures,
             resolved,
             unavailable,
         )
+        for filing_id, next_offset in failure_offsets.items():
+            if filing_id not in exhausted:
+                retry_offsets[filing_id] = next_offset - 1
+        for filing_id in [*resolved, *unavailable, *exhausted]:
+            retry_offsets.pop(filing_id, None)
+        if exhausted:
+            unavailable_total += len(exhausted)
+            print(
+                "UNAVAILABLE after retry limit: "
+                + ", ".join(str(filing_id) for filing_id in exhausted)
+            )
+        if retry_offsets:
+            completed_offset = min(completed_offset, min(retry_offsets.values()))
+        store.save_state(completed_offset if args.all else None)
         elapsed_hours = (time.monotonic() - started) / 3600
+        pending_count = len(store.state.get("failedFilingIds", []))
         print(
             f"Checkpoint: processed {processed:,}, compacted {compacted:,}, "
-            f"skipped {skipped:,}, retryable failed {failed_total:,}, "
+            f"skipped {skipped:,}, failures this run {failure_total:,}, "
+            f"pending retry {pending_count:,}, "
             f"unavailable {unavailable_total:,}; "
             f"offset {completed_offset:,}; elapsed {elapsed_hours:.2f}h."
         )
@@ -552,7 +596,8 @@ def main() -> None:
     if batch:
         run_batch(batch)
     saved_offset = int(store.state.get("nextOffset") or start_offset)
-    if args.all and not failed_total and scanned_offset > saved_offset:
+    pending_count = len(store.state.get("failedFilingIds", []))
+    if args.all and not pending_count and scanned_offset > saved_offset:
         store.save_state(scanned_offset)
     target_offset = min(shard_end, total_records) if shard_end is not None else total_records
     if args.all and not eligible_seen and scanned_offset == start_offset < target_offset:
@@ -561,10 +606,10 @@ def main() -> None:
         )
     print(
         f"Fast R2 ingestion complete: {processed:,} written, {compacted:,} compacted, "
-        f"{skipped:,} existing, {failed_total:,} queued for retry, "
+        f"{skipped:,} existing, {pending_count:,} queued for retry, "
         f"{unavailable_total:,} unavailable."
     )
-    if failed_total:
+    if pending_count:
         print(
             "Retryable filing failures were checkpointed; the next scheduled run "
             "will retry them without failing this shard."

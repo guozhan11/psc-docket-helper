@@ -29,6 +29,7 @@ class FastR2MigrationTests(unittest.TestCase):
         self.assertEqual(state["documentsIndexed"], 1_595)
         self.assertEqual(state["r2WritesThisMonth"], 12_209)
         self.assertEqual(state["failedFilingIds"], [2474])
+        self.assertEqual(state["failureAttempts"], {"2474": 1})
 
     def test_existing_document_requires_compact_format_to_skip(self) -> None:
         store = fast.FastR2Store.__new__(fast.FastR2Store)
@@ -98,17 +99,47 @@ class FastR2MigrationTests(unittest.TestCase):
             "unavailableFilingIds": [],
         }
 
-        store.save_state(
-            100,
+        exhausted = store.update_filing_failures(
             failures=[12],
             resolved=[10],
             unavailable=[11],
         )
+        store.save_state(100)
 
+        self.assertEqual(exhausted, [])
         self.assertEqual(store.state["failedFilingIds"], [12])
+        self.assertEqual(store.state["failureAttempts"], {"12": 1})
         self.assertEqual(store.state["unavailableFilingIds"], [11])
         self.assertEqual(store.state["nextOffset"], 100)
         self.assertEqual(len(writes), 1)
+
+    def test_retry_limit_moves_filing_to_unavailable(self) -> None:
+        store = fast.FastR2Store.__new__(fast.FastR2Store)
+        store.state = {
+            "failedFilingIds": [12],
+            "failureAttempts": {"12": fast.MAX_FILING_ATTEMPTS - 1},
+            "unavailableFilingIds": [],
+        }
+
+        exhausted = store.update_filing_failures(failures=[12])
+
+        self.assertEqual(exhausted, [12])
+        self.assertEqual(store.state["failedFilingIds"], [])
+        self.assertEqual(store.state["failureAttempts"], {})
+        self.assertEqual(store.state["unavailableFilingIds"], [12])
+
+    def test_legacy_pending_failure_starts_with_one_attempt(self) -> None:
+        store = fast.FastR2Store.__new__(fast.FastR2Store)
+        store.state = {
+            "failedFilingIds": [12],
+            "unavailableFilingIds": [],
+        }
+
+        exhausted = store.update_filing_failures(failures=[12])
+
+        self.assertEqual(exhausted, [])
+        self.assertEqual(store.state["failedFilingIds"], [12])
+        self.assertEqual(store.state["failureAttempts"], {"12": 2})
 
     def test_incomplete_shard_cannot_report_success_without_scanning(self) -> None:
         class FakeStore:

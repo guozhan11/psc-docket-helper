@@ -92,6 +92,51 @@ function json(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: CORS_HEADERS });
 }
 
+function numericStateValue(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function stateArrayLength(value: unknown): number {
+  return Array.isArray(value) ? value.length : 0;
+}
+
+function fullTextCoverageSummary(
+  ingestionShards: Array<Record<string, unknown> | null>,
+  publicPdfRecords: number
+) {
+  const indexedDocuments = ingestionShards.reduce(
+    (total, shard) => total + numericStateValue(shard?.documentsIndexed),
+    0
+  );
+  const retryPendingDocuments = ingestionShards.reduce(
+    (total, shard) => total + stateArrayLength(shard?.failedFilingIds),
+    0
+  );
+  const unavailableDocuments = ingestionShards.reduce(
+    (total, shard) => total + stateArrayLength(shard?.unavailableFilingIds),
+    0
+  );
+  const searchablePercent = publicPdfRecords > 0
+    ? Math.min(100, Number((indexedDocuments * 100 / publicPdfRecords).toFixed(2)))
+    : 0;
+  const accountedPercent = publicPdfRecords > 0
+    ? Math.min(100, Number(((indexedDocuments + unavailableDocuments) * 100 / publicPdfRecords).toFixed(2)))
+    : 0;
+  return {
+    source: "r2-ingestion-state",
+    indexedDocuments,
+    publicPdfRecords,
+    retryPendingDocuments,
+    unavailableDocuments,
+    searchablePercent,
+    accountedPercent,
+    complete: publicPdfRecords > 0
+      && retryPendingDocuments === 0
+      && indexedDocuments + unavailableDocuments >= publicPdfRecords
+  };
+}
+
 function isOfficialPscUrl(value: string): boolean {
   try {
     const hostname = new URL(value).hostname.toLowerCase();
@@ -700,10 +745,6 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
     const legacyMetadataCoverage = legacyMetadataObject
       ? await legacyMetadataObject.json<Record<string, unknown>>().catch(() => null)
       : null;
-    const numberValue = (value: unknown) => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : 0;
-    };
     const availableMetadataShards = metadataCoverageShards.filter(
       (item): item is Record<string, unknown> => item !== null
     );
@@ -718,14 +759,14 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
           shardCount: 4,
           officialRecords: Math.max(
             0,
-            ...availableMetadataShards.map(item => numberValue(item.officialRecords))
+            ...availableMetadataShards.map(item => numericStateValue(item.officialRecords))
           ),
           officialRecordsScanned: availableMetadataShards.reduce(
-            (total, item) => total + numberValue(item.officialRecordsScanned),
+            (total, item) => total + numericStateValue(item.officialRecordsScanned),
             0
           ),
           publicPdfRecords: availableMetadataShards.reduce(
-            (total, item) => total + numberValue(item.publicPdfRecords),
+            (total, item) => total + numericStateValue(item.publicPdfRecords),
             0
           ),
           fullScanComplete: metadataCoverageShards.every(
@@ -743,9 +784,13 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
           : null;
       }
     ));
+    const publicPdfRecords = metadataCoverage && "publicPdfRecords" in metadataCoverage
+      ? numericStateValue(metadataCoverage.publicPdfRecords)
+      : 0;
     return json({
       status: "ok",
-      cloudRag: counts,
+      cloudRag: { ...counts, source: "legacy-d1" },
+      fullTextCoverage: fullTextCoverageSummary(ingestionShards, publicPdfRecords),
       shards: shardCounts,
       metadataCoverage,
       ingestionShards
