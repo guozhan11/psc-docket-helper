@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
-import { getLatestPSCUpdates, chatWithDocketAssistant } from './services/geminiService';
+import { AssistantRequestError, getLatestPSCUpdates, chatWithDocketAssistant } from './services/geminiService';
 import { Message, NewsUpdate, ChatSession } from './types';
 import VerifiedLink, { normalizeUrl } from './components/VerifiedLink';
 
@@ -75,6 +75,7 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [failedRequest, setFailedRequest] = useState<{ sessionId: string; message: string } | null>(null);
 
   useEffect(() => {
     if (sessions.length > 0) {
@@ -135,6 +136,7 @@ export default function App() {
 
   const handleNewChat = () => {
     shouldAutoScrollRef.current = true;
+    setFailedRequest(null);
     const newId = 'session_' + Date.now();
     const newSession: ChatSession = {
       id: newId,
@@ -176,6 +178,7 @@ export default function App() {
   const handleClearChat = () => {
     if (confirmClear) {
       shouldAutoScrollRef.current = true;
+      setFailedRequest(null);
       setSessions(prevSessions => prevSessions.map(session => {
         if (session.id === activeSessionId) {
           return {
@@ -237,32 +240,49 @@ export default function App() {
     fetchNews();
   }, []);
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isTyping) return;
-
-    const userMessage = input.trim();
-    setInput('');
+  const runAssistantRequest = async (targetSessionId: string, userMessage: string, appendUserMessage: boolean) => {
     shouldAutoScrollRef.current = true;
-    
-    const targetSessionId = activeSessionId;
-    const isFirstUserMessage = messages.filter(m => m.role === 'user').length === 0;
-
-    updateSessionMessages(targetSessionId, prev => [...prev, { role: 'user', content: userMessage }], isFirstUserMessage ? userMessage : undefined);
+    setFailedRequest(null);
     setIsTyping(true);
 
     try {
       const activeSess = sessions.find(s => s.id === targetSessionId) || sessions[0];
-      const currentHistory: Message[] = [...activeSess.messages, { role: 'user', content: userMessage }];
-      
+      const history = appendUserMessage
+        ? activeSess.messages
+        : activeSess.messages.at(-1)?.role === 'model'
+          ? activeSess.messages.slice(0, -1)
+          : activeSess.messages;
+      const currentHistory: Message[] = appendUserMessage
+        ? [...history, { role: 'user', content: userMessage }]
+        : history;
       const response = await chatWithDocketAssistant(currentHistory, userMessage);
       updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: response || "I'm sorry, I couldn't process that request." }]);
     } catch (error) {
       console.error("Chat error:", error);
-      updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: "There was an error connecting to the assistant. Please try again." }]);
+      const content = error instanceof AssistantRequestError
+        ? error.userMessage
+        : "The assistant could not be reached. Please retry the request.";
+      updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content }]);
+      setFailedRequest({ sessionId: targetSessionId, message: userMessage });
     } finally {
       setIsTyping(false);
     }
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isTyping) return;
+    const userMessage = input.trim();
+    setInput('');
+    const targetSessionId = activeSessionId;
+    const isFirstUserMessage = messages.filter(m => m.role === 'user').length === 0;
+    updateSessionMessages(targetSessionId, prev => [...prev, { role: 'user', content: userMessage }], isFirstUserMessage ? userMessage : undefined);
+    await runAssistantRequest(targetSessionId, userMessage, true);
+  };
+
+  const handleRetryRequest = async () => {
+    if (!failedRequest || isTyping) return;
+    await runAssistantRequest(failedRequest.sessionId, failedRequest.message, false);
   };
 
   return (
@@ -637,6 +657,18 @@ export default function App() {
                               <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce [animation-delay:0.4s]"></div>
                             </div>
                           </div>
+                        </div>
+                      )}
+                      {failedRequest?.sessionId === activeSessionId && !isTyping && (
+                        <div className="flex mr-auto pl-11">
+                          <button
+                            type="button"
+                            onClick={handleRetryRequest}
+                            className="inline-flex items-center gap-2 rounded-xl border border-psc-blue/20 bg-white px-4 py-2 text-sm font-semibold text-psc-blue shadow-sm transition-colors hover:bg-psc-blue/5"
+                          >
+                            <RotateCcw className="h-4 w-4" />
+                            Retry request
+                          </button>
                         </div>
                       )}
                     </div>

@@ -52,6 +52,11 @@ interface CaseManifest {
   documents: ManifestDocumentRow[];
 }
 
+interface CaseManifestResult {
+  documents: CompactDocumentRow[];
+  complete: boolean;
+}
+
 interface OfficialCase {
   caseNumber: string;
   caseCaption?: string | null;
@@ -79,6 +84,7 @@ const NEWSROOM_URL = "https://dcpsc.org/Newsroom.aspx";
 const EDOCKET_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENAI_TIMEOUT_MS = 15_000;
 const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
@@ -90,6 +96,25 @@ function searchDatabases(env: WorkerEnv): D1Database[] {
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, { status, headers: CORS_HEADERS });
+}
+
+function elapsedMs(startedAt: number): number {
+  return Math.round(performance.now() - startedAt);
+}
+
+function logChatStage(
+  requestId: string,
+  stage: string,
+  startedAt: number,
+  details: Record<string, unknown> = {}
+): void {
+  console.log(JSON.stringify({
+    message: "chat stage complete",
+    requestId,
+    stage,
+    durationMs: elapsedMs(startedAt),
+    ...details
+  }));
 }
 
 function numericStateValue(value: unknown): number {
@@ -396,9 +421,9 @@ async function loadManifestObject(
   env: WorkerEnv,
   caseNumber: string,
   key: string
-): Promise<CompactDocumentRow[]> {
+): Promise<CompactDocumentRow[] | null> {
   const object = await env.DOCUMENTS.get(key);
-  if (!object) return [];
+  if (!object) return null;
   if (object.size > 32 * 1024 * 1024) {
     throw new Error(`Case manifest is too large: ${key} (${object.size} bytes)`);
   }
@@ -419,34 +444,42 @@ async function loadManifestObject(
   }));
 }
 
-async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<CompactDocumentRow[]> {
-  if (!/^[A-Z][A-Z0-9-]{2,30}$/.test(caseNumber)) return [];
-  const keys = [
-    `manifests/${caseNumber}.json.gz`,
-    ...Array.from(
-      { length: 4 },
-      (_, shardIndex) => `manifests-v2/${caseNumber}/part-${shardIndex}-of-4.json.gz`
-    )
-  ];
-  const groups = await Promise.all(keys.map(key =>
-    loadManifestObject(env, caseNumber, key).catch(error => {
+async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<CaseManifestResult> {
+  if (!/^[A-Z][A-Z0-9-]{2,30}$/.test(caseNumber)) return { documents: [], complete: false };
+  const legacyKey = `manifests/${caseNumber}.json.gz`;
+  const currentKeys = Array.from(
+    { length: 4 },
+    (_, shardIndex) => `manifests-v2/${caseNumber}/part-${shardIndex}-of-4.json.gz`
+  );
+  const keys = [legacyKey, ...currentKeys];
+  const groups = await Promise.all(keys.map(async key => {
+    try {
+      return { documents: await loadManifestObject(env, caseNumber, key), failed: false };
+    } catch (error) {
       console.error(JSON.stringify({
         message: "R2 manifest shard unavailable",
         error: String(error),
         caseNumber,
         key
       }));
-      return [];
-    })
-  ));
+      return { documents: null, failed: true };
+    }
+  }));
   const documents = new Map<number, CompactDocumentRow>();
-  for (const document of groups.flat()) {
+  for (const document of groups.flatMap(group => group.documents ?? [])) {
     const existing = documents.get(document.filing_id);
     if (!existing || (!existing.r2_key && document.r2_key)) {
       documents.set(document.filing_id, document);
     }
   }
-  return Array.from(documents.values());
+  return {
+    documents: Array.from(documents.values()),
+    // A missing per-shard object normally means that case has no filings in
+    // that chronological shard. Existing v2 data is authoritative as long as
+    // none of the four reads failed.
+    complete: groups.slice(1).some(group => group.documents !== null)
+      && groups.slice(1).every(group => !group.failed)
+  };
 }
 
 function findPageExcerpts(html: string, terms: string[], document: CompactDocumentRow): SearchRow[] {
@@ -478,7 +511,8 @@ function findPageExcerpts(html: string, terms: string[], document: CompactDocume
 async function searchCompactDocuments(
   env: WorkerEnv,
   caseNumber: string,
-  terms: string[]
+  terms: string[],
+  requestId: string
 ): Promise<SearchRow[]> {
   const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
   const addCandidate = (document: CompactDocumentRow) => {
@@ -492,13 +526,23 @@ async function searchCompactDocuments(
     }
   };
 
-  const manifestDocuments = await loadCaseManifest(env, caseNumber);
+  const manifestStartedAt = performance.now();
+  const manifest = await loadCaseManifest(env, caseNumber);
+  const manifestDocuments = manifest.documents;
   for (const document of manifestDocuments) addCandidate(document);
+  logChatStage(requestId, "manifest", manifestStartedAt, {
+    caseNumber,
+    documents: manifestDocuments.length,
+    complete: manifest.complete
+  });
 
-  const pageSize = 750;
-  for (const database of searchDatabases(env)) {
-    for (let offset = 0; offset < 7500; offset += pageSize) {
-      const result = await database.prepare(`
+  if (!manifest.complete) {
+    const d1StartedAt = performance.now();
+    let d1Queries = 0;
+    const pageSize = 750;
+    for (const database of searchDatabases(env)) {
+      for (let offset = 0; offset < 7500; offset += pageSize) {
+        const result = await database.prepare(`
         SELECT d.filing_id, d.case_number, d.docket_number, d.title,
                d.received_date, d.official_pdf_url, d.r2_key, d.term_filter
           FROM document_cases dc
@@ -506,9 +550,12 @@ async function searchCompactDocuments(
          WHERE dc.case_number = ? AND d.term_filter IS NOT NULL
          ORDER BY d.received_date DESC
          LIMIT ? OFFSET ?`).bind(caseNumber, pageSize, offset).all<CompactDocumentRow>();
-      for (const document of result.results ?? []) addCandidate(document);
-      if ((result.results?.length ?? 0) < pageSize) break;
+        d1Queries += 1;
+        for (const document of result.results ?? []) addCandidate(document);
+        if ((result.results?.length ?? 0) < pageSize) break;
+      }
     }
+    logChatStage(requestId, "d1-fallback", d1StartedAt, { caseNumber, queries: d1Queries });
   }
   const candidates = Array.from(candidateMap.values());
   candidates.sort((left, right) => right.filterHits - left.filterHits
@@ -516,18 +563,29 @@ async function searchCompactDocuments(
 
   const selected = candidates.slice(0, 20);
   const rows: SearchRow[] = [];
+  const documentStartedAt = performance.now();
+  let documentsRead = 0;
   for (let start = 0; start < selected.length; start += 4) {
     const batch = selected.slice(start, start + 4);
     const batchRows = await Promise.all(batch.map(async document => {
       if (!document.r2_key) return [];
       const object = await env.DOCUMENTS.get(document.r2_key);
       if (!object || object.size > 3 * 1024 * 1024) return [];
+      documentsRead += 1;
       const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
       const html = await new Response(stream).text();
       return findPageExcerpts(html, terms, document);
     }));
     rows.push(...batchRows.flat());
+    if (rows.length >= 8) break;
   }
+  logChatStage(requestId, "r2-documents", documentStartedAt, {
+    caseNumber,
+    candidates: candidates.length,
+    selected: selected.length,
+    documentsRead,
+    excerpts: rows.length
+  });
   const contentRows = rows.sort((left, right) => left.rank - right.rank).slice(0, 8);
   if (contentRows.length) return contentRows;
 
@@ -586,12 +644,12 @@ async function searchLegacyFts(env: WorkerEnv, caseNumber: string | null, terms:
   return result.results ?? [];
 }
 
-async function searchDockets(env: WorkerEnv, message: string): Promise<SearchRow[]> {
+async function searchDockets(env: WorkerEnv, message: string, requestId: string): Promise<SearchRow[]> {
   const terms = buildSearchTerms(message);
   const caseNumber = extractCaseIdentifier(message);
   if (caseNumber) {
     try {
-      const compactRows = await searchCompactDocuments(env, caseNumber, terms);
+      const compactRows = await searchCompactDocuments(env, caseNumber, terms, requestId);
       if (compactRows.length) return compactRows;
     } catch (error) {
       console.error(JSON.stringify({ message: "compact search unavailable", error: String(error), caseNumber }));
@@ -640,23 +698,29 @@ function openAiEndpoint(env: WorkerEnv): string {
   return OPENAI_RESPONSES_URL;
 }
 
-function extractOpenAiText(response: any): string {
-  if (typeof response?.output_text === "string") return response.output_text.trim();
-  if (!Array.isArray(response?.output)) return "";
-  return response.output.flatMap((item: any) =>
-    Array.isArray(item?.content)
-      ? item.content.filter((part: any) => part?.type === "output_text").map((part: any) => part.text)
-      : []
-  ).join("\n").trim();
+function extractOpenAiText(response: unknown): string {
+  if (!response || typeof response !== "object") return "";
+  const payload = response as { output_text?: unknown; output?: unknown };
+  if (typeof payload.output_text === "string") return payload.output_text.trim();
+  if (!Array.isArray(payload.output)) return "";
+  return payload.output.flatMap(item => {
+    if (!item || typeof item !== "object" || !("content" in item) || !Array.isArray(item.content)) return [];
+    return item.content.flatMap(part =>
+      part && typeof part === "object" && "type" in part && part.type === "output_text"
+        && "text" in part && typeof part.text === "string" ? [part.text] : []
+    );
+  }).join("\n").trim();
 }
 
-async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message: string, rows: SearchRow[]): Promise<string> {
-  if (!env.OPENAI_API_KEY) {
-    if (!rows.length) {
-      return `No matching excerpt was found in the indexed filings. Try a more specific keyword or case number, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`;
-    }
-    return [
-      `I found ${rows.length} matching excerpt(s) in the indexed filings. AI synthesis is disabled, so these results are shown directly without any model/API charge.`,
+function buildDirectExcerptReply(rows: SearchRow[], reason: "disabled" | "unavailable"): string {
+  if (!rows.length) {
+    return `No matching excerpt was found in the indexed filings. Try a more specific keyword or case number, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`;
+  }
+  const introduction = reason === "disabled"
+    ? `I found ${rows.length} matching excerpt(s) in the indexed filings. AI synthesis is disabled, so these results are shown directly without any model/API charge.`
+    : `I found ${rows.length} matching excerpt(s). The AI summary service took too long or was temporarily unavailable, so verified filing excerpts are shown directly instead.`;
+  return [
+      introduction,
       ...rows.map((row, index) => row.evidence_kind === "metadata" ? [
         `**${index + 1}. ${row.case_number}: ${row.title}**`,
         "This filing is covered by metadata; full-text extraction is still pending.",
@@ -668,16 +732,30 @@ async function answerWithOpenAi(env: WorkerEnv, history: ChatMessage[], message:
         ].join("\n\n")),
       `[Search the complete official e-Docket](${EDOCKET_SEARCH_URL})`
     ].join("\n\n---\n\n");
+}
+
+async function answerWithOpenAi(
+  env: WorkerEnv,
+  history: ChatMessage[],
+  message: string,
+  rows: SearchRow[],
+  requestId: string
+): Promise<string> {
+  if (!env.OPENAI_API_KEY) {
+    return buildDirectExcerptReply(rows, "disabled");
   }
   const headers: Record<string, string> = {
     Authorization: `Bearer ${env.OPENAI_API_KEY}`,
     "Content-Type": "application/json"
   };
   if (env.CF_AIG_TOKEN) headers["cf-aig-authorization"] = `Bearer ${env.CF_AIG_TOKEN}`;
-  const response = await fetch(openAiEndpoint(env), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
+  const modelStartedAt = performance.now();
+  try {
+    const response = await fetch(openAiEndpoint(env), {
+      method: "POST",
+      headers,
+      signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
+      body: JSON.stringify({
       model: env.OPENAI_MODEL || "gpt-4.1",
       instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
@@ -688,21 +766,29 @@ Never invent a filing, quotation, page, date, or URL. If evidence is insufficien
 Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
       input: `INDEXED E-DOCKET EXCERPTS:\n${sourceContext(rows)}\n\nCONVERSATION:\n${buildTranscript(history, message)}`,
       text: { format: { type: "text" } }
-    })
-  });
-  if (!response.ok) {
-    throw new Error(`OpenAI Responses API returned ${response.status}: ${await response.text()}`);
+      })
+    });
+    if (!response.ok) throw new Error(`OpenAI Responses API returned ${response.status}`);
+    const rawReply = extractOpenAiText(await response.json());
+    if (!rawReply) throw new Error("OpenAI returned no text");
+    logChatStage(requestId, "ai-summary", modelStartedAt, { outcome: "success" });
+    const reply = replaceOpaqueSourceLabels(rawReply, rows);
+    const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
+    if (!sources.length) return reply;
+    return `${reply}\n\n---\n**Official filing sources**\n${sources.map(row =>
+      row.evidence_kind === "metadata"
+        ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
+        : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
+    ).join("\n")}`;
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "AI summary unavailable; returning direct excerpts",
+      requestId,
+      durationMs: elapsedMs(modelStartedAt),
+      error: error instanceof Error ? error.message : String(error)
+    }));
+    return buildDirectExcerptReply(rows, "unavailable");
   }
-  const rawReply = extractOpenAiText(await response.json());
-  if (!rawReply) throw new Error("OpenAI returned no text");
-  const reply = replaceOpaqueSourceLabels(rawReply, rows);
-  const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
-  if (!sources.length) return reply;
-  return `${reply}\n\n---\n**Official filing sources**\n${sources.map(row =>
-    row.evidence_kind === "metadata"
-      ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
-      : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
-  ).join("\n")}`;
 }
 
 async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
@@ -829,19 +915,31 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   }
 
   if (url.pathname === "/api/chat" && request.method === "POST") {
+    const requestId = crypto.randomUUID();
+    const requestStartedAt = performance.now();
     const body = await request.json<{ history?: ChatMessage[]; message?: string }>().catch(() => null);
     const message = body?.message?.trim();
     if (!message) return json({ error: "Missing message body" }, 400);
     try {
       const directCaseReply = await buildDetailedCaseNumberReply(message);
-      if (directCaseReply) return json({ reply: directCaseReply });
-      const rows = await searchDockets(env, message);
-      const reply = await answerWithOpenAi(env, body?.history ?? [], message, rows);
-      return json({ reply });
-    } catch (error: any) {
-      console.error("chat failed", error);
+      if (directCaseReply) {
+        logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "direct-case" });
+        return json({ reply: directCaseReply, requestId });
+      }
+      const rows = await searchDockets(env, message, requestId);
+      const reply = await answerWithOpenAi(env, body?.history ?? [], message, rows, requestId);
+      logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "success", rows: rows.length });
+      return json({ reply, requestId });
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "chat failed",
+        requestId,
+        durationMs: elapsedMs(requestStartedAt),
+        error: error instanceof Error ? error.message : String(error)
+      }));
       return json({
-        reply: `⚠️ The assistant could not complete this search right now. Please try again, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`
+        reply: `⚠️ The assistant could not complete this search right now. Please try again, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`,
+        requestId
       });
     }
   }
