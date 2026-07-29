@@ -37,13 +37,21 @@ Add these GitHub Actions secrets:
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 
-The `Ingest DC PSC dockets` workflow starts at 00:17, 06:17, 12:17, and 18:17 UTC. A metadata job first publishes all public PDF filing records and official links; later runs refresh the newest three days. Four extraction jobs then process non-overlapping record ranges in parallel, with four PDF workers per range. Compressed HTML, sharded case manifests, independent cursors, and failed-filing lists are stored in R2, so interrupted runs continue from their checkpoints without consuming D1's per-row daily write allowance.
+The `Ingest DC PSC dockets` workflow starts at 00:17, 06:17, 12:17, and 18:17 UTC. A metadata job first publishes all public PDF filing records and official links; later runs refresh the newest three days. Four extraction shards process non-overlapping record ranges with controlled parallelism. After metadata and any enabled extraction finish, one router job rebuilds the 16-part global case index. Compressed HTML, sharded case manifests, independent cursors, failed-filing lists, and the case router are stored in R2, so interrupted runs continue from their checkpoints without consuming D1's per-row daily write allowance.
 
 To build or refresh metadata locally:
 
 ```bash
 npm run rag:metadata-cloud
 ```
+
+To rebuild the global router locally after manifests change:
+
+```bash
+npm run rag:router-cloud
+```
+
+This command reads the existing R2 manifests and does not download PDFs or call an AI model. GitHub Actions normally runs it automatically.
 
 GitHub Actions is the supported way to run all four extraction shards. For a diagnostic run of shard zero:
 

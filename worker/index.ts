@@ -57,6 +57,41 @@ interface CaseManifestResult {
   complete: boolean;
 }
 
+interface CaseRouterIndex {
+  version: number;
+  generation: string;
+  updatedAt: string;
+  complete: boolean;
+  shardCount: number;
+  filterBytes: number;
+  manifestObjects: number;
+  cases: number;
+  contentCases: number;
+  documentAssociations: number;
+  contentDocumentAssociations: number;
+  partKeys: string[];
+  compressedBytes: number;
+}
+
+interface CaseRouterPart {
+  version: number;
+  generation: string;
+  shardIndex: number;
+  shardCount: number;
+  filterBytes: number;
+  cases: Array<[string, number, number, string | null, number]>;
+  filtersB64: string;
+}
+
+interface RoutedCase {
+  caseNumber: string;
+  filterHits: number;
+  documentCount: number;
+  contentDocuments: number;
+  latestReceivedDate: string | null;
+  filterBits: number;
+}
+
 interface OfficialCase {
   caseNumber: string;
   caseCaption?: string | null;
@@ -85,6 +120,10 @@ const EDOCKET_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const OPENAI_TIMEOUT_MS = 15_000;
+const CASE_ROUTER_VERSION = 1;
+const CASE_ROUTER_INDEX_KEY = `case-router/v${CASE_ROUTER_VERSION}/index.json`;
+const CASE_ROUTER_CANDIDATES = 8;
+const CASE_ROUTER_VERIFIED_CASES = 4;
 const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
@@ -412,9 +451,97 @@ function buildSearchTerms(message: string): string[] {
 function toFilterBytes(value: ArrayBuffer | number[] | string): Uint8Array {
   if (typeof value === "string") {
     const binary = atob(value);
-    return Uint8Array.from(binary, character => character.charCodeAt(0));
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
   }
   return new Uint8Array(value);
+}
+
+function isCaseRouterIndex(value: unknown): value is CaseRouterIndex {
+  if (!value || typeof value !== "object") return false;
+  const index = value as Partial<CaseRouterIndex>;
+  return index.version === CASE_ROUTER_VERSION
+    && typeof index.generation === "string"
+    && typeof index.updatedAt === "string"
+    && index.complete === true
+    && Number.isInteger(index.shardCount)
+    && Number.isInteger(index.filterBytes)
+    && Array.isArray(index.partKeys)
+    && index.partKeys.length === index.shardCount
+    && index.partKeys.every(key => typeof key === "string" && key.startsWith("case-router/"));
+}
+
+async function loadCaseRouterIndex(env: WorkerEnv): Promise<CaseRouterIndex | null> {
+  const object = await env.DOCUMENTS.get(CASE_ROUTER_INDEX_KEY);
+  if (!object || object.size > 256 * 1024) return null;
+  const payload: unknown = await object.json();
+  return isCaseRouterIndex(payload) ? payload : null;
+}
+
+function compareRoutedCases(left: RoutedCase, right: RoutedCase): number {
+  return right.filterHits - left.filterHits
+    // Smaller cases are less likely to have a saturated aggregate filter.
+    || left.filterBits - right.filterBits
+    || left.contentDocuments - right.contentDocuments
+    || String(right.latestReceivedDate || "").localeCompare(String(left.latestReceivedDate || ""));
+}
+
+async function routeCases(
+  env: WorkerEnv,
+  terms: string[],
+  requestId: string
+): Promise<RoutedCase[]> {
+  if (!terms.length) return [];
+  const startedAt = performance.now();
+  const index = await loadCaseRouterIndex(env);
+  if (!index) {
+    logChatStage(requestId, "case-router", startedAt, { outcome: "unavailable" });
+    return [];
+  }
+
+  let candidates: RoutedCase[] = [];
+  let partsRead = 0;
+  for (const key of index.partKeys) {
+    const object = await env.DOCUMENTS.get(key);
+    if (!object || object.size > 8 * 1024 * 1024) continue;
+    const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
+    const payload = JSON.parse(await new Response(stream).text()) as CaseRouterPart;
+    if (payload.version !== index.version
+      || payload.generation !== index.generation
+      || payload.shardCount !== index.shardCount
+      || payload.filterBytes !== index.filterBytes
+      || !Array.isArray(payload.cases)
+      || typeof payload.filtersB64 !== "string") continue;
+    const filters = toFilterBytes(payload.filtersB64);
+    if (filters.byteLength !== payload.cases.length * payload.filterBytes) continue;
+    partsRead += 1;
+    for (let caseIndex = 0; caseIndex < payload.cases.length; caseIndex += 1) {
+      const [caseNumber, documentCount, contentDocuments, latestReceivedDate, filterBits] = payload.cases[caseIndex];
+      if (typeof caseNumber !== "string" || !Number.isFinite(contentDocuments)) continue;
+      const start = caseIndex * payload.filterBytes;
+      const filter = filters.subarray(start, start + payload.filterBytes);
+      const filterHits = terms.filter(term => termMayExist(filter, term)).length;
+      if (!filterHits) continue;
+      candidates.push({
+        caseNumber,
+        filterHits,
+        documentCount: Number(documentCount) || 0,
+        contentDocuments: Number(contentDocuments) || 0,
+        latestReceivedDate: typeof latestReceivedDate === "string" ? latestReceivedDate : null,
+        filterBits: Number(filterBits) || payload.filterBytes * 8
+      });
+    }
+    candidates.sort(compareRoutedCases);
+    candidates = candidates.slice(0, CASE_ROUTER_CANDIDATES);
+  }
+  logChatStage(requestId, "case-router", startedAt, {
+    outcome: partsRead === index.shardCount ? "success" : "partial",
+    partsRead,
+    expectedParts: index.shardCount,
+    candidates: candidates.length
+  });
+  return candidates;
 }
 
 async function loadManifestObject(
@@ -512,7 +639,8 @@ async function searchCompactDocuments(
   env: WorkerEnv,
   caseNumber: string,
   terms: string[],
-  requestId: string
+  requestId: string,
+  maxDocumentReads = 20
 ): Promise<SearchRow[]> {
   const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
   const addCandidate = (document: CompactDocumentRow) => {
@@ -561,7 +689,7 @@ async function searchCompactDocuments(
   candidates.sort((left, right) => right.filterHits - left.filterHits
     || String(right.received_date || "").localeCompare(String(left.received_date || "")));
 
-  const selected = candidates.slice(0, 20);
+  const selected = candidates.slice(0, maxDocumentReads);
   const rows: SearchRow[] = [];
   const documentStartedAt = performance.now();
   let documentsRead = 0;
@@ -653,6 +781,35 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
       if (compactRows.length) return compactRows;
     } catch (error) {
       console.error(JSON.stringify({ message: "compact search unavailable", error: String(error), caseNumber }));
+    }
+  } else if (terms.length) {
+    try {
+      const routedCases = await routeCases(env, terms, requestId);
+      const routedRows: SearchRow[] = [];
+      for (const candidate of routedCases.slice(0, CASE_ROUTER_VERIFIED_CASES)) {
+        const rows = await searchCompactDocuments(
+          env,
+          candidate.caseNumber,
+          terms,
+          requestId,
+          4
+        );
+        routedRows.push(...rows.filter(row => row.evidence_kind !== "metadata"));
+        if (routedRows.length >= 8) break;
+      }
+      if (routedRows.length) {
+        const unique = new Map<string, SearchRow>();
+        for (const row of routedRows.sort((left, right) => left.rank - right.rank)) {
+          unique.set(`${row.filing_id}:${row.page_number}`, row);
+        }
+        return Array.from(unique.values()).slice(0, 8);
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "global case routing unavailable",
+        error: error instanceof Error ? error.message : String(error),
+        requestId
+      }));
     }
   }
   return searchLegacyFts(env, caseNumber, terms);
@@ -801,7 +958,8 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
       legacyMetadataObject,
       metadataObjects,
       ingestionV3Objects,
-      ingestionV2Objects
+      ingestionV2Objects,
+      caseRouterObject
     ] = await Promise.all([
       Promise.all(searchDatabases(env).map(database => database.prepare(
       `SELECT COUNT(*) AS documents,
@@ -818,7 +976,8 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
       )),
       Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
         env.DOCUMENTS.get(`ingestion/fast-r2-state-v2-${shardIndex}-of-4.json`)
-      ))
+      )),
+      env.DOCUMENTS.get(CASE_ROUTER_INDEX_KEY)
     ]);
     const counts = shardCounts.reduce((total, shard) => ({
       documents: total.documents + (shard?.documents ?? 0),
@@ -873,13 +1032,32 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
     const publicPdfRecords = metadataCoverage && "publicPdfRecords" in metadataCoverage
       ? numericStateValue(metadataCoverage.publicPdfRecords)
       : 0;
+    const caseRouterPayload: unknown = caseRouterObject
+      ? await caseRouterObject.json().catch(() => null)
+      : null;
+    const caseRouter = isCaseRouterIndex(caseRouterPayload)
+      ? {
+          status: "ready",
+          version: caseRouterPayload.version,
+          updatedAt: caseRouterPayload.updatedAt,
+          complete: caseRouterPayload.complete,
+          shardCount: caseRouterPayload.shardCount,
+          manifestObjects: caseRouterPayload.manifestObjects,
+          cases: caseRouterPayload.cases,
+          contentCases: caseRouterPayload.contentCases,
+          documentAssociations: caseRouterPayload.documentAssociations,
+          contentDocumentAssociations: caseRouterPayload.contentDocumentAssociations,
+          compressedBytes: caseRouterPayload.compressedBytes
+        }
+      : { status: "missing" };
     return json({
       status: "ok",
       cloudRag: { ...counts, source: "legacy-d1" },
       fullTextCoverage: fullTextCoverageSummary(ingestionShards, publicPdfRecords),
       shards: shardCounts,
       metadataCoverage,
-      ingestionShards
+      ingestionShards,
+      caseRouter
     });
   }
 

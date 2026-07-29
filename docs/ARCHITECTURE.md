@@ -11,14 +11,17 @@ The application uses React, TypeScript, Vite, Tailwind CSS, Cloudflare Workers, 
 3. Four independent jobs download PDFs to temporary runner storage and extract text page by page without OCR on the historical first pass.
 4. Gzipped page-level HTML is stored privately in R2.
 5. Each case gets four compressed R2 manifest parts. Each extraction job owns one part, preventing concurrent manifest overwrites.
-6. The Worker merges the four parts with the legacy manifest and D1 fallback, shortlists documents, verifies exact page-level matches in R2, and sends only the best excerpts to OpenAI.
-7. Metadata-only answers are explicitly labelled; document-content claims require extracted text. Answers link to the official PDF.
+6. After ingestion, a GitHub Actions job folds the document filters into compact case-level filters and atomically publishes a 16-part global case router to R2.
+7. For questions with no case number, the Worker scans the router, ranks eight candidate cases, and verifies the strongest candidates against their stored filing text. Case-specific questions skip this routing step.
+8. The Worker sends only verified excerpts to OpenAI. Metadata-only answers are explicitly labelled; document-content claims require extracted text. Answers link to the official PDF.
 
 PDFs are temporary during extraction and are not permanently duplicated in project storage. When `CLOUDFLARE_ACCOUNT_ID` is configured, OpenAI requests use Cloudflare AI Gateway for monitoring and spend controls.
 
 ## Compact Index Design
 
 The initial design duplicated full filing text in D1 and used FTS5. The next compact design moved text to R2 and retained per-filing filters in D1. The current fast-backfill design also moves those filters into four compressed R2 manifest parts per case, removing D1's daily write quota from the historical ingestion path while allowing safe parallel writers. Existing FC1176 D1 data and version-1 R2 manifests remain available as compatibility fallbacks.
+
+The global router uses no embeddings or paid vector database. It folds each 2 KiB document Bloom filter into a 256-byte case filter, groups the filters into 16 compressed R2 objects, and publishes them through alternating A/B slots. Updating the small index object switches generations atomically. Bloom-filter candidates are never treated as evidence; the Worker opens the shortlisted filing objects and verifies the actual page text before answering.
 
 For the FC1176 validation corpus, 831 public FC1176/DR1176 PDFs use approximately 20.5 MB in R2 and 3.6 MB in the existing D1 fallback; the earlier duplicated design used approximately 165 MB in D1.
 
