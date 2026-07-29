@@ -18,8 +18,9 @@ import boto3
 
 from compact_search import TERM_FILTER_BYTES
 
-ROUTER_VERSION = 1
+ROUTER_VERSION = 2
 ROUTER_FILTER_BYTES = 256
+ROUTER_FILTER_BANDS = 4
 DEFAULT_ROUTER_SHARDS = 16
 ROUTER_INDEX_KEY = f"case-router/v{ROUTER_VERSION}/index.json"
 MAX_COMPRESSED_PART_BYTES = 8 * 1024 * 1024
@@ -62,10 +63,10 @@ def case_router_entry(
             if not existing or (not existing.get("term_filter_b64") and document.get("term_filter_b64")):
                 documents[filing_id] = document
 
-    filter_bits = 0
+    filter_bands = [0] * ROUTER_FILTER_BANDS
     content_documents = 0
     latest_received_date: str | None = None
-    for document in documents.values():
+    for filing_id, document in documents.items():
         received_date = document.get("received_date")
         if isinstance(received_date, str) and (
             latest_received_date is None or received_date > latest_received_date
@@ -75,7 +76,12 @@ def case_router_entry(
         if not isinstance(encoded, str) or not document.get("r2_key"):
             continue
         try:
-            filter_bits |= fold_term_filter(encoded, byte_length)
+            # Keep independent filing groups so terms that recur across several
+            # documents rank above one-off Bloom-filter false positives.
+            filter_bands[filing_id % ROUTER_FILTER_BANDS] |= fold_term_filter(
+                encoded,
+                byte_length,
+            )
             content_documents += 1
         except (ValueError, TypeError):
             continue
@@ -88,9 +94,9 @@ def case_router_entry(
             len(documents),
             content_documents,
             latest_received_date,
-            filter_bits.bit_count(),
+            sum(term_filter.bit_count() for term_filter in filter_bands),
         ],
-        filter_bits.to_bytes(byte_length, "little"),
+        b"".join(term_filter.to_bytes(byte_length, "little") for term_filter in filter_bands),
     )
 
 
@@ -165,6 +171,7 @@ def build_router(r2: Any, bucket: str, shard_count: int) -> dict[str, Any]:
             "shardIndex": shard_index,
             "shardCount": shard_count,
             "filterBytes": ROUTER_FILTER_BYTES,
+            "filterBands": ROUTER_FILTER_BANDS,
             "cases": entries,
             "filtersB64": base64.b64encode(partition_filters[shard_index]).decode("ascii"),
         }
@@ -193,6 +200,7 @@ def build_router(r2: Any, bucket: str, shard_count: int) -> dict[str, Any]:
         "complete": True,
         "shardCount": shard_count,
         "filterBytes": ROUTER_FILTER_BYTES,
+        "filterBands": ROUTER_FILTER_BANDS,
         "manifestObjects": manifest_total,
         "cases": len(grouped),
         "contentCases": content_cases,

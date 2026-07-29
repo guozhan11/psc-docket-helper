@@ -54,7 +54,35 @@ class CaseRouterTests(unittest.TestCase):
         entry, term_filter = result or ([], b"")
         self.assertEqual(entry[:4], ["FC1176", 2, 1, "2026-01-01"])
         self.assertGreater(entry[4], 0)
-        self.assertEqual(len(term_filter), router.ROUTER_FILTER_BYTES)
+        self.assertEqual(
+            len(term_filter),
+            router.ROUTER_FILTER_BYTES * router.ROUTER_FILTER_BANDS,
+        )
+
+    def test_case_entry_preserves_recurrence_across_filing_bands(self) -> None:
+        encoded = base64.b64encode(create_term_filter("bad debt")).decode("ascii")
+        manifests = [{"documents": [
+            {
+                "filing_id": filing_id,
+                "received_date": "2026-01-01",
+                "r2_key": f"filings/2026/{filing_id}.html.gz",
+                "term_filter_b64": encoded,
+            }
+            for filing_id in (4, 5, 6)
+        ]}]
+
+        result = router.case_router_entry("FC1176", manifests)
+
+        self.assertIsNotNone(result)
+        _entry, filters = result or ([], b"")
+        matching_bands = 0
+        query = create_term_filter("debt", router.ROUTER_FILTER_BYTES)
+        for band_index in range(router.ROUTER_FILTER_BANDS):
+            start = band_index * router.ROUTER_FILTER_BYTES
+            band = filters[start:start + router.ROUTER_FILTER_BYTES]
+            if all(not byte or (band[index] & byte) == byte for index, byte in enumerate(query)):
+                matching_bands += 1
+        self.assertEqual(matching_bands, 3)
 
     def test_metadata_only_case_is_not_routable(self) -> None:
         result = router.case_router_entry("FC1", [{
@@ -116,9 +144,20 @@ class CaseRouterTests(unittest.TestCase):
 
         self.assertEqual(index["contentCases"], 1)
         self.assertEqual(index["contentDocumentAssociations"], 1)
+        self.assertEqual(index["filterBands"], router.ROUTER_FILTER_BANDS)
         self.assertEqual(index["activeSlot"], "a")
         self.assertEqual(len(index["partKeys"]), 4)
         self.assertEqual(r2.writes[-1], router.ROUTER_INDEX_KEY)
+        populated_key = next(
+            key for key in index["partKeys"]
+            if json.loads(gzip.decompress(r2.objects[key]))["cases"]
+        )
+        populated_part = json.loads(gzip.decompress(r2.objects[populated_key]))
+        self.assertEqual(populated_part["filterBands"], router.ROUTER_FILTER_BANDS)
+        self.assertEqual(
+            len(base64.b64decode(populated_part["filtersB64"])),
+            router.ROUTER_FILTER_BYTES * router.ROUTER_FILTER_BANDS,
+        )
 
         next_index = router.build_router(r2, "test", shard_count=4)
         self.assertEqual(next_index["activeSlot"], "b")

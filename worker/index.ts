@@ -64,6 +64,7 @@ interface CaseRouterIndex {
   complete: boolean;
   shardCount: number;
   filterBytes: number;
+  filterBands: number;
   manifestObjects: number;
   cases: number;
   contentCases: number;
@@ -79,6 +80,7 @@ interface CaseRouterPart {
   shardIndex: number;
   shardCount: number;
   filterBytes: number;
+  filterBands: number;
   cases: Array<[string, number, number, string | null, number]>;
   filtersB64: string;
 }
@@ -86,6 +88,7 @@ interface CaseRouterPart {
 interface RoutedCase {
   caseNumber: string;
   filterHits: number;
+  filterScore: number;
   documentCount: number;
   contentDocuments: number;
   latestReceivedDate: string | null;
@@ -120,7 +123,7 @@ const EDOCKET_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const OPENAI_TIMEOUT_MS = 15_000;
-const CASE_ROUTER_VERSION = 1;
+const CASE_ROUTER_VERSION = 2;
 const CASE_ROUTER_INDEX_KEY = `case-router/v${CASE_ROUTER_VERSION}/index.json`;
 const CASE_ROUTER_CANDIDATES = 8;
 const CASE_ROUTER_VERIFIED_CASES = 4;
@@ -163,6 +166,25 @@ function numericStateValue(value: unknown): number {
 
 function stateArrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+async function readR2Json(object: R2ObjectBody | null, key: string): Promise<unknown> {
+  if (!object) return null;
+  try {
+    return JSON.parse(await object.text()) as unknown;
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "R2 JSON unavailable",
+      key,
+      size: object.size,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+    return null;
+  }
 }
 
 function fullTextCoverageSummary(
@@ -433,7 +455,9 @@ async function buildDetailedCaseNumberReply(message: string): Promise<string | n
 
 const STOP_WORDS = new Set([
   "about", "after", "also", "an", "and", "are", "can", "could", "document", "documents",
-  "find", "for", "from", "have", "into", "mention", "mentions", "please", "that", "the",
+  "case", "cases", "commission", "dc", "discuss", "discussed", "discusses", "discussion",
+  "docket", "dockets", "filing", "filings", "find", "for", "from", "have", "into", "mention",
+  "mentions", "please", "psc", "that", "the",
   "their", "this", "was", "were", "what", "when", "where", "which", "with", "would",
   "in", "is", "it", "of", "or", "to"
 ]);
@@ -467,6 +491,8 @@ function isCaseRouterIndex(value: unknown): value is CaseRouterIndex {
     && index.complete === true
     && Number.isInteger(index.shardCount)
     && Number.isInteger(index.filterBytes)
+    && Number.isInteger(index.filterBands)
+    && index.filterBands > 0
     && Array.isArray(index.partKeys)
     && index.partKeys.length === index.shardCount
     && index.partKeys.every(key => typeof key === "string" && key.startsWith("case-router/"));
@@ -475,12 +501,13 @@ function isCaseRouterIndex(value: unknown): value is CaseRouterIndex {
 async function loadCaseRouterIndex(env: WorkerEnv): Promise<CaseRouterIndex | null> {
   const object = await env.DOCUMENTS.get(CASE_ROUTER_INDEX_KEY);
   if (!object || object.size > 256 * 1024) return null;
-  const payload: unknown = await object.json();
+  const payload = await readR2Json(object, CASE_ROUTER_INDEX_KEY);
   return isCaseRouterIndex(payload) ? payload : null;
 }
 
 function compareRoutedCases(left: RoutedCase, right: RoutedCase): number {
   return right.filterHits - left.filterHits
+    || right.filterScore - left.filterScore
     // Smaller cases are less likely to have a saturated aggregate filter.
     || left.filterBits - right.filterBits
     || left.contentDocuments - right.contentDocuments
@@ -501,6 +528,7 @@ async function routeCases(
   }
 
   let candidates: RoutedCase[] = [];
+  const requiredTermMatches = Math.min(2, terms.length);
   let partsRead = 0;
   for (const key of index.partKeys) {
     const object = await env.DOCUMENTS.get(key);
@@ -511,25 +539,36 @@ async function routeCases(
       || payload.generation !== index.generation
       || payload.shardCount !== index.shardCount
       || payload.filterBytes !== index.filterBytes
+      || payload.filterBands !== index.filterBands
       || !Array.isArray(payload.cases)
       || typeof payload.filtersB64 !== "string") continue;
     const filters = toFilterBytes(payload.filtersB64);
-    if (filters.byteLength !== payload.cases.length * payload.filterBytes) continue;
+    const caseFilterBytes = payload.filterBytes * payload.filterBands;
+    if (filters.byteLength !== payload.cases.length * caseFilterBytes) continue;
     partsRead += 1;
     for (let caseIndex = 0; caseIndex < payload.cases.length; caseIndex += 1) {
       const [caseNumber, documentCount, contentDocuments, latestReceivedDate, filterBits] = payload.cases[caseIndex];
       if (typeof caseNumber !== "string" || !Number.isFinite(contentDocuments)) continue;
-      const start = caseIndex * payload.filterBytes;
-      const filter = filters.subarray(start, start + payload.filterBytes);
-      const filterHits = terms.filter(term => termMayExist(filter, term)).length;
-      if (!filterHits) continue;
+      const start = caseIndex * caseFilterBytes;
+      const bandHits = terms.map(term => {
+        let hits = 0;
+        for (let bandIndex = 0; bandIndex < payload.filterBands; bandIndex += 1) {
+          const bandStart = start + bandIndex * payload.filterBytes;
+          const filter = filters.subarray(bandStart, bandStart + payload.filterBytes);
+          if (termMayExist(filter, term)) hits += 1;
+        }
+        return hits;
+      });
+      const filterHits = bandHits.filter(hits => hits > 0).length;
+      if (filterHits < requiredTermMatches) continue;
       candidates.push({
         caseNumber,
         filterHits,
+        filterScore: bandHits.reduce((total, hits) => total + hits, 0),
         documentCount: Number(documentCount) || 0,
         contentDocuments: Number(contentDocuments) || 0,
         latestReceivedDate: typeof latestReceivedDate === "string" ? latestReceivedDate : null,
-        filterBits: Number(filterBits) || payload.filterBytes * 8
+        filterBits: Number(filterBits) || payload.filterBytes * payload.filterBands * 8
       });
     }
     candidates.sort(compareRoutedCases);
@@ -609,14 +648,19 @@ async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<Cas
   };
 }
 
-function findPageExcerpts(html: string, terms: string[], document: CompactDocumentRow): SearchRow[] {
+function findPageExcerpts(
+  html: string,
+  terms: string[],
+  document: CompactDocumentRow,
+  minimumTermMatches = 1
+): SearchRow[] {
   const rows: SearchRow[] = [];
   const sections = html.matchAll(/<section\s+data-page=["'](\d+)["'][^>]*>([\s\S]*?)<\/section>/gi);
   for (const section of sections) {
     const text = stripHtml(section[2]);
     const normalized = text.toLowerCase();
     const matchingTerms = terms.filter(term => normalized.includes(term));
-    if (!matchingTerms.length) continue;
+    if (matchingTerms.length < minimumTermMatches) continue;
     const firstMatch = Math.min(...matchingTerms.map(term => normalized.indexOf(term)).filter(index => index >= 0));
     const start = Math.max(0, firstMatch - 500);
     const end = Math.min(text.length, firstMatch + 1700);
@@ -640,14 +684,15 @@ async function searchCompactDocuments(
   caseNumber: string,
   terms: string[],
   requestId: string,
-  maxDocumentReads = 20
+  maxDocumentReads = 20,
+  minimumTermMatches = 1
 ): Promise<SearchRow[]> {
   const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
   const addCandidate = (document: CompactDocumentRow) => {
     if (!document.r2_key || !document.term_filter) return;
     const filter = toFilterBytes(document.term_filter);
     const filterHits = terms.filter(term => termMayExist(filter, term)).length;
-    if (filterHits <= 0) return;
+    if (filterHits < minimumTermMatches) return;
     const existing = candidateMap.get(document.filing_id);
     if (!existing || filterHits > existing.filterHits) {
       candidateMap.set(document.filing_id, { ...document, filterHits });
@@ -702,7 +747,7 @@ async function searchCompactDocuments(
       documentsRead += 1;
       const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
       const html = await new Response(stream).text();
-      return findPageExcerpts(html, terms, document);
+      return findPageExcerpts(html, terms, document, minimumTermMatches);
     }));
     rows.push(...batchRows.flat());
     if (rows.length >= 8) break;
@@ -792,7 +837,8 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
           candidate.caseNumber,
           terms,
           requestId,
-          4
+          4,
+          Math.min(2, terms.length)
         );
         routedRows.push(...rows.filter(row => row.evidence_kind !== "metadata"));
         if (routedRows.length >= 8) break;
@@ -984,11 +1030,18 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
       compactDocuments: total.compactDocuments + (shard?.compactDocuments ?? 0),
       cases: total.cases + (shard?.cases ?? 0)
     }), { documents: 0, compactDocuments: 0, cases: 0 });
-    const metadataCoverageShards = await Promise.all(metadataObjects.map(object =>
-      object ? object.json<Record<string, unknown>>().catch(() => null) : null
+    const metadataCoveragePayloads = await Promise.all(metadataObjects.map((object, shardIndex) =>
+      readR2Json(object, `ingestion/metadata-coverage-v3-${shardIndex}-of-4.json`)
     ));
-    const legacyMetadataCoverage = legacyMetadataObject
-      ? await legacyMetadataObject.json<Record<string, unknown>>().catch(() => null)
+    const metadataCoverageShards = metadataCoveragePayloads.map(payload =>
+      isRecord(payload) ? payload : null
+    );
+    const legacyMetadataPayload = await readR2Json(
+      legacyMetadataObject,
+      "ingestion/metadata-coverage-v2.json"
+    );
+    const legacyMetadataCoverage = isRecord(legacyMetadataPayload)
+      ? legacyMetadataPayload
       : null;
     const availableMetadataShards = metadataCoverageShards.filter(
       (item): item is Record<string, unknown> => item !== null
@@ -1024,17 +1077,18 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
     const ingestionShards = await Promise.all(ingestionV3Objects.map(
       async (object, shardIndex) => {
         const selected = object ?? ingestionV2Objects[shardIndex];
-        return selected
-          ? selected.json<Record<string, unknown>>().catch(() => null)
-          : null;
+        const version = object ? 3 : 2;
+        const payload = await readR2Json(
+          selected,
+          `ingestion/fast-r2-state-v${version}-${shardIndex}-of-4.json`
+        );
+        return isRecord(payload) ? payload : null;
       }
     ));
     const publicPdfRecords = metadataCoverage && "publicPdfRecords" in metadataCoverage
       ? numericStateValue(metadataCoverage.publicPdfRecords)
       : 0;
-    const caseRouterPayload: unknown = caseRouterObject
-      ? await caseRouterObject.json().catch(() => null)
-      : null;
+    const caseRouterPayload = await readR2Json(caseRouterObject, CASE_ROUTER_INDEX_KEY);
     const caseRouter = isCaseRouterIndex(caseRouterPayload)
       ? {
           status: "ready",
@@ -1042,6 +1096,7 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
           updatedAt: caseRouterPayload.updatedAt,
           complete: caseRouterPayload.complete,
           shardCount: caseRouterPayload.shardCount,
+          filterBands: caseRouterPayload.filterBands,
           manifestObjects: caseRouterPayload.manifestObjects,
           cases: caseRouterPayload.cases,
           contentCases: caseRouterPayload.contentCases,
