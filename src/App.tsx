@@ -35,6 +35,71 @@ const EXAMPLE_QUESTIONS = [
   'Which FC1176 filings discuss bad debt or uncollectible accounts?'
 ];
 
+function LatestUpdatesSection({ news, loading }: { news: NewsUpdate[]; loading: boolean }) {
+  return (
+    <section id="updates" className="py-16 sm:py-20 bg-white">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex flex-col md:flex-row md:items-end justify-between mb-10 gap-6">
+          <div>
+            <h2 className="text-3xl md:text-4xl text-psc-blue mb-4">Latest Regulatory Updates</h2>
+            <p className="text-slate-500 max-w-2xl">
+              Stay informed about the latest decisions, press releases, and public notices from the Commission.
+            </p>
+          </div>
+          <a
+            href="https://dcpsc.org/Newsroom.aspx"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-psc-blue font-bold flex items-center gap-1 hover:underline group"
+          >
+            View All News <ChevronRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+          </a>
+        </div>
+
+        {loading ? (
+          <div className="flex flex-col items-center justify-center py-20 text-slate-400">
+            <Loader2 className="w-12 h-12 animate-spin mb-4 text-psc-gold" />
+            <p className="font-medium">Fetching latest updates from the Commission...</p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+            {news.map((item, idx) => (
+              <motion.div
+                key={idx}
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true }}
+                transition={{ delay: idx * 0.1 }}
+                className="group bg-psc-light rounded-2xl p-8 border border-slate-100 hover:border-psc-gold/30 hover:shadow-xl transition-all flex flex-col h-full"
+              >
+                <div className="flex justify-between items-start mb-6">
+                  <span className="text-xs font-bold text-psc-gold uppercase tracking-widest">{item.date}</span>
+                  <div className="p-2 bg-white rounded-lg shadow-sm group-hover:bg-psc-gold group-hover:text-white transition-colors">
+                    <Newspaper className="w-4 h-4" />
+                  </div>
+                </div>
+                <h3 className="text-xl mb-4 group-hover:text-psc-blue transition-colors leading-snug">
+                  {item.title}
+                </h3>
+                <p className="text-slate-600 mb-8 flex-grow line-clamp-4 leading-relaxed">
+                  {item.summary}
+                </p>
+                <VerifiedLink
+                  href={normalizeUrl(item.url)}
+                  fallbackHref="https://dcpsc.org/Newsroom.aspx"
+                  className="inline-flex items-center gap-2 text-psc-blue font-bold text-sm no-underline hover:gap-3 transition-all"
+                >
+                  Read Full Update
+                </VerifiedLink>
+              </motion.div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function App() {
   const [news, setNews] = useState<NewsUpdate[]>([]);
   const [loadingNews, setLoadingNews] = useState(true);
@@ -86,6 +151,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [failedRequest, setFailedRequest] = useState<{ sessionId: string; message: string } | null>(null);
+  const activeRequestRef = useRef<{ controller: AbortController; sessionId: string } | null>(null);
   const [clientId] = useState(() => {
     const storageKey = 'dc_psc_anonymous_client_id';
     try {
@@ -137,6 +203,19 @@ export default function App() {
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
   const messages = activeSession ? activeSession.messages : [];
+  const hasUserMessages = messages.some(message => message.role === 'user');
+
+  const cancelActiveRequest = (sessionId?: string) => {
+    const activeRequest = activeRequestRef.current;
+    if (!activeRequest || (sessionId && activeRequest.sessionId !== sessionId)) return;
+    activeRequestRef.current = null;
+    activeRequest.controller.abort();
+    setIsTyping(false);
+    if (appConfig?.turnstileRequired) {
+      setTurnstileToken(null);
+      setTurnstileResetSignal(value => value + 1);
+    }
+  };
 
   const updateSessionMessages = (sessionId: string, newMsgSelector: (prev: Message[]) => Message[], isUserFirstMsg?: string) => {
     setSessions(prevSessions => prevSessions.map(session => {
@@ -157,6 +236,7 @@ export default function App() {
   };
 
   const handleNewChat = () => {
+    cancelActiveRequest();
     shouldAutoScrollRef.current = true;
     setFailedRequest(null);
     const newId = 'session_' + Date.now();
@@ -174,6 +254,7 @@ export default function App() {
 
   const handleDeleteChat = (idToDelete: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    cancelActiveRequest(idToDelete);
     shouldAutoScrollRef.current = true;
     if (sessions.length <= 1) {
       const defaultId = 'session_' + Date.now();
@@ -199,6 +280,7 @@ export default function App() {
 
   const handleClearChat = () => {
     if (confirmClear) {
+      cancelActiveRequest(activeSessionId);
       shouldAutoScrollRef.current = true;
       setFailedRequest(null);
       setSessions(prevSessions => prevSessions.map(session => {
@@ -222,9 +304,8 @@ export default function App() {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const shouldAutoScrollRef = useRef(true);
-  const activeRequestControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => () => activeRequestControllerRef.current?.abort(), []);
+  useEffect(() => () => activeRequestRef.current?.controller.abort(), []);
 
   const handleMessagesScroll = () => {
     const container = messagesContainerRef.current;
@@ -276,7 +357,7 @@ export default function App() {
     setFailedRequest(null);
     setIsTyping(true);
     const requestController = new AbortController();
-    activeRequestControllerRef.current = requestController;
+    activeRequestRef.current = { controller: requestController, sessionId: targetSessionId };
 
     try {
       const activeSess = sessions.find(s => s.id === targetSessionId) || sessions[0];
@@ -305,12 +386,13 @@ export default function App() {
       updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content }]);
       setFailedRequest({ sessionId: targetSessionId, message: userMessage });
     } finally {
-      if (activeRequestControllerRef.current === requestController) {
-        activeRequestControllerRef.current = null;
+      if (activeRequestRef.current?.controller === requestController) {
+        activeRequestRef.current = null;
         setIsTyping(false);
-      }
-      if (appConfig?.turnstileRequired) {
-        setTurnstileResetSignal(value => value + 1);
+        if (appConfig?.turnstileRequired) {
+          setTurnstileToken(null);
+          setTurnstileResetSignal(value => value + 1);
+        }
       }
     }
   };
@@ -333,7 +415,7 @@ export default function App() {
   };
 
   const handleStopGenerating = () => {
-    activeRequestControllerRef.current?.abort();
+    cancelActiveRequest();
   };
 
   return (
@@ -358,8 +440,8 @@ export default function App() {
             {/* Desktop Nav */}
             <div className="hidden md:flex items-center gap-8 font-medium text-sm">
               <a href="#" className="hover:text-psc-gold transition-colors">Home</a>
+              <a href="#docket-chat" className="hover:text-psc-gold transition-colors">Docket Assistant</a>
               <a href="#updates" className="hover:text-psc-gold transition-colors">News & Updates</a>
-              <a href="#assistant" className="hover:text-psc-gold transition-colors">Docket Assistant</a>
               <a href="#privacy" className="hover:text-psc-gold transition-colors">Privacy</a>
               <a href="https://dcpsc.org" target="_blank" rel="noopener noreferrer" className="bg-psc-gold hover:bg-psc-gold/90 text-psc-blue px-5 py-2 rounded-full font-bold transition-all shadow-md">
                 Visit Official Site
@@ -370,6 +452,7 @@ export default function App() {
             <button 
               className="md:hidden p-2"
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              aria-label={mobileMenuOpen ? "Close navigation menu" : "Open navigation menu"}
             >
               {mobileMenuOpen ? <X /> : <Menu />}
             </button>
@@ -386,10 +469,10 @@ export default function App() {
               className="md:hidden bg-psc-blue border-t border-white/10 overflow-hidden"
             >
               <div className="px-4 py-6 flex flex-col gap-4">
-                <a href="#" className="text-lg font-medium">Home</a>
-                <a href="#updates" className="text-lg font-medium">News & Updates</a>
-                <a href="#assistant" className="text-lg font-medium">Docket Assistant</a>
-                <a href="#privacy" className="text-lg font-medium">Privacy</a>
+                <a href="#" onClick={() => setMobileMenuOpen(false)} className="text-lg font-medium">Home</a>
+                <a href="#docket-chat" onClick={() => setMobileMenuOpen(false)} className="text-lg font-medium">Docket Assistant</a>
+                <a href="#updates" onClick={() => setMobileMenuOpen(false)} className="text-lg font-medium">News & Updates</a>
+                <a href="#privacy" onClick={() => setMobileMenuOpen(false)} className="text-lg font-medium">Privacy</a>
                 <a href="https://dcpsc.org" target="_blank" rel="noopener noreferrer" className="bg-psc-gold text-psc-blue w-full py-3 rounded-xl font-bold text-center">
                   Visit Official Site
                 </a>
@@ -422,7 +505,7 @@ export default function App() {
                   This is a non-official experimental tool designed to help you easily search, summarize, and explore public utility records and regulatory filings using advanced AI-assisted navigation.
                 </p>
                 <div className="flex flex-wrap gap-4">
-                  <a href="#assistant" className="bg-white text-psc-blue px-8 py-4 rounded-xl font-bold hover:bg-slate-100 transition-all flex items-center gap-2 shadow-xl">
+                  <a href="#docket-chat" className="bg-white text-psc-blue px-8 py-4 rounded-xl font-bold hover:bg-slate-100 transition-all flex items-center gap-2 shadow-xl">
                     <MessageSquare className="w-5 h-5" />
                     Ask the Docket Assistant
                   </a>
@@ -436,74 +519,12 @@ export default function App() {
           </div>
         </section>
 
-        {/* Latest Updates Section */}
-        <section id="updates" className="py-24 bg-white">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex flex-col md:flex-row md:items-end justify-between mb-12 gap-6">
-              <div>
-                <h2 className="text-3xl md:text-4xl text-psc-blue mb-4">Latest Regulatory Updates</h2>
-                <p className="text-slate-500 max-w-2xl">
-                  Stay informed about the latest decisions, press releases, and public notices from the Commission.
-                </p>
-              </div>
-              <a 
-                href="https://dcpsc.org/Newsroom.aspx" 
-                target="_blank" 
-                rel="noopener noreferrer" 
-                className="text-psc-blue font-bold flex items-center gap-1 hover:underline group"
-              >
-                View All News <ChevronRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
-              </a>
-            </div>
-
-            {loadingNews ? (
-              <div className="flex flex-col items-center justify-center py-20 text-slate-400">
-                <Loader2 className="w-12 h-12 animate-spin mb-4 text-psc-gold" />
-                <p className="font-medium">Fetching latest updates from the Commission...</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-                {news.map((item, idx) => (
-                  <motion.div
-                    key={idx}
-                    initial={{ opacity: 0, y: 20 }}
-                    whileInView={{ opacity: 1, y: 0 }}
-                    viewport={{ once: true }}
-                    transition={{ delay: idx * 0.1 }}
-                    className="group bg-psc-light rounded-2xl p-8 border border-slate-100 hover:border-psc-gold/30 hover:shadow-xl transition-all flex flex-col h-full"
-                  >
-                    <div className="flex justify-between items-start mb-6">
-                      <span className="text-xs font-bold text-psc-gold uppercase tracking-widest">{item.date}</span>
-                      <div className="p-2 bg-white rounded-lg shadow-sm group-hover:bg-psc-gold group-hover:text-white transition-colors">
-                        <Newspaper className="w-4 h-4" />
-                      </div>
-                    </div>
-                    <h3 className="text-xl mb-4 group-hover:text-psc-blue transition-colors leading-snug">
-                      {item.title}
-                    </h3>
-                    <p className="text-slate-600 mb-8 flex-grow line-clamp-4 leading-relaxed">
-                      {item.summary}
-                    </p>
-                    <VerifiedLink
-                      href={normalizeUrl(item.url)}
-                      fallbackHref="https://dcpsc.org/Newsroom.aspx"
-                      className="inline-flex items-center gap-2 text-psc-blue font-bold text-sm no-underline hover:gap-3 transition-all"
-                    >
-                      Read Full Update
-                    </VerifiedLink>
-                  </motion.div>
-                ))}
-              </div>
-            )}
-          </div>
-        </section>
-
         {/* Chatbot Section */}
         <section id="assistant" className="scroll-mt-20 py-8 bg-psc-light">
           <div className="max-w-[1536px] mx-auto px-4 sm:px-6 lg:px-8">
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 xl:gap-10 items-start">
               {/* Info Sidebar */}
-              <div className="lg:col-span-4 xl:col-span-3">
+              <div className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3">
                 <div className="sticky top-28">
                   <div className="bg-psc-blue text-white p-8 rounded-3xl shadow-2xl mb-8">
                     <div className="bg-psc-gold/20 p-3 rounded-2xl w-fit mb-6">
@@ -547,7 +568,7 @@ export default function App() {
               </div>
 
               {/* Chat Interface */}
-              <div className="lg:col-span-8 xl:col-span-9">
+              <div id="docket-chat" className="order-1 scroll-mt-24 lg:order-2 lg:col-span-8 xl:col-span-9">
                 <div className="bg-white rounded-3xl shadow-xl border border-slate-200 flex h-[calc(100dvh-7rem)] min-h-[520px] max-h-[760px] overflow-hidden relative z-10">
                   {/* Left Chat History Pane */}
                   <div className={cn(
@@ -573,6 +594,7 @@ export default function App() {
                           <div
                             key={session.id}
                             onClick={() => {
+                              if (session.id !== activeSessionId) cancelActiveRequest();
                               shouldAutoScrollRef.current = true;
                               setActiveSessionId(session.id);
                               setSidebarOpen(false);
@@ -651,6 +673,14 @@ export default function App() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        <a
+                          href="mailto:gz163@georgetown.edu?subject=PSC%20Docket%20Helper%20feedback"
+                          className="p-2 rounded-lg text-slate-400 hover:text-psc-blue hover:bg-psc-blue/5 transition-colors"
+                          aria-label="Report an issue"
+                          title="Report an issue"
+                        >
+                          <MessageCircle className="h-4 w-4" />
+                        </a>
                         <button 
                           onClick={handleClearChat}
                           className={cn(
@@ -712,6 +742,26 @@ export default function App() {
                           </div>
                         </motion.div>
                       ))}
+                      {!hasUserMessages && (
+                        <div className="ml-11 max-w-2xl rounded-2xl border border-psc-blue/10 bg-white/90 p-4 shadow-sm">
+                          <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-400">Try an example</p>
+                          <div className="grid gap-2">
+                            {EXAMPLE_QUESTIONS.map(question => (
+                              <button
+                                key={question}
+                                type="button"
+                                onClick={() => {
+                                  setInput(question);
+                                  inputRef.current?.focus();
+                                }}
+                                className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-left text-xs font-semibold text-slate-600 transition-colors hover:border-psc-gold hover:text-psc-blue"
+                              >
+                                {question}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                       {isTyping && (
                         <div className="flex mr-auto max-w-[85%]">
                           <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center bg-psc-blue text-white mr-3">
@@ -742,11 +792,11 @@ export default function App() {
                     </div>
 
                     {/* Input Area */}
-                    <form onSubmit={handleSendMessage} className="p-4 sm:p-5 border-t border-slate-100 bg-slate-50/50">
+                    <form onSubmit={handleSendMessage} className="border-t border-slate-100 bg-slate-50/50 p-3 sm:p-5">
                       <div className="relative">
                         <textarea
                           ref={inputRef}
-                          rows={2}
+                          rows={1}
                           value={input}
                           onChange={(e) => setInput(e.target.value)}
                           onKeyDown={(e) => {
@@ -758,7 +808,7 @@ export default function App() {
                           placeholder="Ask about a docket number or utility case..."
                           aria-label="Message PSC Assistant"
                           maxLength={appConfig?.maxMessageLength ?? 5000}
-                          className="block w-full min-h-[76px] max-h-40 resize-none bg-white border border-slate-200 rounded-2xl py-4 pl-5 pr-20 leading-6 focus:outline-none focus:ring-2 focus:ring-psc-blue/20 focus:border-psc-blue transition-[border-color,box-shadow] shadow-inner"
+                          className="block w-full min-h-[64px] max-h-40 resize-none bg-white border border-slate-200 rounded-2xl py-3.5 pl-4 pr-20 leading-6 focus:outline-none focus:ring-2 focus:ring-psc-blue/20 focus:border-psc-blue transition-[border-color,box-shadow] shadow-inner sm:min-h-[72px] sm:py-4 sm:pl-5"
                         />
                         <button
                           type={isTyping ? "button" : "submit"}
@@ -792,30 +842,9 @@ export default function App() {
                           Security verification is temporarily unavailable. Chat submissions are paused.
                         </div>
                       ) : null}
-                      <div className="mt-3 flex flex-col gap-2 text-[11px] leading-relaxed text-slate-500 sm:flex-row sm:items-center sm:justify-between">
-                        <p>
-                          Beta research tool. Verify answers against linked filings. Do not submit confidential, privileged, or personal information.
-                        </p>
-                        <a
-                          href="mailto:gz163@georgetown.edu?subject=PSC%20Docket%20Helper%20feedback"
-                          className="inline-flex flex-shrink-0 items-center gap-1.5 font-semibold text-psc-blue hover:underline"
-                        >
-                          <MessageCircle className="h-3.5 w-3.5" />
-                          Report an issue
-                        </a>
-                      </div>
-                      <div className="mt-4 flex flex-wrap gap-2">
-                        {EXAMPLE_QUESTIONS.map((question) => (
-                          <button
-                            key={question}
-                            type="button"
-                            onClick={() => setInput(question)}
-                            className="text-xs font-semibold text-left bg-white border border-slate-200 px-3 py-2 rounded-xl text-slate-600 hover:border-psc-gold hover:text-psc-gold transition-all cursor-pointer"
-                          >
-                            {question}
-                          </button>
-                        ))}
-                      </div>
+                      <p className="mt-2 text-[10px] leading-relaxed text-slate-500 sm:text-[11px]">
+                        Public-record research only. Verify answers against linked filings; do not submit confidential or personal information.
+                      </p>
                     </form>
                   </div>
                 </div>
@@ -823,6 +852,8 @@ export default function App() {
             </div>
           </div>
         </section>
+
+        <LatestUpdatesSection news={news} loading={loadingNews} />
 
         <section id="privacy" className="border-t border-slate-200 bg-white py-16">
           <div className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
