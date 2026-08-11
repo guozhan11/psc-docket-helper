@@ -1,9 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap');
 @import "tailwindcss";
 
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-display: "Outfit", sans-serif;
+  --font-display: "Manrope", ui-sans-serif, system-ui, sans-serif;
   
   --color-psc-blue: #003366;
   --color-psc-gold: #C5A059;
@@ -13,10 +13,16 @@
 @layer base {
   body {
     @apply bg-psc-light text-slate-900 font-sans;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
   }
   
-  h1, h2, h3, h4 {
+  h1, h2, h3 {
     @apply font-display font-bold tracking-tight;
+  }
+
+  h4 {
+    @apply font-sans font-bold;
   }
 }
 
@@ -35,4 +41,3 @@
 .markdown-body li {
   @apply mb-1;
 }
-

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">PSC Docket Helper document search</title>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#003366"/>
+  <path d="M10 20a5 5 0 0 1 5-5h12l5 6h17a5 5 0 0 1 5 5v18a5 5 0 0 1-5 5H15a5 5 0 0 1-5-5V20Z" fill="#fff"/>
+  <path d="M10 20a5 5 0 0 1 5-5h12l5 6H10v-1Z" fill="#C5A059"/>
+  <circle cx="41" cy="39" r="10" fill="#003366" stroke="#C5A059" stroke-width="4"/>
+  <path d="m48.5 46.5 7 7" fill="none" stroke="#C5A059" stroke-linecap="round" stroke-width="5"/>
+</svg>

@@ -6,6 +6,10 @@ An independent beta AI assistant for exploring District of Columbia Public Servi
 
 ### [Open the PSC Docket Helper](https://psc-docket-assistant.psc-docket-helper.workers.dev/)
 
+[![PSC Docket Helper chat interface](docs/images/chat-page.jpg)](https://psc-docket-assistant.psc-docket-helper.workers.dev/#docket-chat)
+
+*The Docket Assistant searches indexed public filings and links answers back to official sources. Click the screenshot to open the live chat.*
+
 No installation is required.
 
 > Public filing metadata, official links, and nearly all available PDF full text have been indexed. A small number of unavailable or image-only filings may still lack searchable text. Current corpus and global-router coverage are available from the [health endpoint](https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health).

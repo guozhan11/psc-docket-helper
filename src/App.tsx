@@ -1,13 +1,11 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  Search, 
+import {
   Send, 
   Newspaper, 
   MessageSquare, 
   ChevronRight, 
   Loader2, 
-  Scale, 
   Info,
   Menu,
   X,
@@ -20,7 +18,7 @@ import {
   ShieldCheck,
   AlertTriangle,
   MessageCircle,
-  Database,
+  FileSearch,
   Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -425,15 +423,13 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between h-20 items-center">
             <div className="flex items-center gap-3">
-              <div className="bg-white p-2 rounded-lg">
-                <Scale className="w-8 h-8 text-psc-blue" />
-              </div>
+              <img src="/favicon.svg" alt="" aria-hidden="true" className="h-12 w-12 flex-shrink-0" />
               <div>
                 <div className="flex items-center gap-2">
-                  <h1 className="text-xl font-display font-bold leading-tight uppercase">AI Docket Assistant</h1>
+                  <h1 className="font-display text-lg font-extrabold leading-tight tracking-[-0.03em] sm:text-xl">AI Docket Assistant</h1>
                   <span className="rounded-full border border-psc-gold/50 bg-psc-gold/20 px-2 py-0.5 text-[10px] font-bold tracking-widest text-psc-gold">BETA</span>
                 </div>
-                <p className="text-xs text-psc-gold font-medium uppercase tracking-widest">Public Service Commission</p>
+                <p className="font-sans text-[11px] font-semibold uppercase tracking-[0.14em] text-psc-gold sm:text-xs">Public Service Commission</p>
               </div>
             </div>
             
@@ -525,16 +521,16 @@ export default function App() {
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 xl:gap-10 items-start">
               {/* Info Sidebar */}
               <div className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3">
-                <div className="sticky top-28">
-                  <div className="bg-psc-blue text-white p-8 rounded-3xl shadow-2xl mb-8">
-                    <div className="bg-psc-gold/20 p-3 rounded-2xl w-fit mb-6">
-                      <Database className="w-8 h-8 text-psc-gold" />
+                <div className="sticky top-28 lg:flex lg:h-[calc(100dvh-7rem)] lg:min-h-[520px] lg:max-h-[760px] lg:flex-col lg:gap-4">
+                  <div className="mb-8 rounded-3xl bg-psc-blue p-8 text-white shadow-2xl lg:mb-0 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-6">
+                    <div className="mb-5 w-fit rounded-2xl bg-psc-gold/20 p-3">
+                      <FileSearch className="h-8 w-8 text-psc-gold" aria-hidden="true" />
                     </div>
-                    <h2 className="text-3xl mb-4">RAG Document Collection</h2>
-                    <p className="text-slate-300 mb-8 leading-relaxed">
+                    <h2 className="mb-3 text-3xl leading-tight">RAG Document Collection</h2>
+                    <p className="mb-6 leading-relaxed text-slate-300">
                       Answers are generated from relevant excerpts retrieved at question time from public records published in the official DC PSC e-Docket.
                     </p>
-                    <div className="space-y-4">
+                    <div className="space-y-3">
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
@@ -556,9 +552,9 @@ export default function App() {
                     </div>
                   </div>
                   
-                  <div className="bg-white p-6 rounded-2xl border border-slate-200 flex items-center gap-4">
-                    <div className="bg-psc-light p-3 rounded-xl">
-                      <Info className="w-6 h-6 text-psc-blue" />
+                  <div className="flex flex-shrink-0 items-center gap-3 rounded-2xl border border-slate-200 bg-white p-5 lg:p-4">
+                    <div className="rounded-xl bg-psc-light p-2.5">
+                      <Info className="h-5 w-5 text-psc-blue" />
                     </div>
                     <p className="text-xs text-slate-500 italic">
                       Note: This assistant uses AI to search public records. For official legal filings, please visit the e-Docket system.
@@ -664,12 +660,10 @@ export default function App() {
                         >
                           <Menu className="w-5 h-5" />
                         </button>
-                        <div className="w-10 h-10 rounded-full bg-psc-blue flex items-center justify-center text-white flex-shrink-0">
-                          <Scale className="w-5 h-5" />
-                        </div>
+                        <img src="/favicon.svg" alt="" aria-hidden="true" className="h-10 w-10 flex-shrink-0" />
                         <div>
                           <div className="flex items-center gap-2">
-                            <h3 className="font-bold text-psc-blue text-sm md:text-base">PSC Assistant</h3>
+                            <h3 className="font-display text-sm font-bold text-psc-blue md:text-base">PSC Assistant</h3>
                             <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-bold tracking-widest text-amber-800">BETA</span>
                           </div>
                           <div className="flex items-center gap-1.5">
@@ -910,9 +904,7 @@ export default function App() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-12 mb-20">
             <div className="col-span-1 lg:col-span-1">
               <div className="flex items-center gap-3 mb-8">
-                <div className="bg-white p-1.5 rounded-lg">
-                  <Scale className="w-6 h-6 text-psc-blue" />
-                </div>
+                <img src="/favicon.svg" alt="" aria-hidden="true" className="h-9 w-9 flex-shrink-0" />
                 <h2 className="text-xl font-display font-bold">AI Assistant</h2>
               </div>
               <p className="text-slate-400 text-sm leading-relaxed mb-8">
