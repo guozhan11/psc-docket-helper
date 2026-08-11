@@ -551,28 +551,30 @@ export default function App() {
               <div className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3">
                 <div className="sticky top-28 lg:flex lg:h-[calc(100dvh-7rem)] lg:min-h-[520px] lg:max-h-[760px] lg:flex-col lg:gap-4">
                   <div className="mb-8 rounded-3xl bg-psc-blue p-8 text-white shadow-2xl lg:mb-0 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-6">
-                    <h2 className="mb-3 text-3xl leading-tight">RAG Document Collection</h2>
-                    <p className="mb-6 leading-relaxed text-slate-300">
-                      Answers use searchable excerpts from public DC PSC e-Docket filings.
-                    </p>
-                    <div className="space-y-3">
+                    <div className="flex h-full flex-col justify-center">
+                      <h2 className="mb-3 text-3xl leading-tight">RAG Document Collection</h2>
+                      <p className="text-sm leading-relaxed text-slate-300">
+                        Answers are grounded in searchable excerpts from public DC PSC e-Docket filings.
+                      </p>
+
+                      <div className="my-5 border-y border-white/15 py-4">
+                        <p className="font-display text-4xl font-extrabold leading-none text-white">153K+</p>
+                        <p className="mt-2 text-sm leading-relaxed text-slate-300">Public PDFs indexed as page-level text</p>
+                      </div>
+
+                      <div className="space-y-3">
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">153,000+ public PDFs are indexed by page.</p>
+                        <p className="text-sm leading-relaxed text-slate-200">Search filing text and metadata across DC PSC cases.</p>
                       </div>
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">Search filing text and metadata across DC PSC cases.</p>
+                        <p className="text-sm leading-relaxed text-slate-200">Open official filing links to verify each answer.</p>
                       </div>
-                      <div className="flex items-start gap-3">
-                        <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
-                          <ChevronRight className="w-4 h-4 text-psc-gold" />
-                        </div>
-                        <p className="text-sm text-slate-200">Answers include official links for verification.</p>
                       </div>
                     </div>
                   </div>
