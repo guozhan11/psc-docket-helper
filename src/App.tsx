@@ -18,7 +18,6 @@ import {
   ShieldCheck,
   AlertTriangle,
   MessageCircle,
-  FileSearch,
   Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -148,6 +147,7 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [isReceivingContent, setIsReceivingContent] = useState(false);
   const [failedRequest, setFailedRequest] = useState<{ sessionId: string; message: string } | null>(null);
   const activeRequestRef = useRef<{ controller: AbortController; sessionId: string } | null>(null);
   const [clientId] = useState(() => {
@@ -173,12 +173,13 @@ export default function App() {
   }, [sessions, activeSessionId]);
 
   useEffect(() => {
+    if (isTyping) return;
     try {
       localStorage.setItem('dc_psc_chat_sessions', JSON.stringify(sessions));
     } catch (e) {
       console.error("Error saving chat sessions to localStorage:", e);
     }
-  }, [sessions]);
+  }, [sessions, isTyping]);
 
   useEffect(() => {
     if (activeSessionId) {
@@ -209,6 +210,7 @@ export default function App() {
     activeRequestRef.current = null;
     activeRequest.controller.abort();
     setIsTyping(false);
+    setIsReceivingContent(false);
     if (appConfig?.turnstileRequired) {
       setTurnstileToken(null);
       setTurnstileResetSignal(value => value + 1);
@@ -354,8 +356,16 @@ export default function App() {
     shouldAutoScrollRef.current = true;
     setFailedRequest(null);
     setIsTyping(true);
+    setIsReceivingContent(false);
     const requestController = new AbortController();
     activeRequestRef.current = { controller: requestController, sessionId: targetSessionId };
+    let streamedContent = '';
+
+    if (!appendUserMessage) {
+      updateSessionMessages(targetSessionId, prev =>
+        prev.at(-1)?.role === 'model' ? prev.slice(0, -1) : prev
+      );
+    }
 
     try {
       const activeSess = sessions.find(s => s.id === targetSessionId) || sessions[0];
@@ -372,12 +382,29 @@ export default function App() {
         userMessage,
         clientId,
         turnstileToken,
-        requestController.signal
+        requestController.signal,
+        delta => {
+          streamedContent += delta;
+          setIsReceivingContent(true);
+          updateSessionMessages(targetSessionId, prev => {
+            if (prev.at(-1)?.role === 'model') {
+              return [...prev.slice(0, -1), { role: 'model', content: streamedContent }];
+            }
+            return [...prev, { role: 'model', content: streamedContent }];
+          });
+        }
       );
-      updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: response || "I'm sorry, I couldn't process that request." }]);
+      if (!streamedContent) {
+        updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: response || "I'm sorry, I couldn't process that request." }]);
+      }
     } catch (error) {
       if (error instanceof AssistantRequestCancelledError) return;
       console.error("Chat error:", error);
+      if (streamedContent) {
+        updateSessionMessages(targetSessionId, prev =>
+          prev.at(-1)?.role === 'model' ? prev.slice(0, -1) : prev
+        );
+      }
       const content = error instanceof AssistantRequestError
         ? error.userMessage
         : "The assistant could not be reached. Please retry the request.";
@@ -387,6 +414,7 @@ export default function App() {
       if (activeRequestRef.current?.controller === requestController) {
         activeRequestRef.current = null;
         setIsTyping(false);
+        setIsReceivingContent(false);
         if (appConfig?.turnstileRequired) {
           setTurnstileToken(null);
           setTurnstileResetSignal(value => value + 1);
@@ -523,31 +551,28 @@ export default function App() {
               <div className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3">
                 <div className="sticky top-28 lg:flex lg:h-[calc(100dvh-7rem)] lg:min-h-[520px] lg:max-h-[760px] lg:flex-col lg:gap-4">
                   <div className="mb-8 rounded-3xl bg-psc-blue p-8 text-white shadow-2xl lg:mb-0 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-6">
-                    <div className="mb-5 w-fit rounded-2xl bg-psc-gold/20 p-3">
-                      <FileSearch className="h-8 w-8 text-psc-gold" aria-hidden="true" />
-                    </div>
                     <h2 className="mb-3 text-3xl leading-tight">RAG Document Collection</h2>
                     <p className="mb-6 leading-relaxed text-slate-300">
-                      Answers are generated from relevant excerpts retrieved at question time from public records published in the official DC PSC e-Docket.
+                      Answers use searchable excerpts from public DC PSC e-Docket filings.
                     </p>
                     <div className="space-y-3">
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">More than 153,000 eligible public PDF filings are indexed as searchable page-level text.</p>
+                        <p className="text-sm text-slate-200">153,000+ public PDFs are indexed by page.</p>
                       </div>
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">Filing metadata includes case and docket numbers, titles, dates, filers, and official source links.</p>
+                        <p className="text-sm text-slate-200">Search filing text and metadata across DC PSC cases.</p>
                       </div>
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">Confidential, archived, and non-PDF attachments are excluded from full-text retrieval.</p>
+                        <p className="text-sm text-slate-200">Answers include official links for verification.</p>
                       </div>
                     </div>
                   </div>
@@ -770,7 +795,7 @@ export default function App() {
                           </div>
                         </div>
                       )}
-                      {isTyping && (
+                      {isTyping && !isReceivingContent && (
                         <div className="mr-auto flex max-w-[95%] sm:max-w-[85%]">
                           <div className="mr-2 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-psc-blue text-white sm:mr-3 sm:h-8 sm:w-8">
                             A

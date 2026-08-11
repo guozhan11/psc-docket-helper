@@ -1155,6 +1155,185 @@ function extractOpenAiText(response: unknown): string {
   }).join("\n").trim();
 }
 
+function openAiRequestPayload(
+  env: WorkerEnv,
+  history: ChatMessage[],
+  message: string,
+  rows: SearchRow[],
+  stream = false
+): Record<string, unknown> {
+  return {
+    model: env.OPENAI_MODEL || "gpt-4.1",
+    max_output_tokens: 1_500,
+    instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
+Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
+Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
+Metadata-only records may establish that a filing exists, its title, date, case, and official URL, but never what its document body says.
+Never show labels such as Source 1, Source 2, or Evidence 1 to the user. Content citations must identify the filing by title and PDF page; metadata citations must identify it as a filing record.
+Never invent a filing, quotation, page, date, or URL. If evidence is insufficient, say so and suggest a narrower search.
+Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
+    input: `INDEXED E-DOCKET EXCERPTS:\n${sourceContext(rows)}\n\nCONVERSATION:\n${buildTranscript(history, message)}`,
+    text: { format: { type: "text" } },
+    stream
+  };
+}
+
+function answerSuffix(message: string, reply: string, rows: SearchRow[]): string {
+  const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
+  const scopeNote = extractCaseIdentifier(message) ? "" : "\n\n> **Search scope:** These are relevance-ranked matches from the indexed corpus, not a guarantee that every potentially relevant case is listed.";
+  const replyReportsInsufficientEvidence = /\b(?:no|insufficient|not enough)\s+(?:matching\s+)?evidence\b|\bcould(?:n['’]t| not)\s+find\b/i.test(reply);
+  if (replyReportsInsufficientEvidence || !sources.length) return scopeNote;
+  return `${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>
+    row.evidence_kind === "metadata"
+      ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
+      : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
+  ).join("\n")}`;
+}
+
+function formatOpenAiReply(message: string, rawReply: string, rows: SearchRow[]): string {
+  const reply = replaceOpaqueSourceLabels(rawReply, rows);
+  return `${reply}${answerSuffix(message, reply, rows)}`;
+}
+
+function encodeAssistantEvent(event: "delta" | "done" | "error", data: unknown): Uint8Array {
+  return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function staticAssistantStream(reply: string, requestId: string): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encodeAssistantEvent("delta", { delta: reply }));
+      controller.enqueue(encodeAssistantEvent("done", { requestId }));
+      controller.close();
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      ...API_HEADERS,
+      "Content-Type": "text/event-stream; charset=utf-8"
+    }
+  });
+}
+
+export function openAiStreamDelta(frame: string): string | null {
+  const dataText = frame.split(/\r?\n/)
+    .filter(line => line.startsWith("data:"))
+    .map(line => line.slice(5).trimStart())
+    .join("\n");
+  if (!dataText || dataText === "[DONE]") return null;
+  const payload: unknown = JSON.parse(dataText);
+  if (!isRecord(payload)) return null;
+  if (payload.type === "error") {
+    const message = isRecord(payload.error) && typeof payload.error.message === "string"
+      ? payload.error.message
+      : "OpenAI streaming error";
+    throw new Error(message);
+  }
+  return payload.type === "response.output_text.delta" && typeof payload.delta === "string"
+    ? payload.delta
+    : null;
+}
+
+async function streamAnswerWithOpenAi(
+  env: WorkerEnv,
+  history: ChatMessage[],
+  message: string,
+  rows: SearchRow[],
+  requestId: string,
+  requestSignal: AbortSignal
+): Promise<Response> {
+  if (!env.OPENAI_API_KEY) {
+    return staticAssistantStream(buildDirectExcerptReply(rows, "disabled"), requestId);
+  }
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+    "Content-Type": "application/json"
+  };
+  if (env.CF_AIG_TOKEN) headers["cf-aig-authorization"] = `Bearer ${env.CF_AIG_TOKEN}`;
+  const modelStartedAt = performance.now();
+
+  try {
+    const response = await fetch(openAiEndpoint(env), {
+      method: "POST",
+      headers,
+      signal: AbortSignal.any([requestSignal, AbortSignal.timeout(OPENAI_TIMEOUT_MS)]),
+      body: JSON.stringify(openAiRequestPayload(env, history, message, rows, true))
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`OpenAI Responses API returned ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let rawReply = "";
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            buffer += decoder.decode(value, { stream: !done });
+            const frames = buffer.split(/\r?\n\r?\n/);
+            buffer = frames.pop() ?? "";
+            for (const frame of frames) {
+              const delta = openAiStreamDelta(frame);
+              if (!delta) continue;
+              rawReply += delta;
+              controller.enqueue(encodeAssistantEvent("delta", { delta }));
+            }
+            if (done) break;
+          }
+          if (buffer.trim()) {
+            const delta = openAiStreamDelta(buffer);
+            if (delta) {
+              rawReply += delta;
+              controller.enqueue(encodeAssistantEvent("delta", { delta }));
+            }
+          }
+          if (!rawReply.trim()) throw new Error("OpenAI returned no text");
+          const suffix = answerSuffix(message, rawReply, rows);
+          if (suffix) controller.enqueue(encodeAssistantEvent("delta", { delta: suffix }));
+          controller.enqueue(encodeAssistantEvent("done", { requestId }));
+          logChatStage(requestId, "ai-summary", modelStartedAt, { outcome: "streamed" });
+        } catch (error) {
+          if (!requestSignal.aborted) {
+            console.error(JSON.stringify({
+              message: "AI response stream interrupted",
+              requestId,
+              durationMs: elapsedMs(modelStartedAt),
+              error: error instanceof Error ? error.message : String(error)
+            }));
+            controller.enqueue(encodeAssistantEvent("error", {
+              userMessage: "The assistant response was interrupted. Please retry the request."
+            }));
+          }
+        } finally {
+          reader.releaseLock();
+          try {
+            controller.close();
+          } catch {
+            // The client may have already cancelled the response stream.
+          }
+        }
+      }
+    });
+    return new Response(stream, {
+      headers: {
+        ...API_HEADERS,
+        "Content-Type": "text/event-stream; charset=utf-8"
+      }
+    });
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "AI stream unavailable; returning direct excerpts",
+      requestId,
+      durationMs: elapsedMs(modelStartedAt),
+      error: error instanceof Error ? error.message : String(error)
+    }));
+    return staticAssistantStream(buildDirectExcerptReply(rows, "unavailable"), requestId);
+  }
+}
+
 function buildDirectExcerptReply(rows: SearchRow[], reason: "disabled" | "unavailable"): string {
   if (!rows.length) {
     return `No matching excerpt was found in the indexed filings. Try a more specific keyword or case number, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`;
@@ -1198,35 +1377,13 @@ async function answerWithOpenAi(
       method: "POST",
       headers,
       signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
-      body: JSON.stringify({
-      model: env.OPENAI_MODEL || "gpt-4.1",
-      max_output_tokens: 1_500,
-      instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
-Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
-Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
-Metadata-only records may establish that a filing exists, its title, date, case, and official URL, but never what its document body says.
-Never show labels such as Source 1, Source 2, or Evidence 1 to the user. Content citations must identify the filing by title and PDF page; metadata citations must identify it as a filing record.
-Never invent a filing, quotation, page, date, or URL. If evidence is insufficient, say so and suggest a narrower search.
-Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
-      input: `INDEXED E-DOCKET EXCERPTS:\n${sourceContext(rows)}\n\nCONVERSATION:\n${buildTranscript(history, message)}`,
-      text: { format: { type: "text" } }
-      })
+      body: JSON.stringify(openAiRequestPayload(env, history, message, rows))
     });
     if (!response.ok) throw new Error(`OpenAI Responses API returned ${response.status}`);
     const rawReply = extractOpenAiText(await response.json());
     if (!rawReply) throw new Error("OpenAI returned no text");
     logChatStage(requestId, "ai-summary", modelStartedAt, { outcome: "success" });
-    const reply = replaceOpaqueSourceLabels(rawReply, rows);
-    const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
-    const scopeNote = extractCaseIdentifier(message) ? "" : "\n\n> **Search scope:** These are relevance-ranked matches from the indexed corpus, not a guarantee that every potentially relevant case is listed.";
-    const replyReportsInsufficientEvidence = /\b(?:no|insufficient|not enough)\s+(?:matching\s+)?evidence\b|\bcould(?:n['’]t| not)\s+find\b/i.test(reply);
-    if (replyReportsInsufficientEvidence) return `${reply}${scopeNote}`;
-    if (!sources.length) return `${reply}${scopeNote}`;
-    return `${reply}${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>
-      row.evidence_kind === "metadata"
-        ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
-        : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
-    ).join("\n")}`;
+    return formatOpenAiReply(message, rawReply, rows);
   } catch (error) {
     console.error(JSON.stringify({
       message: "AI summary unavailable; returning direct excerpts",
@@ -1434,6 +1591,7 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
   if (url.pathname === "/api/chat" && request.method === "POST") {
     const requestId = crypto.randomUUID();
     const requestStartedAt = performance.now();
+    const wantsEventStream = (request.headers.get("Accept") ?? "").includes("text/event-stream");
     if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) {
       return json({ error: "Content-Type must be application/json" }, 415);
     }
@@ -1471,16 +1629,21 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
     const message = body.message;
     try {
       if (isCredentialOrPromptExtractionRequest(message)) {
-        return json({
-          reply: "I can’t reveal private instructions, credentials, or secrets. I can help research DC PSC dockets and public filings instead."
-        });
+        const reply = "I can’t reveal private instructions, credentials, or secrets. I can help research DC PSC dockets and public filings instead.";
+        return wantsEventStream ? staticAssistantStream(reply, requestId) : json({ reply });
       }
       const directCaseReply = await buildDetailedCaseNumberReply(message);
       if (directCaseReply) {
         logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "direct-case" });
-        return json({ reply: directCaseReply, requestId });
+        return wantsEventStream
+          ? staticAssistantStream(directCaseReply, requestId)
+          : json({ reply: directCaseReply, requestId });
       }
       const rows = await searchDockets(env, message, requestId);
+      if (wantsEventStream) {
+        logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "stream-start", rows: rows.length });
+        return streamAnswerWithOpenAi(env, body.history, message, rows, requestId, request.signal);
+      }
       const reply = await answerWithOpenAi(env, body.history, message, rows, requestId);
       logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "success", rows: rows.length });
       return json({ reply, requestId });
@@ -1491,10 +1654,10 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
         durationMs: elapsedMs(requestStartedAt),
         error: error instanceof Error ? error.message : String(error)
       }));
-      return json({
-        reply: `⚠️ The assistant could not complete this search right now. Please try again, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`,
-        requestId
-      });
+      const reply = `⚠️ The assistant could not complete this search right now. Please try again, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`;
+      return wantsEventStream
+        ? staticAssistantStream(reply, requestId)
+        : json({ reply, requestId });
     }
   }
 

@@ -3,10 +3,16 @@ import test from 'node:test';
 import {
   fullTextCoverageSummary,
   isCredentialOrPromptExtractionRequest,
+  openAiStreamDelta,
   parseChatRequestBody,
   readR2JsonWithRetry,
   selectDiverseGlobalResults
 } from './index.ts';
+
+test('OpenAI response stream parser returns only text deltas', () => {
+  assert.equal(openAiStreamDelta('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}'), 'Hello');
+  assert.equal(openAiStreamDelta('event: response.completed\ndata: {"type":"response.completed"}'), null);
+});
 
 function r2Object(payload: unknown) {
   const text = JSON.stringify(payload);

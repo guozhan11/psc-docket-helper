@@ -54,13 +54,15 @@ export async function chatWithDocketAssistant(
   message: string,
   clientId: string,
   turnstileToken: string | null,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDelta?: (delta: string) => void
 ): Promise<string> {
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        "Accept": "text/event-stream, application/json",
       },
       body: JSON.stringify({ history, message, clientId, turnstileToken }),
       signal,
@@ -76,6 +78,58 @@ export async function chatWithDocketAssistant(
         userMessage,
         `Docket Assistant backend returned HTTP ${response.status}`
       );
+    }
+
+    if ((response.headers.get("Content-Type") ?? "").includes("text/event-stream")) {
+      if (!response.body) {
+        throw new AssistantRequestError(
+          "The assistant returned an empty response. Please retry the request.",
+          "Docket Assistant backend returned an empty stream"
+        );
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let reply = "";
+
+      const processFrame = (frame: string) => {
+        const event = frame.split(/\r?\n/).find(line => line.startsWith("event:"))?.slice(6).trim();
+        const dataText = frame.split(/\r?\n/)
+          .filter(line => line.startsWith("data:"))
+          .map(line => line.slice(5).trimStart())
+          .join("\n");
+        if (!dataText) return;
+        const payload: unknown = JSON.parse(dataText);
+        if (event === "delta" && payload && typeof payload === "object"
+          && "delta" in payload && typeof payload.delta === "string") {
+          reply += payload.delta;
+          onDelta?.(payload.delta);
+        }
+        if (event === "error") {
+          const userMessage = payload && typeof payload === "object" && "userMessage" in payload
+            && typeof payload.userMessage === "string"
+            ? payload.userMessage
+            : "The assistant stream was interrupted. Please retry the request.";
+          throw new AssistantRequestError(userMessage, "Docket Assistant stream returned an error");
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() ?? "";
+        frames.forEach(processFrame);
+        if (done) break;
+      }
+      if (buffer.trim()) processFrame(buffer);
+      if (!reply) {
+        throw new AssistantRequestError(
+          "The assistant returned no text. Please retry the request.",
+          "Docket Assistant stream completed without text"
+        );
+      }
+      return reply;
     }
 
     const data: unknown = await response.json();
