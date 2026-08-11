@@ -15,6 +15,8 @@ const DC_PSC_CURRENT_NEWS_URL = "https://dcpsc.org/Newsroom/Current-PSC-News.asp
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const OPENAI_MODEL = "gpt-4.1";
+const MAX_MESSAGE_LENGTH = 5_000;
+const MAX_HISTORY_MESSAGES = 10;
 
 // Helper utility to normalize and correct any DC PSC & eDocket URLs (e.g. converting lowercase paths to case-sensitive equivalents used by IIS)
 function normalizeUrl(url: string | undefined): string {
@@ -979,7 +981,17 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   // Middleware to support json parsing
-  app.use(express.json());
+  app.use(express.json({ limit: "64kb" }));
+
+  // Local development does not require Turnstile. The deployed Worker exposes
+  // the production site key and validates every token server-side.
+  app.get("/api/config", (req, res) => {
+    res.json({
+      turnstileRequired: false,
+      turnstileSiteKey: null,
+      maxMessageLength: MAX_MESSAGE_LENGTH
+    });
+  });
 
   // API Route: Server status checking
   app.get("/api/health", (req, res) => {
@@ -1066,9 +1078,16 @@ async function startServer() {
   // API Route: Securely chat with the DC PSC docket assistant
   app.post("/api/chat", async (req, res) => {
     try {
-      const { history = [], message } = req.body;
-      if (!message) {
-        return res.status(400).json({ error: "Missing message body" });
+      const { history = [], message } = req.body ?? {};
+      const validHistory = Array.isArray(history)
+        && history.length <= MAX_HISTORY_MESSAGES
+        && history.every(item => item && (item.role === "user" || item.role === "model")
+          && typeof item.content === "string" && item.content.length <= MAX_MESSAGE_LENGTH);
+      if (typeof message !== "string" || !message.trim()
+        || message.length > MAX_MESSAGE_LENGTH || !validHistory) {
+        return res.status(400).json({
+          error: `Message must be at most ${MAX_MESSAGE_LENGTH} characters and history must contain at most ${MAX_HISTORY_MESSAGES} valid messages.`
+        });
       }
 
       try {

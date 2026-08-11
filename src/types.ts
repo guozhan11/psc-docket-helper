@@ -16,3 +16,23 @@ export interface ChatSession {
   messages: Message[];
   createdAt: number;
 }
+
+export interface PublicAppConfig {
+  turnstileRequired: boolean;
+  turnstileSiteKey: string | null;
+  maxMessageLength: number;
+}
+
+export interface HealthSummary {
+  status: 'ok' | 'degraded';
+  issues: string[];
+  fullTextCoverage?: {
+    searchablePercent: number | null;
+    indexedDocuments: number;
+    publicPdfRecords: number;
+    stateAvailable: boolean;
+  };
+  metadataCoverage?: {
+    updatedAt?: string | null;
+  };
+}

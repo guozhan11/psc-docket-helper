@@ -1,4 +1,4 @@
-import { Message, NewsUpdate } from "../types";
+import { HealthSummary, Message, NewsUpdate, PublicAppConfig } from "../types";
 
 export class AssistantRequestError extends Error {
   constructor(public readonly userMessage: string, message: string) {
@@ -20,19 +20,48 @@ export async function getLatestPSCUpdates(): Promise<NewsUpdate[]> {
   }
 }
 
-export async function chatWithDocketAssistant(history: Message[], message: string): Promise<string> {
+export async function getPublicAppConfig(): Promise<PublicAppConfig> {
+  const response = await fetch('/api/config', { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(`Configuration returned HTTP ${response.status}`);
+  return response.json();
+}
+
+export async function getHealthSummary(): Promise<HealthSummary | null> {
+  try {
+    const response = await fetch('/api/health', { headers: { Accept: 'application/json' } });
+    const data: unknown = await response.json();
+    if (!data || typeof data !== 'object' || !("status" in data)
+      || (data.status !== 'ok' && data.status !== 'degraded')) return null;
+    return data as HealthSummary;
+  } catch (error) {
+    console.error('Health status unavailable:', error);
+    return null;
+  }
+}
+
+export async function chatWithDocketAssistant(
+  history: Message[],
+  message: string,
+  clientId: string,
+  turnstileToken: string | null
+): Promise<string> {
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ history, message }),
+      body: JSON.stringify({ history, message, clientId, turnstileToken }),
     });
 
     if (!response.ok) {
+      const data: unknown = await response.json().catch(() => null);
+      const userMessage = data && typeof data === 'object' && 'userMessage' in data
+        && typeof data.userMessage === 'string'
+        ? data.userMessage
+        : `The assistant returned HTTP ${response.status}. Please retry the request.`;
       throw new AssistantRequestError(
-        `The assistant returned HTTP ${response.status}. Please retry the request.`,
+        userMessage,
         `Docket Assistant backend returned HTTP ${response.status}`
       );
     }

@@ -3,11 +3,28 @@ import { termMayExist, tokenizeForFilter } from "../shared/compactSearch.ts";
 type WorkerEnv = Env & {
   OPENAI_API_KEY?: string;
   CF_AIG_TOKEN?: string;
+  TURNSTILE_SECRET?: string;
+  TURNSTILE_SITE_KEY?: string;
+  TURNSTILE_EXPECTED_HOSTNAME?: string;
 };
 
 interface ChatMessage {
   role: "user" | "model";
   content: string;
+}
+
+interface ChatRequestBody {
+  history: ChatMessage[];
+  message: string;
+  clientId: string | null;
+  turnstileToken: string | null;
+}
+
+interface TurnstileSiteverifyResponse {
+  success?: boolean;
+  hostname?: string;
+  action?: string;
+  "error-codes"?: string[];
 }
 
 interface SearchRow {
@@ -22,6 +39,8 @@ interface SearchRow {
   rank: number;
   evidence_kind?: "content" | "metadata";
 }
+
+type GlobalResultIdentity = Pick<SearchRow, "case_number" | "filing_id" | "page_number">;
 
 interface CompactDocumentRow {
   filing_id: number;
@@ -123,21 +142,34 @@ const EDOCKET_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const OPENAI_TIMEOUT_MS = 15_000;
+const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const TURNSTILE_TIMEOUT_MS = 5_000;
+const TURNSTILE_ACTION = "turnstile-spin-v2";
+const MAX_CHAT_BODY_BYTES = 64 * 1024;
+const MAX_MESSAGE_LENGTH = 5_000;
+const MAX_HISTORY_MESSAGES = 10;
+const MAX_HISTORY_MESSAGE_LENGTH = 5_000;
+const MAX_TURNSTILE_TOKEN_LENGTH = 2_048;
+const HEALTH_FRESHNESS_MS = 36 * 60 * 60 * 1_000;
 const CASE_ROUTER_VERSION = 2;
 const CASE_ROUTER_INDEX_KEY = `case-router/v${CASE_ROUTER_VERSION}/index.json`;
 const CASE_ROUTER_CANDIDATES = 8;
-const CASE_ROUTER_VERIFIED_CASES = 4;
-const CORS_HEADERS = {
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+const CASE_ROUTER_VERIFIED_CASES = 2;
+// Cross-case questions must stay within the Worker CPU budget. The complete
+// router is intentionally split into 16 independent hash partitions; sample a
+// deterministic window instead of inflating and scanning all 12 MB per chat.
+const CASE_ROUTER_PART_READ_LIMIT = 1;
+const API_HEADERS = {
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff"
 };
 
 function searchDatabases(env: WorkerEnv): D1Database[] {
   return [env.DB, env.DB_1, env.DB_2];
 }
 
-function json(data: unknown, status = 200): Response {
-  return Response.json(data, { status, headers: CORS_HEADERS });
+function json(data: unknown, status = 200, headers: HeadersInit = {}): Response {
+  return Response.json(data, { status, headers: { ...API_HEADERS, ...headers } });
 }
 
 function elapsedMs(startedAt: number): number {
@@ -172,6 +204,104 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isChatMessage(value: unknown): value is ChatMessage {
+  return isRecord(value)
+    && (value.role === "user" || value.role === "model")
+    && typeof value.content === "string"
+    && value.content.length <= MAX_HISTORY_MESSAGE_LENGTH;
+}
+
+export function parseChatRequestBody(value: unknown): ChatRequestBody | null {
+  if (!isRecord(value) || typeof value.message !== "string") return null;
+  const message = value.message.trim();
+  if (!message || message.length > MAX_MESSAGE_LENGTH) return null;
+  const rawHistory = value.history ?? [];
+  if (!Array.isArray(rawHistory) || rawHistory.length > MAX_HISTORY_MESSAGES
+    || !rawHistory.every(isChatMessage)) return null;
+  const clientId = typeof value.clientId === "string" && /^[a-f0-9-]{20,64}$/i.test(value.clientId)
+    ? value.clientId
+    : null;
+  const turnstileToken = typeof value.turnstileToken === "string"
+    && value.turnstileToken.length > 0
+    && value.turnstileToken.length <= MAX_TURNSTILE_TOKEN_LENGTH
+    ? value.turnstileToken
+    : null;
+  return { history: rawHistory, message, clientId, turnstileToken };
+}
+
+async function readLimitedJson(request: Request): Promise<unknown> {
+  const contentLength = Number(request.headers.get("Content-Length") ?? 0);
+  if (contentLength > MAX_CHAT_BODY_BYTES) throw new Error("request-too-large");
+  if (!request.body) return null;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_CHAT_BODY_BYTES) {
+      await reader.cancel();
+      throw new Error("request-too-large");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function rateLimitActor(request: Request, clientId: string | null): string {
+  if (clientId) return `client:${clientId}`;
+  const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  return `ip:${clientIp}`;
+}
+
+async function verifyTurnstile(
+  request: Request,
+  env: WorkerEnv,
+  token: string | null,
+  requestId: string
+): Promise<boolean> {
+  if (!env.TURNSTILE_SECRET) return true;
+  if (!token) return false;
+  const remoteIp = request.headers.get("CF-Connecting-IP") ?? "";
+  const form = new URLSearchParams({
+    secret: env.TURNSTILE_SECRET,
+    response: token,
+    idempotency_key: requestId
+  });
+  if (remoteIp) form.set("remoteip", remoteIp);
+  try {
+    const response = await fetch(TURNSTILE_SITEVERIFY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form,
+      signal: AbortSignal.timeout(TURNSTILE_TIMEOUT_MS)
+    });
+    if (!response.ok) return false;
+    const result = await response.json<TurnstileSiteverifyResponse>();
+    if (result.success !== true || result.action !== TURNSTILE_ACTION) return false;
+    return !env.TURNSTILE_EXPECTED_HOSTNAME
+      || result.hostname === env.TURNSTILE_EXPECTED_HOSTNAME;
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Turnstile validation unavailable",
+      requestId,
+      error: error instanceof Error ? error.message : String(error)
+    }));
+    return false;
+  }
+}
+
 async function readR2Json(object: R2ObjectBody | null, key: string): Promise<unknown> {
   if (!object) return null;
   try {
@@ -187,9 +317,10 @@ async function readR2Json(object: R2ObjectBody | null, key: string): Promise<unk
   }
 }
 
-function fullTextCoverageSummary(
+export function fullTextCoverageSummary(
   ingestionShards: Array<Record<string, unknown> | null>,
-  publicPdfRecords: number
+  publicPdfRecords: number,
+  stateAvailable = true
 ) {
   const indexedDocuments = ingestionShards.reduce(
     (total, shard) => total + numericStateValue(shard?.documentsIndexed),
@@ -203,24 +334,49 @@ function fullTextCoverageSummary(
     (total, shard) => total + stateArrayLength(shard?.unavailableFilingIds),
     0
   );
-  const searchablePercent = publicPdfRecords > 0
+  const searchablePercent = stateAvailable && publicPdfRecords > 0
     ? Math.min(100, Number((indexedDocuments * 100 / publicPdfRecords).toFixed(2)))
-    : 0;
-  const accountedPercent = publicPdfRecords > 0
+    : null;
+  const accountedPercent = stateAvailable && publicPdfRecords > 0
     ? Math.min(100, Number(((indexedDocuments + unavailableDocuments) * 100 / publicPdfRecords).toFixed(2)))
-    : 0;
+    : null;
   return {
     source: "r2-ingestion-state",
+    stateAvailable,
     indexedDocuments,
     publicPdfRecords,
     retryPendingDocuments,
     unavailableDocuments,
+    unaccountedDocuments: stateAvailable
+      ? Math.max(0, publicPdfRecords - indexedDocuments - unavailableDocuments)
+      : null,
     searchablePercent,
     accountedPercent,
-    complete: publicPdfRecords > 0
+    complete: stateAvailable
+      && publicPdfRecords > 0
       && retryPendingDocuments === 0
       && indexedDocuments + unavailableDocuments >= publicPdfRecords
   };
+}
+
+function isFreshTimestamp(value: unknown, now = Date.now()): boolean {
+  if (typeof value !== "string") return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && now - timestamp <= HEALTH_FRESHNESS_MS;
+}
+
+export function selectDiverseGlobalResults<T extends GlobalResultIdentity>(
+  groups: T[][],
+  maxPerCase = 3,
+  totalLimit = 8
+): T[] {
+  const selected = new Map<string, T>();
+  for (const group of groups) {
+    for (const row of group.slice(0, maxPerCase)) {
+      selected.set(`${row.filing_id}:${row.page_number}`, row);
+    }
+  }
+  return Array.from(selected.values()).slice(0, totalLimit);
 }
 
 function isOfficialPscUrl(value: string): boolean {
@@ -332,6 +488,14 @@ function extractCaseIdentifier(text: string): string | null {
 function isSimpleCaseNumberQuery(text: string): boolean {
   return /^(?:(?:fc|formal\s+case|case|docket)\s*(?:no\.?|number)?\s*[-#:]*\s*)?\d{3,5}$/i.test(text.trim())
     || /^[a-z]{1,12}-?\d{3,5}(?:-[a-z0-9]{1,8}){0,3}$/i.test(text.trim());
+}
+
+export function isCredentialOrPromptExtractionRequest(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return /(system|developer)\s+(prompt|instructions?)/.test(normalized)
+    || /(api|secret|access)\s*keys?/.test(normalized)
+    || /reveal.{0,40}(prompt|instructions?|keys?|secrets?)/.test(normalized)
+    || /ignore.{0,40}(previous|prior|system|developer).{0,40}(instructions?|prompt)/.test(normalized);
 }
 
 function formatEdocketDate(value: string | null | undefined): string {
@@ -456,9 +620,9 @@ async function buildDetailedCaseNumberReply(message: string): Promise<string | n
 const STOP_WORDS = new Set([
   "about", "after", "also", "an", "and", "are", "can", "could", "document", "documents",
   "case", "cases", "commission", "dc", "discuss", "discussed", "discusses", "discussion",
-  "docket", "dockets", "filing", "filings", "find", "for", "from", "have", "into", "mention",
+  "across", "docket", "dockets", "filing", "filings", "find", "for", "from", "give", "have", "into", "link", "links", "mention",
   "mentions", "please", "psc", "that", "the",
-  "their", "this", "was", "were", "what", "when", "where", "which", "with", "would",
+  "number", "numbers", "official", "recent", "their", "this", "was", "were", "what", "when", "where", "which", "with", "would",
   "in", "is", "it", "of", "or", "to"
 ]);
 
@@ -530,7 +694,15 @@ async function routeCases(
   let candidates: RoutedCase[] = [];
   const requiredTermMatches = Math.min(2, terms.length);
   let partsRead = 0;
-  for (const key of index.partKeys) {
+  const routeSeed = terms.join("|").split("").reduce(
+    (hash, character) => ((hash * 31) + character.charCodeAt(0)) >>> 0,
+    0
+  );
+  const orderedKeys = Array.from(
+    { length: Math.min(CASE_ROUTER_PART_READ_LIMIT, index.partKeys.length) },
+    (_, offset) => index.partKeys[(routeSeed + offset) % index.partKeys.length]
+  );
+  for (const key of orderedKeys) {
     const object = await env.DOCUMENTS.get(key);
     if (!object || object.size > 8 * 1024 * 1024) continue;
     const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
@@ -575,9 +747,10 @@ async function routeCases(
     candidates = candidates.slice(0, CASE_ROUTER_CANDIDATES);
   }
   logChatStage(requestId, "case-router", startedAt, {
-    outcome: partsRead === index.shardCount ? "success" : "partial",
+    outcome: partsRead === orderedKeys.length ? "bounded-success" : "partial",
     partsRead,
-    expectedParts: index.shardCount,
+    expectedParts: orderedKeys.length,
+    totalParts: index.shardCount,
     candidates: candidates.length
   });
   return candidates;
@@ -830,25 +1003,23 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
   } else if (terms.length) {
     try {
       const routedCases = await routeCases(env, terms, requestId);
-      const routedRows: SearchRow[] = [];
+      const routedGroups: SearchRow[][] = [];
       for (const candidate of routedCases.slice(0, CASE_ROUTER_VERIFIED_CASES)) {
         const rows = await searchCompactDocuments(
           env,
           candidate.caseNumber,
           terms,
           requestId,
-          4,
+          2,
           Math.min(2, terms.length)
         );
-        routedRows.push(...rows.filter(row => row.evidence_kind !== "metadata"));
-        if (routedRows.length >= 8) break;
+        // Preserve cross-case diversity for global questions instead of letting
+        // the first high-volume case consume every evidence slot.
+        routedGroups.push(rows.filter(row => row.evidence_kind !== "metadata"));
       }
+      const routedRows = selectDiverseGlobalResults(routedGroups);
       if (routedRows.length) {
-        const unique = new Map<string, SearchRow>();
-        for (const row of routedRows.sort((left, right) => left.rank - right.rank)) {
-          unique.set(`${row.filing_id}:${row.page_number}`, row);
-        }
-        return Array.from(unique.values()).slice(0, 8);
+        return routedRows;
       }
     } catch (error) {
       console.error(JSON.stringify({
@@ -862,9 +1033,9 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
 }
 
 function buildTranscript(history: ChatMessage[], message: string): string {
-  const prior = history.slice(-8).map(item => {
+  const prior = history.slice(-10).map(item => {
     const role = item.role === "model" ? "Assistant" : "User";
-    return `${role}: ${String(item.content).slice(0, 3000)}`;
+    return `${role}: ${String(item.content).slice(0, MAX_HISTORY_MESSAGE_LENGTH)}`;
   });
   return [...prior, `User: ${message}`].join("\n\n");
 }
@@ -960,6 +1131,7 @@ async function answerWithOpenAi(
       signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
       body: JSON.stringify({
       model: env.OPENAI_MODEL || "gpt-4.1",
+      max_output_tokens: 1_500,
       instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
 Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
@@ -977,8 +1149,11 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
     logChatStage(requestId, "ai-summary", modelStartedAt, { outcome: "success" });
     const reply = replaceOpaqueSourceLabels(rawReply, rows);
     const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
-    if (!sources.length) return reply;
-    return `${reply}\n\n---\n**Official filing sources**\n${sources.map(row =>
+    const scopeNote = extractCaseIdentifier(message) ? "" : "\n\n> **Search scope:** These are relevance-ranked matches from the indexed corpus, not a guarantee that every potentially relevant case is listed.";
+    const replyReportsInsufficientEvidence = /\b(?:no|insufficient|not enough)\s+(?:matching\s+)?evidence\b|\bcould(?:n['’]t| not)\s+find\b/i.test(reply);
+    if (replyReportsInsufficientEvidence) return `${reply}${scopeNote}`;
+    if (!sources.length) return `${reply}${scopeNote}`;
+    return `${reply}${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>
       row.evidence_kind === "metadata"
         ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
         : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
@@ -996,7 +1171,14 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
 
 async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   const url = new URL(request.url);
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+
+  if (url.pathname === "/api/config" && request.method === "GET") {
+    return json({
+      turnstileRequired: Boolean(env.TURNSTILE_SECRET),
+      turnstileSiteKey: env.TURNSTILE_SECRET ? env.TURNSTILE_SITE_KEY ?? null : null,
+      maxMessageLength: MAX_MESSAGE_LENGTH
+    });
+  }
 
   if (url.pathname === "/api/health" && request.method === "GET") {
     const [
@@ -1105,15 +1287,42 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
           compressedBytes: caseRouterPayload.compressedBytes
         }
       : { status: "missing" };
+    const metadataStateAvailable = metadataCoverageShards.every(item => item !== null);
+    const ingestionStateAvailable = ingestionShards.every(item => item !== null);
+    const routerReady = isCaseRouterIndex(caseRouterPayload);
+    const metadataFresh = isFreshTimestamp(metadataCoverage && "updatedAt" in metadataCoverage
+      ? metadataCoverage.updatedAt
+      : null);
+    const routerFresh = routerReady && isFreshTimestamp(caseRouterPayload.updatedAt);
+    const turnstileConfigurationValid = Boolean(env.TURNSTILE_SECRET) === Boolean(env.TURNSTILE_SITE_KEY);
+    const issues = [
+      !metadataStateAvailable ? "metadata-shard-unavailable" : null,
+      !ingestionStateAvailable ? "ingestion-shard-unavailable" : null,
+      !routerReady ? "case-router-unavailable" : null,
+      !metadataFresh ? "metadata-stale" : null,
+      !routerFresh ? "case-router-stale" : null,
+      !turnstileConfigurationValid ? "turnstile-misconfigured" : null,
+      !env.TURNSTILE_SECRET ? "turnstile-disabled" : null
+    ].filter((issue): issue is string => issue !== null);
+    const status = issues.length ? "degraded" : "ok";
     return json({
-      status: "ok",
+      status,
+      issues,
       cloudRag: { ...counts, source: "legacy-d1" },
-      fullTextCoverage: fullTextCoverageSummary(ingestionShards, publicPdfRecords),
+      fullTextCoverage: fullTextCoverageSummary(
+        ingestionShards,
+        publicPdfRecords,
+        metadataStateAvailable && ingestionStateAvailable
+      ),
       shards: shardCounts,
       metadataCoverage,
       ingestionShards,
-      caseRouter
-    });
+      caseRouter,
+      security: {
+        rateLimiting: "enabled",
+        turnstile: env.TURNSTILE_SECRET ? "enabled" : "disabled"
+      }
+    }, status === "ok" ? 200 : 503);
   }
 
   if (url.pathname === "/api/news" && request.method === "GET") {
@@ -1150,17 +1359,54 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   if (url.pathname === "/api/chat" && request.method === "POST") {
     const requestId = crypto.randomUUID();
     const requestStartedAt = performance.now();
-    const body = await request.json<{ history?: ChatMessage[]; message?: string }>().catch(() => null);
-    const message = body?.message?.trim();
-    if (!message) return json({ error: "Missing message body" }, 400);
+    if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) {
+      return json({ error: "Content-Type must be application/json" }, 415);
+    }
+    let rawBody: unknown;
     try {
+      rawBody = await readLimitedJson(request);
+    } catch (error) {
+      if (error instanceof Error && error.message === "request-too-large") {
+        return json({ error: "Request body is too large" }, 413);
+      }
+      throw error;
+    }
+    const body = parseChatRequestBody(rawBody);
+    if (!body) {
+      return json({
+        error: `Message is required and must be at most ${MAX_MESSAGE_LENGTH} characters; history must contain at most ${MAX_HISTORY_MESSAGES} valid messages.`
+      }, 400);
+    }
+    const [actorLimit, globalLimit] = await Promise.all([
+      env.CHAT_RATE_LIMITER.limit({ key: rateLimitActor(request, body.clientId) }),
+      env.CHAT_GLOBAL_RATE_LIMITER.limit({ key: "chat" })
+    ]);
+    if (!actorLimit.success || !globalLimit.success) {
+      return json({
+        error: "Rate limit exceeded",
+        userMessage: "The assistant is receiving too many requests. Please wait one minute and try again."
+      }, 429, { "Retry-After": "60" });
+    }
+    if (!(await verifyTurnstile(request, env, body.turnstileToken, requestId))) {
+      return json({
+        error: "Turnstile verification failed",
+        userMessage: "Security verification expired or failed. Please retry the challenge and submit again."
+      }, 403);
+    }
+    const message = body.message;
+    try {
+      if (isCredentialOrPromptExtractionRequest(message)) {
+        return json({
+          reply: "I can’t reveal private instructions, credentials, or secrets. I can help research DC PSC dockets and public filings instead."
+        });
+      }
       const directCaseReply = await buildDetailedCaseNumberReply(message);
       if (directCaseReply) {
         logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "direct-case" });
         return json({ reply: directCaseReply, requestId });
       }
       const rows = await searchDockets(env, message, requestId);
-      const reply = await answerWithOpenAi(env, body?.history ?? [], message, rows, requestId);
+      const reply = await answerWithOpenAi(env, body.history, message, rows, requestId);
       logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "success", rows: rows.length });
       return json({ reply, requestId });
     } catch (error) {

@@ -1,8 +1,7 @@
-# Copy to .dev.vars for `npm run cloudflare:dev`. Never commit .dev.vars.
-OPENAI_API_KEY="your_openai_api_key"
-
-# Optional AI Gateway routing. If CLOUDFLARE_ACCOUNT_ID is absent, the Worker
-# calls https://api.openai.com/v1/responses directly.
-CLOUDFLARE_ACCOUNT_ID=""
-AI_GATEWAY_ID="default"
+# Copy this file to .dev.vars for `npm run cloudflare:dev`.
+# Never commit real secret values.
+OPENAI_API_KEY=""
 CF_AIG_TOKEN=""
+TURNSTILE_SECRET=""
+TURNSTILE_SITE_KEY=""
+TURNSTILE_EXPECTED_HOSTNAME="localhost"

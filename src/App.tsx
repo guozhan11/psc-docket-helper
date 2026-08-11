@@ -16,13 +16,17 @@ import {
   MapPin,
   RotateCcw,
   Trash2,
-  Plus
+  Plus,
+  ShieldCheck,
+  AlertTriangle,
+  MessageCircle
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
-import { AssistantRequestError, getLatestPSCUpdates, chatWithDocketAssistant } from './services/geminiService';
-import { Message, NewsUpdate, ChatSession } from './types';
+import { AssistantRequestError, getHealthSummary, getLatestPSCUpdates, getPublicAppConfig, chatWithDocketAssistant } from './services/geminiService';
+import { Message, NewsUpdate, ChatSession, HealthSummary, PublicAppConfig } from './types';
 import VerifiedLink, { normalizeUrl } from './components/VerifiedLink';
+import TurnstileWidget from './components/TurnstileWidget';
 
 const EXAMPLE_QUESTIONS = [
   "In FC1176, what drove Pepco's 2025 O&M expense variance?",
@@ -32,6 +36,10 @@ const EXAMPLE_QUESTIONS = [
 export default function App() {
   const [news, setNews] = useState<NewsUpdate[]>([]);
   const [loadingNews, setLoadingNews] = useState(true);
+  const [appConfig, setAppConfig] = useState<PublicAppConfig | null>(null);
+  const [health, setHealth] = useState<HealthSummary | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [turnstileResetSignal, setTurnstileResetSignal] = useState(0);
   
   const [sessions, setSessions] = useState<ChatSession[]>(() => {
     try {
@@ -76,6 +84,18 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [failedRequest, setFailedRequest] = useState<{ sessionId: string; message: string } | null>(null);
+  const [clientId] = useState(() => {
+    const storageKey = 'dc_psc_anonymous_client_id';
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (saved) return saved;
+      const created = crypto.randomUUID();
+      localStorage.setItem(storageKey, created);
+      return created;
+    } catch {
+      return crypto.randomUUID();
+    }
+  });
 
   useEffect(() => {
     if (sessions.length > 0) {
@@ -232,12 +252,18 @@ export default function App() {
   }, [input]);
   
   useEffect(() => {
-    async function fetchNews() {
-      const updates = await getLatestPSCUpdates();
+    async function loadPublicData() {
+      const [updates, config, healthSummary] = await Promise.all([
+        getLatestPSCUpdates(),
+        getPublicAppConfig().catch(() => null),
+        getHealthSummary()
+      ]);
       setNews(updates);
+      setAppConfig(config);
+      setHealth(healthSummary);
       setLoadingNews(false);
     }
-    fetchNews();
+    void loadPublicData();
   }, []);
 
   const runAssistantRequest = async (targetSessionId: string, userMessage: string, appendUserMessage: boolean) => {
@@ -252,10 +278,15 @@ export default function App() {
         : activeSess.messages.at(-1)?.role === 'model'
           ? activeSess.messages.slice(0, -1)
           : activeSess.messages;
-      const currentHistory: Message[] = appendUserMessage
-        ? [...history, { role: 'user', content: userMessage }]
-        : history;
-      const response = await chatWithDocketAssistant(currentHistory, userMessage);
+      // `message` is sent separately; including it in history duplicated the
+      // current question in the model transcript.
+      const currentHistory: Message[] = history.slice(-10);
+      const response = await chatWithDocketAssistant(
+        currentHistory,
+        userMessage,
+        clientId,
+        turnstileToken
+      );
       updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: response || "I'm sorry, I couldn't process that request." }]);
     } catch (error) {
       console.error("Chat error:", error);
@@ -266,12 +297,15 @@ export default function App() {
       setFailedRequest({ sessionId: targetSessionId, message: userMessage });
     } finally {
       setIsTyping(false);
+      if (appConfig?.turnstileRequired) {
+        setTurnstileResetSignal(value => value + 1);
+      }
     }
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isTyping) return;
+    if (!appConfig || !input.trim() || isTyping || (appConfig.turnstileRequired && !turnstileToken)) return;
     const userMessage = input.trim();
     setInput('');
     const targetSessionId = activeSessionId;
@@ -282,6 +316,7 @@ export default function App() {
 
   const handleRetryRequest = async () => {
     if (!failedRequest || isTyping) return;
+    if (appConfig?.turnstileRequired && !turnstileToken) return;
     await runAssistantRequest(failedRequest.sessionId, failedRequest.message, false);
   };
 
@@ -296,7 +331,10 @@ export default function App() {
                 <Scale className="w-8 h-8 text-psc-blue" />
               </div>
               <div>
-                <h1 className="text-xl font-display font-bold leading-tight uppercase">AI PROTOTYPE</h1>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-xl font-display font-bold leading-tight uppercase">AI Docket Assistant</h1>
+                  <span className="rounded-full border border-psc-gold/50 bg-psc-gold/20 px-2 py-0.5 text-[10px] font-bold tracking-widest text-psc-gold">BETA</span>
+                </div>
                 <p className="text-xs text-psc-gold font-medium uppercase tracking-widest">Public Service Commission</p>
               </div>
             </div>
@@ -306,6 +344,7 @@ export default function App() {
               <a href="#" className="hover:text-psc-gold transition-colors">Home</a>
               <a href="#updates" className="hover:text-psc-gold transition-colors">News & Updates</a>
               <a href="#assistant" className="hover:text-psc-gold transition-colors">Docket Assistant</a>
+              <a href="#privacy" className="hover:text-psc-gold transition-colors">Privacy</a>
               <a href="https://dcpsc.org" target="_blank" rel="noopener noreferrer" className="bg-psc-gold hover:bg-psc-gold/90 text-psc-blue px-5 py-2 rounded-full font-bold transition-all shadow-md">
                 Visit Official Site
               </a>
@@ -334,6 +373,7 @@ export default function App() {
                 <a href="#" className="text-lg font-medium">Home</a>
                 <a href="#updates" className="text-lg font-medium">News & Updates</a>
                 <a href="#assistant" className="text-lg font-medium">Docket Assistant</a>
+                <a href="#privacy" className="text-lg font-medium">Privacy</a>
                 <a href="https://dcpsc.org" target="_blank" rel="noopener noreferrer" className="bg-psc-gold text-psc-blue w-full py-3 rounded-xl font-bold text-center">
                   Visit Official Site
                 </a>
@@ -546,7 +586,7 @@ export default function App() {
                     
                     {/* Sidebar Footer */}
                     <div className="p-4 border-t border-slate-800 bg-slate-950/40 text-[10px] text-slate-500 tracking-wider flex items-center justify-between">
-                      <span>SECURE LOCAL MEMORY</span>
+                      <span>CHATS SAVED ON THIS DEVICE</span>
                       <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
                     </div>
                   </div>
@@ -576,10 +616,21 @@ export default function App() {
                           <Scale className="w-5 h-5" />
                         </div>
                         <div>
-                          <h3 className="font-bold text-psc-blue text-sm md:text-base">PSC Assistant</h3>
+                          <div className="flex items-center gap-2">
+                            <h3 className="font-bold text-psc-blue text-sm md:text-base">PSC Assistant</h3>
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[9px] font-bold tracking-widest text-amber-800">BETA</span>
+                          </div>
                           <div className="flex items-center gap-1.5">
-                            <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                            <span className="text-[10px] uppercase font-bold tracking-widest text-slate-400">Online & Ready</span>
+                            <div className={cn(
+                              "w-2 h-2 rounded-full",
+                              health?.status === 'ok' ? "bg-green-500" : "bg-amber-500"
+                            )}></div>
+                            <span className="text-[10px] uppercase font-bold tracking-widest text-slate-400">
+                              {health?.status === 'ok' ? 'Corpus current' : health ? 'Limited status' : 'Checking status'}
+                              {health?.fullTextCoverage?.searchablePercent != null
+                                ? ` · ${health.fullTextCoverage.searchablePercent}% searchable`
+                                : ''}
+                            </span>
                           </div>
                         </div>
                       </div>
@@ -664,6 +715,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={handleRetryRequest}
+                            disabled={Boolean(appConfig?.turnstileRequired && !turnstileToken)}
                             className="inline-flex items-center gap-2 rounded-xl border border-psc-blue/20 bg-white px-4 py-2 text-sm font-semibold text-psc-blue shadow-sm transition-colors hover:bg-psc-blue/5"
                           >
                             <RotateCcw className="h-4 w-4" />
@@ -689,16 +741,43 @@ export default function App() {
                           }}
                           placeholder="Ask about a docket number or utility case..."
                           aria-label="Message PSC Assistant"
+                          maxLength={appConfig?.maxMessageLength ?? 5000}
                           className="block w-full min-h-[76px] max-h-40 resize-none bg-white border border-slate-200 rounded-2xl py-4 pl-5 pr-20 leading-6 focus:outline-none focus:ring-2 focus:ring-psc-blue/20 focus:border-psc-blue transition-[border-color,box-shadow] shadow-inner"
                         />
                         <button
                           type="submit"
-                          disabled={!input.trim() || isTyping}
+                          disabled={!appConfig || !input.trim() || isTyping || Boolean(appConfig.turnstileRequired && !turnstileToken)}
                           aria-label="Send message"
                           className="absolute right-3 bottom-3 w-12 h-12 bg-psc-blue text-white rounded-xl hover:bg-psc-blue/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center cursor-pointer"
                         >
                           <Send className="w-5 h-5" />
                         </button>
+                      </div>
+                      {appConfig?.turnstileRequired && appConfig.turnstileSiteKey ? (
+                        <div className="mt-2">
+                          <TurnstileWidget
+                            siteKey={appConfig.turnstileSiteKey}
+                            resetSignal={turnstileResetSignal}
+                            onToken={setTurnstileToken}
+                          />
+                        </div>
+                      ) : appConfig?.turnstileRequired ? (
+                        <div className="mt-3 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                          <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                          Security verification is temporarily unavailable. Chat submissions are paused.
+                        </div>
+                      ) : null}
+                      <div className="mt-3 flex flex-col gap-2 text-[11px] leading-relaxed text-slate-500 sm:flex-row sm:items-center sm:justify-between">
+                        <p>
+                          Beta research tool. Verify answers against linked filings. Do not submit confidential, privileged, or personal information.
+                        </p>
+                        <a
+                          href="mailto:gz163@georgetown.edu?subject=PSC%20Docket%20Helper%20feedback"
+                          className="inline-flex flex-shrink-0 items-center gap-1.5 font-semibold text-psc-blue hover:underline"
+                        >
+                          <MessageCircle className="h-3.5 w-3.5" />
+                          Report an issue
+                        </a>
                       </div>
                       <div className="mt-4 flex flex-wrap gap-2">
                         {EXAMPLE_QUESTIONS.map((question) => (
@@ -714,6 +793,40 @@ export default function App() {
                       </div>
                     </form>
                   </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="privacy" className="border-t border-slate-200 bg-white py-16">
+          <div className="mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
+            <div className="rounded-3xl border border-slate-200 bg-slate-50 p-8 shadow-sm">
+              <div className="mb-5 flex items-center gap-3">
+                <div className="rounded-xl bg-psc-blue p-2.5 text-white">
+                  <ShieldCheck className="h-5 w-5" />
+                </div>
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-widest text-psc-gold">Privacy & responsible use</p>
+                  <h2 className="text-2xl text-psc-blue">What happens to your questions</h2>
+                </div>
+              </div>
+              <div className="grid gap-5 text-sm leading-relaxed text-slate-600 md:grid-cols-2">
+                <div>
+                  <h3 className="mb-2 text-base text-slate-900">Stored on this device</h3>
+                  <p>Conversation history is saved in this browser's local storage so it can reappear on your next visit. Clearing browser storage removes it. Changing domains does not transfer that history automatically.</p>
+                </div>
+                <div>
+                  <h3 className="mb-2 text-base text-slate-900">Sent for answer generation</h3>
+                  <p>Your question, up to ten recent chat messages, and relevant public filing excerpts may be sent to OpenAI through Cloudflare AI Gateway to generate an answer.</p>
+                </div>
+                <div>
+                  <h3 className="mb-2 text-base text-slate-900">Information you should not submit</h3>
+                  <p>Do not enter confidential, privileged, personal, proprietary, or non-public regulatory information. This service is intended only for research involving public records.</p>
+                </div>
+                <div>
+                  <h3 className="mb-2 text-base text-slate-900">No official or legal reliance</h3>
+                  <p>This independent beta is not affiliated with DC PSC and does not provide legal advice. AI summaries and cross-case results may be incomplete; verify important claims in the linked official filing.</p>
                 </div>
               </div>
             </div>
@@ -756,6 +869,8 @@ export default function App() {
               <ul className="space-y-4 text-slate-400 text-sm">
                 <li><a href="https://dcpsc.org/About-PSC.aspx" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">About the Commission</a></li>
                 <li><a href="https://edocket.dcpsc.org/" target="_blank" rel="noopener noreferrer" className="hover:text-white transition-colors">e-Docket System</a></li>
+                <li><a href="#privacy" className="hover:text-white transition-colors">Privacy & Responsible Use</a></li>
+                <li><a href="mailto:gz163@georgetown.edu?subject=PSC%20Docket%20Helper%20feedback" className="hover:text-white transition-colors">Report an Issue</a></li>
               </ul>
             </div>
 

@@ -1,6 +1,6 @@
 # PSC Docket Helper
 
-An experimental AI assistant for exploring District of Columbia Public Service Commission dockets, regulatory filings, and public records.
+An independent beta AI assistant for exploring District of Columbia Public Service Commission dockets, regulatory filings, and public records.
 
 ## Try the Website
 
@@ -16,6 +16,8 @@ No installation is required.
 - Answers filing-content questions with document names, PDF page numbers, and official links.
 - Retrieves current notices and regulatory news from the official DCPSC website.
 - Keeps separate chat sessions in the user's browser.
+- Publishes corpus freshness and coverage through a fail-closed health endpoint.
+- Protects the production chat API with request limits, Cloudflare rate limiting, and Turnstile.
 
 ## Questions That Work Well
 
@@ -24,6 +26,8 @@ No installation is required.
 - `Which DC PSC cases discuss bad debt or uncollectible accounts?`
 
 Questions with a case number search that case directly. Questions without a case number first use the global case router to shortlist relevant proceedings before verifying exact terms against filing text.
+
+Cross-case results are relevance-ranked shortlists, not a guarantee that every potentially relevant proceeding is listed.
 
 ## How It Works
 
@@ -47,6 +51,7 @@ Open [http://localhost:3000](http://localhost:3000).
 
 - [Architecture and RAG design](docs/ARCHITECTURE.md)
 - [Deployment, ingestion, and operations](docs/OPERATIONS.md)
+- [Industry beta release checklist](docs/RELEASE_CHECKLIST.md)
 
 The main stack is React, TypeScript, Vite, Cloudflare Workers, D1, R2, and the OpenAI Responses API. An Express server remains available for local development and as a Render-compatible fallback.
 
@@ -55,3 +60,5 @@ The main stack is React, TypeScript, Vite, Cloudflare Workers, D1, R2, and the O
 News is retrieved from [DCPSC Current PSC News](https://dcpsc.org/Newsroom/Current-PSC-News.aspx). Filing metadata and documents come from the public [DC PSC e-Docket](https://edocket.dcpsc.org/public/search).
 
 This project is not affiliated with or endorsed by the Public Service Commission of the District of Columbia. It is an experimental research tool, not legal advice or an official agency record. Verify important information against the original filing or the [official DCPSC website](https://dcpsc.org/).
+
+Conversation history is stored in the user's browser. A question, up to ten recent messages, and relevant public filing excerpts may be sent to OpenAI through Cloudflare AI Gateway to generate an answer. Do not submit confidential, privileged, proprietary, personal, or other non-public information.

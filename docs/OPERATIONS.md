@@ -6,6 +6,9 @@
 npm run lint
 npm run build
 npx wrangler deploy --dry-run
+npm test
+npm run eval:validate
+npm run security:audit
 ```
 
 ## First Cloudflare Deployment
@@ -18,6 +21,31 @@ npm run cloudflare:deploy
 npm run cloudflare:db:remote
 npx wrangler secret put OPENAI_API_KEY
 ```
+
+Do not share a production URL until every gate in [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) passes.
+
+## Turnstile and Chat Protection
+
+Production chat requests use two Workers Rate Limiting bindings: 30 requests per anonymous browser per minute and an additional 300-request-per-minute regional safety ceiling. The frontend stores a random anonymous client identifier in browser local storage; no account or user profile is created.
+
+Create a managed Turnstile widget for `localhost`, `127.0.0.1`, and the canonical production hostname. Put the non-secret site key in `wrangler.jsonc`:
+
+```jsonc
+"vars": {
+  "TURNSTILE_SITE_KEY": "<site-key>",
+  "TURNSTILE_EXPECTED_HOSTNAME": "<canonical-hostname>"
+}
+```
+
+Store the secret only through Wrangler:
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET
+```
+
+The browser sends a single-use token with each chat request. The Worker calls Cloudflare Siteverify, requires `success: true`, verifies the `turnstile-spin-v2` action, and optionally verifies the expected hostname. `/api/health` reports `degraded` until both the site key and secret are configured.
+
+AI Gateway spend limits and alerts are account-level controls and must be confirmed in the Cloudflare dashboard before release; they cannot be guaranteed by repository configuration alone.
 
 The committed `wrangler.jsonc` binds the production R2 bucket and three D1 shards. Apply migrations to every shard before the first ingestion run. For authenticated AI Gateway requests, configure `CLOUDFLARE_ACCOUNT_ID`, `AI_GATEWAY_ID`, and `CF_AIG_TOKEN` as needed.
 
@@ -60,6 +88,10 @@ npm run rag:ingest-shard-0-cloud
 ```
 
 The four shard states collectively stop before 8 GiB of tracked R2 storage or 700,000 tracked R2 writes in one calendar month. These are project safeguards rather than billing guarantees. Monitor the Cloudflare dashboard as the corpus grows.
+
+The public health endpoint returns HTTP 503 with `status: "degraded"` when a metadata or ingestion shard is unavailable, when metadata or the case router is more than 36 hours old, when the router is unavailable, or when Turnstile is disabled/misconfigured. It does not calculate a coverage percentage from partial shard state.
+
+GitHub Actions runs application validation on every pull request and push to `main`. Ingestion remains a separate scheduled workflow so a DC PSC upstream outage cannot block ordinary code validation.
 
 When `OPENAI_API_KEY` is absent, the Worker returns verified excerpts, page numbers, and official PDF links without model synthesis. When OpenAI is enabled, pair it with an AI Gateway spend limit.
 
