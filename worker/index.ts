@@ -317,6 +317,75 @@ async function readR2Json(object: R2ObjectBody | null, key: string): Promise<unk
   }
 }
 
+const R2_HEALTH_READ_ATTEMPTS = 3;
+const R2_HEALTH_RETRY_DELAY_MS = 25;
+const HEALTH_LAST_KNOWN_GOOD_TTL_SECONDS = 300;
+
+export async function readR2JsonWithRetry(
+  bucket: Pick<R2Bucket, "get">,
+  key: string,
+  attempts = R2_HEALTH_READ_ATTEMPTS
+): Promise<unknown> {
+  const boundedAttempts = Math.max(1, attempts);
+  for (let attempt = 1; attempt <= boundedAttempts; attempt += 1) {
+    try {
+      const payload = await readR2Json(await bucket.get(key), key);
+      if (payload !== null) return payload;
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "R2 health read failed",
+        key,
+        attempt,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+    if (attempt < boundedAttempts) {
+      await new Promise(resolve => setTimeout(resolve, R2_HEALTH_RETRY_DELAY_MS * attempt));
+    }
+  }
+  return null;
+}
+
+function healthCacheRequest(request: Request): Request {
+  const cacheUrl = new URL(request.url);
+  cacheUrl.search = "?snapshot=last-known-good";
+  return new Request(cacheUrl.toString(), { method: "GET" });
+}
+
+async function cacheHealthySnapshot(request: Request, payload: Record<string, unknown>): Promise<void> {
+  try {
+    await caches.default.put(healthCacheRequest(request), new Response(JSON.stringify({
+      ...payload,
+      cachedAt: new Date().toISOString()
+    }), {
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": `public, max-age=${HEALTH_LAST_KNOWN_GOOD_TTL_SECONDS}`
+      }
+    }));
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Unable to cache healthy snapshot",
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+}
+
+async function lastKnownGoodHealth(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await caches.default.match(healthCacheRequest(request));
+    if (!response) return null;
+    const payload: unknown = await response.json();
+    return isRecord(payload) ? payload : null;
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "Unable to read cached healthy snapshot",
+      error: error instanceof Error ? error.message : String(error)
+    }));
+    return null;
+  }
+}
+
 export function fullTextCoverageSummary(
   ingestionShards: Array<Record<string, unknown> | null>,
   publicPdfRecords: number,
@@ -1169,7 +1238,7 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
   }
 }
 
-async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
+async function handleApi(request: Request, env: WorkerEnv, context: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
   if (url.pathname === "/api/config" && request.method === "GET") {
@@ -1183,11 +1252,10 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
   if (url.pathname === "/api/health" && request.method === "GET") {
     const [
       shardCounts,
-      legacyMetadataObject,
-      metadataObjects,
-      ingestionV3Objects,
-      ingestionV2Objects,
-      caseRouterObject
+      legacyMetadataPayload,
+      metadataCoveragePayloads,
+      ingestionShards,
+      caseRouterPayload
     ] = await Promise.all([
       Promise.all(searchDatabases(env).map(database => database.prepare(
       `SELECT COUNT(*) AS documents,
@@ -1195,32 +1263,35 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
               (SELECT COUNT(DISTINCT case_number) FROM document_cases) AS cases
          FROM documents`
       ).first<{ documents: number; compactDocuments: number; cases: number }>().catch(() => null))),
-      env.DOCUMENTS.get("ingestion/metadata-coverage-v2.json"),
+      readR2JsonWithRetry(env.DOCUMENTS, "ingestion/metadata-coverage-v2.json"),
       Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
-        env.DOCUMENTS.get(`ingestion/metadata-coverage-v3-${shardIndex}-of-4.json`)
+        readR2JsonWithRetry(
+          env.DOCUMENTS,
+          `ingestion/metadata-coverage-v3-${shardIndex}-of-4.json`
+        )
       )),
       Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
-        env.DOCUMENTS.get(`ingestion/fast-r2-state-v3-${shardIndex}-of-4.json`)
+        readR2JsonWithRetry(
+          env.DOCUMENTS,
+          `ingestion/fast-r2-state-v3-${shardIndex}-of-4.json`
+        ).then(async payload => {
+          if (isRecord(payload)) return payload;
+          const fallback = await readR2JsonWithRetry(
+            env.DOCUMENTS,
+            `ingestion/fast-r2-state-v2-${shardIndex}-of-4.json`
+          );
+          return isRecord(fallback) ? fallback : null;
+        })
       )),
-      Promise.all(Array.from({ length: 4 }, (_, shardIndex) =>
-        env.DOCUMENTS.get(`ingestion/fast-r2-state-v2-${shardIndex}-of-4.json`)
-      )),
-      env.DOCUMENTS.get(CASE_ROUTER_INDEX_KEY)
+      readR2JsonWithRetry(env.DOCUMENTS, CASE_ROUTER_INDEX_KEY)
     ]);
     const counts = shardCounts.reduce((total, shard) => ({
       documents: total.documents + (shard?.documents ?? 0),
       compactDocuments: total.compactDocuments + (shard?.compactDocuments ?? 0),
       cases: total.cases + (shard?.cases ?? 0)
     }), { documents: 0, compactDocuments: 0, cases: 0 });
-    const metadataCoveragePayloads = await Promise.all(metadataObjects.map((object, shardIndex) =>
-      readR2Json(object, `ingestion/metadata-coverage-v3-${shardIndex}-of-4.json`)
-    ));
     const metadataCoverageShards = metadataCoveragePayloads.map(payload =>
       isRecord(payload) ? payload : null
-    );
-    const legacyMetadataPayload = await readR2Json(
-      legacyMetadataObject,
-      "ingestion/metadata-coverage-v2.json"
     );
     const legacyMetadataCoverage = isRecord(legacyMetadataPayload)
       ? legacyMetadataPayload
@@ -1256,21 +1327,9 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
           shards: metadataCoverageShards
         }
       : legacyMetadataCoverage;
-    const ingestionShards = await Promise.all(ingestionV3Objects.map(
-      async (object, shardIndex) => {
-        const selected = object ?? ingestionV2Objects[shardIndex];
-        const version = object ? 3 : 2;
-        const payload = await readR2Json(
-          selected,
-          `ingestion/fast-r2-state-v${version}-${shardIndex}-of-4.json`
-        );
-        return isRecord(payload) ? payload : null;
-      }
-    ));
     const publicPdfRecords = metadataCoverage && "publicPdfRecords" in metadataCoverage
       ? numericStateValue(metadataCoverage.publicPdfRecords)
       : 0;
-    const caseRouterPayload = await readR2Json(caseRouterObject, CASE_ROUTER_INDEX_KEY);
     const caseRouter = isCaseRouterIndex(caseRouterPayload)
       ? {
           status: "ready",
@@ -1305,7 +1364,7 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
       !env.TURNSTILE_SECRET ? "turnstile-disabled" : null
     ].filter((issue): issue is string => issue !== null);
     const status = issues.length ? "degraded" : "ok";
-    return json({
+    const healthPayload = {
       status,
       issues,
       cloudRag: { ...counts, source: "legacy-d1" },
@@ -1322,7 +1381,23 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
         rateLimiting: "enabled",
         turnstile: env.TURNSTILE_SECRET ? "enabled" : "disabled"
       }
-    }, status === "ok" ? 200 : 503);
+    };
+    if (status === "ok") {
+      context.waitUntil(cacheHealthySnapshot(request, healthPayload));
+      return json(healthPayload);
+    }
+    const cachedHealth = await lastKnownGoodHealth(request);
+    if (cachedHealth) {
+      return json({
+        ...cachedHealth,
+        healthSource: "last-known-good",
+        liveIssues: issues
+      }, 200, {
+        "X-Health-Source": "last-known-good",
+        "X-Health-Live-Issues": issues.join(",")
+      });
+    }
+    return json(healthPayload, 503);
   }
 
   if (url.pathname === "/api/news" && request.method === "GET") {
@@ -1427,9 +1502,9 @@ async function handleApi(request: Request, env: WorkerEnv): Promise<Response> {
 }
 
 export default {
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+  async fetch(request: Request, env: WorkerEnv, context: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) return handleApi(request, env);
+    if (url.pathname.startsWith("/api/")) return handleApi(request, env, context);
     return env.ASSETS.fetch(request);
   }
 } satisfies ExportedHandler<WorkerEnv>;
