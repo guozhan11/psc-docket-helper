@@ -19,7 +19,8 @@ import {
   Plus,
   ShieldCheck,
   AlertTriangle,
-  MessageCircle
+  MessageCircle,
+  Database
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
@@ -491,30 +492,30 @@ export default function App() {
                 <div className="sticky top-28">
                   <div className="bg-psc-blue text-white p-8 rounded-3xl shadow-2xl mb-8">
                     <div className="bg-psc-gold/20 p-3 rounded-2xl w-fit mb-6">
-                      <MessageSquare className="w-8 h-8 text-psc-gold" />
+                      <Database className="w-8 h-8 text-psc-gold" />
                     </div>
-                    <h2 className="text-3xl mb-4">Docket Assistant</h2>
+                    <h2 className="text-3xl mb-4">RAG Document Collection</h2>
                     <p className="text-slate-300 mb-8 leading-relaxed">
-                      This is a non-official experimental AI-powered assistant designed to help you search through thousands of historical dockets, find specific case numbers, and summarize complex regulatory filings.
+                      Answers are generated from relevant excerpts retrieved at question time from public records published in the official DC PSC e-Docket.
                     </p>
                     <div className="space-y-4">
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">Search by docket number (e.g., FC 1167)</p>
+                        <p className="text-sm text-slate-200">More than 153,000 eligible public PDF filings are indexed as searchable page-level text.</p>
                       </div>
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">Ask about recent utility rate cases</p>
+                        <p className="text-sm text-slate-200">Filing metadata includes case and docket numbers, titles, dates, filers, and official source links.</p>
                       </div>
                       <div className="flex items-start gap-3">
                         <div className="mt-1 bg-psc-gold/20 p-1 rounded-full">
                           <ChevronRight className="w-4 h-4 text-psc-gold" />
                         </div>
-                        <p className="text-sm text-slate-200">Find information on renewable energy goals</p>
+                        <p className="text-sm text-slate-200">Confidential, archived, and non-PDF attachments are excluded from full-text retrieval.</p>
                       </div>
                     </div>
                   </div>
