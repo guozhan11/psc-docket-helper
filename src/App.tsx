@@ -20,11 +20,12 @@ import {
   ShieldCheck,
   AlertTriangle,
   MessageCircle,
-  Database
+  Database,
+  Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
-import { AssistantRequestError, getHealthSummary, getLatestPSCUpdates, getPublicAppConfig, chatWithDocketAssistant } from './services/geminiService';
+import { AssistantRequestCancelledError, AssistantRequestError, getHealthSummary, getLatestPSCUpdates, getPublicAppConfig, chatWithDocketAssistant } from './services/geminiService';
 import { Message, NewsUpdate, ChatSession, HealthSummary, PublicAppConfig } from './types';
 import VerifiedLink, { normalizeUrl } from './components/VerifiedLink';
 import TurnstileWidget from './components/TurnstileWidget';
@@ -221,6 +222,9 @@ export default function App() {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const shouldAutoScrollRef = useRef(true);
+  const activeRequestControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => activeRequestControllerRef.current?.abort(), []);
 
   const handleMessagesScroll = () => {
     const container = messagesContainerRef.current;
@@ -271,6 +275,8 @@ export default function App() {
     shouldAutoScrollRef.current = true;
     setFailedRequest(null);
     setIsTyping(true);
+    const requestController = new AbortController();
+    activeRequestControllerRef.current = requestController;
 
     try {
       const activeSess = sessions.find(s => s.id === targetSessionId) || sessions[0];
@@ -286,10 +292,12 @@ export default function App() {
         currentHistory,
         userMessage,
         clientId,
-        turnstileToken
+        turnstileToken,
+        requestController.signal
       );
       updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: response || "I'm sorry, I couldn't process that request." }]);
     } catch (error) {
+      if (error instanceof AssistantRequestCancelledError) return;
       console.error("Chat error:", error);
       const content = error instanceof AssistantRequestError
         ? error.userMessage
@@ -297,7 +305,10 @@ export default function App() {
       updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content }]);
       setFailedRequest({ sessionId: targetSessionId, message: userMessage });
     } finally {
-      setIsTyping(false);
+      if (activeRequestControllerRef.current === requestController) {
+        activeRequestControllerRef.current = null;
+        setIsTyping(false);
+      }
       if (appConfig?.turnstileRequired) {
         setTurnstileResetSignal(value => value + 1);
       }
@@ -319,6 +330,10 @@ export default function App() {
     if (!failedRequest || isTyping) return;
     if (appConfig?.turnstileRequired && !turnstileToken) return;
     await runAssistantRequest(failedRequest.sessionId, failedRequest.message, false);
+  };
+
+  const handleStopGenerating = () => {
+    activeRequestControllerRef.current?.abort();
   };
 
   return (
@@ -746,12 +761,21 @@ export default function App() {
                           className="block w-full min-h-[76px] max-h-40 resize-none bg-white border border-slate-200 rounded-2xl py-4 pl-5 pr-20 leading-6 focus:outline-none focus:ring-2 focus:ring-psc-blue/20 focus:border-psc-blue transition-[border-color,box-shadow] shadow-inner"
                         />
                         <button
-                          type="submit"
-                          disabled={!appConfig || !input.trim() || isTyping || Boolean(appConfig.turnstileRequired && !turnstileToken)}
-                          aria-label="Send message"
-                          className="absolute right-3 bottom-3 w-12 h-12 bg-psc-blue text-white rounded-xl hover:bg-psc-blue/90 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center cursor-pointer"
+                          type={isTyping ? "button" : "submit"}
+                          onClick={isTyping ? handleStopGenerating : undefined}
+                          disabled={isTyping ? false : !appConfig || !input.trim() || Boolean(appConfig.turnstileRequired && !turnstileToken)}
+                          aria-label={isTyping ? "Stop generating" : "Send message"}
+                          title={isTyping ? "Stop generating" : "Send message"}
+                          className={cn(
+                            "absolute right-3 bottom-3 w-12 h-12 text-white rounded-xl disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center cursor-pointer",
+                            isTyping
+                              ? "bg-slate-700 hover:bg-rose-600"
+                              : "bg-psc-blue hover:bg-psc-blue/90"
+                          )}
                         >
-                          <Send className="w-5 h-5" />
+                          {isTyping
+                            ? <Square className="w-4 h-4 fill-current" />
+                            : <Send className="w-5 h-5" />}
                         </button>
                       </div>
                       {appConfig?.turnstileRequired && appConfig.turnstileSiteKey ? (

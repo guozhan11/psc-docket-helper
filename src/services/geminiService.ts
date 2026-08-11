@@ -1,9 +1,19 @@
-import { HealthSummary, Message, NewsUpdate, PublicAppConfig } from "../types";
+import type { HealthSummary, Message, NewsUpdate, PublicAppConfig } from "../types";
 
 export class AssistantRequestError extends Error {
-  constructor(public readonly userMessage: string, message: string) {
+  public readonly userMessage: string;
+
+  constructor(userMessage: string, message: string) {
     super(message);
     this.name = "AssistantRequestError";
+    this.userMessage = userMessage;
+  }
+}
+
+export class AssistantRequestCancelledError extends Error {
+  constructor() {
+    super("Assistant request cancelled by the user");
+    this.name = "AssistantRequestCancelledError";
   }
 }
 
@@ -43,7 +53,8 @@ export async function chatWithDocketAssistant(
   history: Message[],
   message: string,
   clientId: string,
-  turnstileToken: string | null
+  turnstileToken: string | null,
+  signal?: AbortSignal
 ): Promise<string> {
   try {
     const response = await fetch("/api/chat", {
@@ -52,6 +63,7 @@ export async function chatWithDocketAssistant(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ history, message, clientId, turnstileToken }),
+      signal,
     });
 
     if (!response.ok) {
@@ -75,6 +87,9 @@ export async function chatWithDocketAssistant(
     }
     return data.reply;
   } catch (error) {
+    if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      throw new AssistantRequestCancelledError();
+    }
     console.error("Chat error:", error);
     if (error instanceof AssistantRequestError) throw error;
     throw new AssistantRequestError(

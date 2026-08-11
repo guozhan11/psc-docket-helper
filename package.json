@@ -22,7 +22,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit && tsc --noEmit --project worker/tsconfig.json",
-    "test:worker": "node --test worker/index.test.ts",
+    "test:worker": "node --test worker/index.test.ts src/services/geminiService.test.ts",
     "test:python": "python3 -m unittest discover -s scripts -p 'test_*.py' -v",
     "test": "npm run test:worker && npm run test:python",
     "eval:validate": "node scripts/validate-evaluation.ts",
