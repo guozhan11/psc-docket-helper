@@ -484,7 +484,7 @@ export default function App() {
 
       <main className="flex-grow">
         {/* Hero Section */}
-        <section className="relative bg-psc-blue py-20 overflow-hidden">
+        <section className="relative overflow-hidden bg-psc-blue py-12 sm:py-16 lg:py-20">
           <div className="absolute inset-0 opacity-10">
             <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-white via-transparent to-transparent"></div>
           </div>
@@ -495,21 +495,21 @@ export default function App() {
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.6 }}
               >
-                <span className="inline-block px-4 py-1 rounded-full bg-psc-gold/20 text-psc-gold text-sm font-bold mb-6 border border-psc-gold/30">
+                <span className="mb-4 inline-block rounded-full border border-psc-gold/30 bg-psc-gold/20 px-4 py-1 text-xs font-bold text-psc-gold sm:mb-6 sm:text-sm">
                   Non-Official AI Assistant
                 </span>
-                <h2 className="text-4xl md:text-6xl text-white mb-6 leading-tight">
+                <h2 className="mb-4 text-3xl leading-tight text-white sm:mb-6 sm:text-5xl md:text-6xl">
                   Navigate DC PSC Dockets with <span className="text-psc-gold italic">AI-Powered</span> Insights
                 </h2>
-                <p className="text-xl text-slate-300 mb-10 leading-relaxed">
+                <p className="mb-7 text-base leading-relaxed text-slate-300 sm:mb-10 sm:text-lg lg:text-xl">
                   This is a non-official experimental tool designed to help you easily search, summarize, and explore public utility records and regulatory filings using advanced AI-assisted navigation.
                 </p>
-                <div className="flex flex-wrap gap-4">
-                  <a href="#docket-chat" className="bg-white text-psc-blue px-8 py-4 rounded-xl font-bold hover:bg-slate-100 transition-all flex items-center gap-2 shadow-xl">
+                <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:gap-4">
+                  <a href="#docket-chat" className="flex items-center justify-center gap-2 rounded-xl bg-white px-6 py-3.5 font-bold text-psc-blue shadow-xl transition-all hover:bg-slate-100 sm:px-8 sm:py-4">
                     <MessageSquare className="w-5 h-5" />
                     Ask the Docket Assistant
                   </a>
-                  <a href="#updates" className="bg-transparent border-2 border-white/30 text-white px-8 py-4 rounded-xl font-bold hover:bg-white/10 transition-all flex items-center gap-2">
+                  <a href="#updates" className="flex items-center justify-center gap-2 rounded-xl border-2 border-white/30 bg-transparent px-6 py-3.5 font-bold text-white transition-all hover:bg-white/10 sm:px-8 sm:py-4">
                     <Newspaper className="w-5 h-5" />
                     View Latest Updates
                   </a>
@@ -572,17 +572,26 @@ export default function App() {
                 <div className="bg-white rounded-3xl shadow-xl border border-slate-200 flex h-[calc(100dvh-7rem)] min-h-[520px] max-h-[760px] overflow-hidden relative z-10">
                   {/* Left Chat History Pane */}
                   <div className={cn(
-                    "w-64 bg-slate-900 border-r border-slate-800 flex flex-col h-full flex-shrink-0 transition-transform duration-300 md:translate-x-0 absolute md:relative z-30 md:z-auto",
+                    "absolute z-30 flex h-full w-[calc(100%-2.5rem)] max-w-80 flex-shrink-0 flex-col border-r border-slate-800 bg-slate-900 transition-transform duration-300 md:relative md:z-auto md:w-64 md:translate-x-0",
                     sidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
                   )}>
                     {/* New Chat Button */}
-                    <div className="p-4 border-b border-slate-800">
+                    <div className="flex gap-2 border-b border-slate-800 p-4">
                       <button
                         onClick={handleNewChat}
-                        className="w-full flex items-center justify-center gap-2 bg-psc-gold hover:bg-psc-gold/90 text-psc-blue font-bold py-3 px-4 rounded-xl transition-all shadow-md text-sm cursor-pointer"
+                        className="flex flex-1 cursor-pointer items-center justify-center gap-2 rounded-xl bg-psc-gold px-4 py-3 text-sm font-bold text-psc-blue shadow-md transition-all hover:bg-psc-gold/90"
                       >
                         <Plus className="w-4 h-4" />
                         New Chat
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSidebarOpen(false)}
+                        className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl text-slate-400 transition-colors hover:bg-white/10 hover:text-white md:hidden"
+                        aria-label="Close conversation history"
+                        title="Close conversation history"
+                      >
+                        <X className="h-5 w-5" />
                       </button>
                     </div>
 
@@ -593,29 +602,34 @@ export default function App() {
                         return (
                           <div
                             key={session.id}
-                            onClick={() => {
-                              if (session.id !== activeSessionId) cancelActiveRequest();
-                              shouldAutoScrollRef.current = true;
-                              setActiveSessionId(session.id);
-                              setSidebarOpen(false);
-                            }}
                             className={cn(
-                              "group flex items-center justify-between px-3 py-3 rounded-xl cursor-pointer transition-all border text-left",
+                              "group flex items-center rounded-xl border transition-all",
                               isActive
                                 ? "bg-white/10 text-white border-white/10 font-medium"
                                 : "text-slate-400 hover:bg-white/5 hover:text-slate-200 border-transparent"
                             )}
                           >
-                            <div className="flex items-center gap-2.5 overflow-hidden w-full pr-1">
-                              <MessageSquare className={cn("w-4 h-4 flex-shrink-0", isActive ? "text-psc-gold" : "text-slate-500")} />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (session.id !== activeSessionId) cancelActiveRequest();
+                                shouldAutoScrollRef.current = true;
+                                setActiveSessionId(session.id);
+                                setSidebarOpen(false);
+                              }}
+                              className="flex min-w-0 flex-1 items-center gap-2.5 overflow-hidden px-3 py-3 text-left"
+                              aria-current={isActive ? "page" : undefined}
+                            >
+                              <MessageSquare className={cn("h-4 w-4 flex-shrink-0", isActive ? "text-psc-gold" : "text-slate-500")} />
                               <span className="truncate text-xs tracking-wide">{session.title}</span>
-                            </div>
+                            </button>
                             <button
                               onClick={(e) => handleDeleteChat(session.id, e)}
-                              className="text-slate-500 hover:text-rose-400 p-1 rounded-md opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0 cursor-pointer"
+                              className="mr-1 flex h-9 w-9 flex-shrink-0 cursor-pointer items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-rose-500/10 hover:text-rose-400 md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100"
+                              aria-label={`Delete conversation: ${session.title}`}
                               title="Delete conversation"
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
+                              <Trash2 className="h-4 w-4" />
                             </button>
                           </div>
                         );
@@ -640,7 +654,7 @@ export default function App() {
                   {/* Right Chat Pane */}
                   <div className="flex-grow flex flex-col h-full overflow-hidden bg-white">
                     {/* Chat Header */}
-                    <div className="p-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+                    <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/50 p-4 sm:p-6">
                       <div className="flex items-center gap-3">
                         {/* Mobile sidebar toggle */}
                         <button
@@ -702,7 +716,7 @@ export default function App() {
                       ref={messagesContainerRef}
                       data-testid="messages-container"
                       onScroll={handleMessagesScroll}
-                      className="flex-grow overflow-y-auto p-6 space-y-6 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] bg-fixed"
+                      className="flex-grow space-y-4 overflow-y-auto bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] bg-fixed p-3 sm:space-y-6 sm:p-6"
                     >
                       {messages.map((msg, idx) => (
                         <motion.div
@@ -710,13 +724,13 @@ export default function App() {
                           initial={{ opacity: 0, x: msg.role === 'user' ? 20 : -20 }}
                           animate={{ opacity: 1, x: 0 }}
                           className={cn(
-                            "flex max-w-[85%]",
+                            "flex max-w-[95%] sm:max-w-[85%]",
                             msg.role === 'user' ? "ml-auto flex-row-reverse" : "mr-auto"
                           )}
                         >
                           <div className={cn(
-                            "w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-xs font-bold",
-                            msg.role === 'user' ? "ml-3 bg-psc-gold text-psc-blue" : "mr-3 bg-psc-blue text-white"
+                            "flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full text-xs font-bold sm:h-8 sm:w-8",
+                            msg.role === 'user' ? "ml-2 bg-psc-gold text-psc-blue sm:ml-3" : "mr-2 bg-psc-blue text-white sm:mr-3"
                           )}>
                             {msg.role === 'user' ? 'U' : 'A'}
                           </div>
@@ -743,7 +757,7 @@ export default function App() {
                         </motion.div>
                       ))}
                       {!hasUserMessages && (
-                        <div className="ml-11 max-w-2xl rounded-2xl border border-psc-blue/10 bg-white/90 p-4 shadow-sm">
+                        <div className="ml-9 max-w-2xl rounded-2xl border border-psc-blue/10 bg-white/90 p-4 shadow-sm sm:ml-11">
                           <p className="mb-3 text-xs font-bold uppercase tracking-widest text-slate-400">Try an example</p>
                           <div className="grid gap-2">
                             {EXAMPLE_QUESTIONS.map(question => (
@@ -763,8 +777,8 @@ export default function App() {
                         </div>
                       )}
                       {isTyping && (
-                        <div className="flex mr-auto max-w-[85%]">
-                          <div className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center bg-psc-blue text-white mr-3">
+                        <div className="mr-auto flex max-w-[95%] sm:max-w-[85%]">
+                          <div className="mr-2 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-psc-blue text-white sm:mr-3 sm:h-8 sm:w-8">
                             A
                           </div>
                           <div className="bg-slate-100 p-4 rounded-2xl rounded-tl-none shadow-sm">
