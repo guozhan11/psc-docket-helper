@@ -160,6 +160,16 @@ const CASE_ROUTER_VERIFIED_CASES = 2;
 // router is intentionally split into 16 independent hash partitions; sample a
 // deterministic window instead of inflating and scanning all 12 MB per chat.
 const CASE_ROUTER_PART_READ_LIMIT = 1;
+// Bloom-filter hit counts alone favour long historical filings, because a
+// saturated filter matches more terms than a short current one. These weights
+// stay below a single extra term match so recency nudges comparable documents
+// without letting a recent weak match outrank a strong older one.
+const QUERY_YEAR_MATCH_WEIGHT = 0.9;
+const RECENCY_WEIGHT = 0.6;
+const RECENCY_SPAN_YEARS = 12;
+// Read enough distinct filings that a well-ranked but lower-placed document
+// still reaches the evidence set instead of being cut off by earlier hits.
+const COMPACT_DOCUMENT_GROUP_TARGET = 6;
 const API_HEADERS = {
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff"
@@ -447,6 +457,62 @@ export function selectDiverseGlobalResults<T extends GlobalResultIdentity>(
     }
   }
   return Array.from(selected.values()).slice(0, totalLimit);
+}
+
+// Round-robin across filings so breadth wins the first slots. Taking every
+// excerpt from the top document first lets one long filing consume the whole
+// evidence budget even when other filings answer the question better.
+export function selectDiverseDocumentResults<T extends GlobalResultIdentity>(
+  groups: T[][],
+  maxPerDocument = 2,
+  totalLimit = 8
+): T[] {
+  const selected = new Map<string, T>();
+  for (let depth = 0; depth < maxPerDocument; depth += 1) {
+    for (const group of groups) {
+      const row = group[depth];
+      if (!row) continue;
+      selected.set(`${row.filing_id}:${row.page_number}`, row);
+      if (selected.size >= totalLimit) return Array.from(selected.values());
+    }
+  }
+  return Array.from(selected.values());
+}
+
+export function extractQueryYears(message: string): number[] {
+  const currentYear = new Date().getUTCFullYear();
+  const years = Array.from(message.matchAll(/\b(19|20)\d{2}\b/g), match => Number(match[0]));
+  // A filing cannot document a year that has not happened yet, and stray
+  // four-digit numbers outside the docket era are not dates.
+  return Array.from(new Set(years.filter(year => year >= 1990 && year <= currentYear + 1)));
+}
+
+function documentYear(receivedDate: string | null): number | null {
+  if (!receivedDate) return null;
+  const year = Number(String(receivedDate).slice(0, 4));
+  return Number.isInteger(year) && year >= 1900 ? year : null;
+}
+
+// Blends term evidence with filing date. `filterHits` stays the dominant term
+// so a document matching more query terms still outranks a merely newer one.
+export function documentRankingScore(
+  filterHits: number,
+  receivedDate: string | null,
+  queryYears: number[],
+  now = Date.now()
+): number {
+  const year = documentYear(receivedDate);
+  if (year === null) return filterHits;
+  let score = filterHits;
+  if (queryYears.length) {
+    // A filing reporting on a year is normally submitted during it or shortly
+    // after, so accept the named year and the one following it.
+    const matchesQueryYear = queryYears.some(queryYear => year === queryYear || year === queryYear + 1);
+    if (matchesQueryYear) score += QUERY_YEAR_MATCH_WEIGHT;
+  }
+  const ageYears = new Date(now).getUTCFullYear() - year;
+  const freshness = Math.min(1, Math.max(0, 1 - ageYears / RECENCY_SPAN_YEARS));
+  return score + RECENCY_WEIGHT * freshness;
 }
 
 function isOfficialPscUrl(value: string): boolean {
@@ -928,7 +994,8 @@ async function searchCompactDocuments(
   terms: string[],
   requestId: string,
   maxDocumentReads = 20,
-  minimumTermMatches = 1
+  minimumTermMatches = 1,
+  queryYears: number[] = []
 ): Promise<SearchRow[]> {
   const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
   const addCandidate = (document: CompactDocumentRow) => {
@@ -974,11 +1041,17 @@ async function searchCompactDocuments(
     logChatStage(requestId, "d1-fallback", d1StartedAt, { caseNumber, queries: d1Queries });
   }
   const candidates = Array.from(candidateMap.values());
-  candidates.sort((left, right) => right.filterHits - left.filterHits
+  const scoreOf = new Map(candidates.map(document => [
+    document.filing_id,
+    documentRankingScore(document.filterHits, document.received_date, queryYears)
+  ]));
+  candidates.sort((left, right) => (scoreOf.get(right.filing_id) ?? 0) - (scoreOf.get(left.filing_id) ?? 0)
     || String(right.received_date || "").localeCompare(String(left.received_date || "")));
 
   const selected = candidates.slice(0, maxDocumentReads);
-  const rows: SearchRow[] = [];
+  // Keep each filing's excerpts together so the evidence budget can be shared
+  // across filings rather than filled by whichever document is read first.
+  const excerptGroups: SearchRow[][] = [];
   const documentStartedAt = performance.now();
   let documentsRead = 0;
   for (let start = 0; start < selected.length; start += 4) {
@@ -992,17 +1065,18 @@ async function searchCompactDocuments(
       const html = await new Response(stream).text();
       return findPageExcerpts(html, terms, document, minimumTermMatches);
     }));
-    rows.push(...batchRows.flat());
-    if (rows.length >= 8) break;
+    excerptGroups.push(...batchRows.filter(group => group.length));
+    if (excerptGroups.length >= COMPACT_DOCUMENT_GROUP_TARGET) break;
   }
+  const contentRows = selectDiverseDocumentResults(excerptGroups);
   logChatStage(requestId, "r2-documents", documentStartedAt, {
     caseNumber,
     candidates: candidates.length,
     selected: selected.length,
     documentsRead,
-    excerpts: rows.length
+    matchedDocuments: excerptGroups.length,
+    excerpts: contentRows.length
   });
-  const contentRows = rows.sort((left, right) => left.rank - right.rank).slice(0, 8);
   if (contentRows.length) return contentRows;
 
   const metadataRows = manifestDocuments
@@ -1012,7 +1086,9 @@ async function searchCompactDocuments(
       return { document, score: matchingTerms.length };
     })
     .filter(item => terms.length === 0 || item.score > 0)
-    .sort((left, right) => right.score - left.score
+    .sort((left, right) =>
+      documentRankingScore(right.score, right.document.received_date, queryYears)
+        - documentRankingScore(left.score, left.document.received_date, queryYears)
       || String(right.document.received_date || "").localeCompare(String(left.document.received_date || "")))
     .slice(0, 8);
   return metadataRows.map(({ document, score }) => ({
@@ -1063,9 +1139,10 @@ async function searchLegacyFts(env: WorkerEnv, caseNumber: string | null, terms:
 async function searchDockets(env: WorkerEnv, message: string, requestId: string): Promise<SearchRow[]> {
   const terms = buildSearchTerms(message);
   const caseNumber = extractCaseIdentifier(message);
+  const queryYears = extractQueryYears(message);
   if (caseNumber) {
     try {
-      const compactRows = await searchCompactDocuments(env, caseNumber, terms, requestId);
+      const compactRows = await searchCompactDocuments(env, caseNumber, terms, requestId, 20, 1, queryYears);
       if (compactRows.length) return compactRows;
     } catch (error) {
       console.error(JSON.stringify({ message: "compact search unavailable", error: String(error), caseNumber }));
@@ -1081,7 +1158,8 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
           terms,
           requestId,
           2,
-          Math.min(2, terms.length)
+          Math.min(2, terms.length),
+          queryYears
         );
         // Preserve cross-case diversity for global questions instead of letting
         // the first high-volume case consume every evidence slot.

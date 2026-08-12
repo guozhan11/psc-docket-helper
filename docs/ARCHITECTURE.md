@@ -17,6 +17,12 @@ The application uses React, TypeScript, Vite, Tailwind CSS, Cloudflare Workers, 
 
 PDFs are temporary during extraction and are not permanently duplicated in project storage. When `CLOUDFLARE_ACCOUNT_ID` is configured, OpenAI requests use Cloudflare AI Gateway for monitoring and spend controls.
 
+## Document Ranking
+
+Bloom-filter hit counts alone favour long historical filings, because a saturated filter matches more query terms than a short current one. Candidate documents are therefore ranked on a blended score: filter hits stay the dominant term, a filing dated in a year named by the question gains a fixed bonus, and remaining filings decay gently over a twelve-year span. The weights are deliberately smaller than one extra term match, so a recent weak match never outranks a strong older one. Filings with no usable date keep their unmodified hit count.
+
+Evidence slots are then filled round-robin across filings rather than depth-first, and the Worker keeps reading until several distinct filings have matched. Depth-first selection let one long filing consume the entire evidence budget, which could hide a more current filing that answered the question directly.
+
 ## Compact Index Design
 
 The initial design duplicated full filing text in D1 and used FTS5. The next compact design moved text to R2 and retained per-filing filters in D1. The current fast-backfill design also moves those filters into four compressed R2 manifest parts per case, removing D1's daily write quota from the historical ingestion path while allowing safe parallel writers. Existing FC1176 D1 data and version-1 R2 manifests remain available as compatibility fallbacks.
