@@ -141,7 +141,8 @@ const NEWSROOM_URL = "https://dcpsc.org/Newsroom.aspx";
 const EDOCKET_SEARCH_URL = "https://edocket.dcpsc.org/public/search";
 const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const OPENAI_TIMEOUT_MS = 15_000;
+const OPENAI_RESPONSE_START_TIMEOUT_MS = 60_000;
+const OPENAI_NON_STREAM_TIMEOUT_MS = 120_000;
 const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const TURNSTILE_TIMEOUT_MS = 5_000;
 const TURNSTILE_ACTION = "turnstile-spin-v2";
@@ -1155,7 +1156,7 @@ function extractOpenAiText(response: unknown): string {
   }).join("\n").trim();
 }
 
-function openAiRequestPayload(
+export function openAiRequestPayload(
   env: WorkerEnv,
   history: ChatMessage[],
   message: string,
@@ -1164,7 +1165,6 @@ function openAiRequestPayload(
 ): Record<string, unknown> {
   return {
     model: env.OPENAI_MODEL || "gpt-4.1",
-    max_output_tokens: 1_500,
     instructions: `You are the DC PSC Docket Assistant for people researching District of Columbia utility regulation.
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
 Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
@@ -1253,12 +1253,24 @@ async function streamAnswerWithOpenAi(
   const modelStartedAt = performance.now();
 
   try {
-    const response = await fetch(openAiEndpoint(env), {
-      method: "POST",
-      headers,
-      signal: AbortSignal.any([requestSignal, AbortSignal.timeout(OPENAI_TIMEOUT_MS)]),
-      body: JSON.stringify(openAiRequestPayload(env, history, message, rows, true))
-    });
+    const responseStartController = new AbortController();
+    const responseStartTimeout = setTimeout(
+      () => responseStartController.abort("OpenAI response start timed out"),
+      OPENAI_RESPONSE_START_TIMEOUT_MS
+    );
+    let response: Response;
+    try {
+      response = await fetch(openAiEndpoint(env), {
+        method: "POST",
+        headers,
+        signal: AbortSignal.any([requestSignal, responseStartController.signal]),
+        body: JSON.stringify(openAiRequestPayload(env, history, message, rows, true))
+      });
+    } finally {
+      // Once response headers arrive, let the model finish streaming. The
+      // inbound request signal still cancels generation when the user stops.
+      clearTimeout(responseStartTimeout);
+    }
     if (!response.ok || !response.body) {
       throw new Error(`OpenAI Responses API returned ${response.status}`);
     }
@@ -1376,7 +1388,7 @@ async function answerWithOpenAi(
     const response = await fetch(openAiEndpoint(env), {
       method: "POST",
       headers,
-      signal: AbortSignal.timeout(OPENAI_TIMEOUT_MS),
+      signal: AbortSignal.timeout(OPENAI_NON_STREAM_TIMEOUT_MS),
       body: JSON.stringify(openAiRequestPayload(env, history, message, rows))
     });
     if (!response.ok) throw new Error(`OpenAI Responses API returned ${response.status}`);

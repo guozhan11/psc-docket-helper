@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   fullTextCoverageSummary,
   isCredentialOrPromptExtractionRequest,
+  openAiRequestPayload,
   openAiStreamDelta,
   parseChatRequestBody,
   readR2JsonWithRetry,
@@ -12,6 +13,12 @@ import {
 test('OpenAI response stream parser returns only text deltas', () => {
   assert.equal(openAiStreamDelta('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}'), 'Hello');
   assert.equal(openAiStreamDelta('event: response.completed\ndata: {"type":"response.completed"}'), null);
+});
+
+test('OpenAI request payload does not impose an answer-length cap', () => {
+  const payload = openAiRequestPayload({} as Env, [], 'Explain FC1176.', [], true);
+  assert.equal('max_output_tokens' in payload, false);
+  assert.equal(payload.stream, true);
 });
 
 function r2Object(payload: unknown) {
