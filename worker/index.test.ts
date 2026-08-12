@@ -15,10 +15,17 @@ import {
   openAiStreamDelta,
   parseChatRequestBody,
   readR2JsonWithRetry,
+  routeCasesByTermIndex,
   selectDiverseDocumentResults,
   selectDiverseGlobalResults
 } from './index.ts';
-import { inverseDocumentFrequency, termShard } from '../shared/termIndex.ts';
+import { gzipSync } from 'node:zlib';
+import {
+  TERM_INDEX_KEY,
+  inverseDocumentFrequency,
+  termIndexShardKey,
+  termShard
+} from '../shared/termIndex.ts';
 
 test('OpenAI response stream parser returns only text deltas', () => {
   assert.equal(openAiStreamDelta('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}'), 'Hello');
@@ -243,4 +250,114 @@ test('global result selection preserves cross-case diversity', () => {
     'FC1176', 'ARDIR2026-01', 'FC1184'
   ]));
   assert.equal(selected.filter(row => row.case_number === 'FC1176').length, 3);
+});
+
+// --- Inverted term index routing -------------------------------------------
+
+function termIndexEnv(
+  manifest: unknown,
+  shards: Record<number, unknown>,
+  shardCount = 4096
+): Env {
+  const objects = new Map<string, Buffer>();
+  if (manifest !== null) {
+    objects.set(TERM_INDEX_KEY, Buffer.from(JSON.stringify(manifest)));
+  }
+  for (const [shardIndex, payload] of Object.entries(shards)) {
+    objects.set(
+      termIndexShardKey('a', Number(shardIndex), shardCount),
+      gzipSync(Buffer.from(JSON.stringify(payload)))
+    );
+  }
+  return {
+    DOCUMENTS: {
+      get: async (key: string) => {
+        const body = objects.get(key);
+        if (!body) return null;
+        return {
+          size: body.byteLength,
+          text: async () => body.toString('utf8'),
+          body: new Blob([body]).stream()
+        };
+      }
+    }
+  } as unknown as Env;
+}
+
+const TERM_INDEX_MANIFEST = {
+  version: 1,
+  generation: 'g1',
+  updatedAt: '2026-08-12T00:00:00.000Z',
+  complete: true,
+  activeSlot: 'a',
+  shardCount: 4096,
+  cases: 40_000,
+  terms: 100,
+  postings: 1_000,
+  compressedBytes: 10,
+  shardKeyPrefix: 'term-index/v1/slots/a/'
+};
+
+function shardFor(terms: Record<string, [number, ...string[]]>, shardIndex: number) {
+  return { version: 1, generation: 'g1', shardIndex, shardCount: 4096, terms };
+}
+
+test('term index routing yields to the case router when unpublished', async () => {
+  const env = termIndexEnv(null, {});
+  // null, not an empty list: "no index" must not be read as "no matching case".
+  assert.equal(await routeCasesByTermIndex(env, ['uncollectible'], 'r1'), null);
+});
+
+test('term index routing ignores a shard from a superseded generation', async () => {
+  const stale = { ...shardFor({ uncollectible: [2, 'FC1176'] }, 940), generation: 'g0' };
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, { 940: stale });
+  assert.deepEqual(await routeCasesByTermIndex(env, ['uncollectible'], 'r2'), []);
+});
+
+test('term index routing ranks a rare term above a common one', async () => {
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
+    940: shardFor({ uncollectible: [2, 'FC1176', 'FC1184'] }, 940),
+    1680: shardFor({ commission: [30_000, 'FC1176', 'FC9999'] }, 1680)
+  });
+  const routed = await routeCasesByTermIndex(env, ['uncollectible', 'commission'], 'r3');
+  assert.ok(routed);
+  // FC1176 matches both terms; FC1184 matches only the rare one but must still
+  // outrank FC9999, which matches only the near-ubiquitous term.
+  assert.equal(routed[0].caseNumber, 'FC1176');
+  assert.deepEqual(routed.map(row => row.caseNumber), ['FC1176', 'FC1184', 'FC9999']);
+});
+
+test('term index routing drops postings-free entries above the frequency cap', async () => {
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
+    940: shardFor({ uncollectible: [2, 'FC1176'] }, 940),
+    // Above the cap: frequency retained for IDF, no case list.
+    1680: shardFor({ commission: [30_000] }, 1680)
+  });
+  const routed = await routeCasesByTermIndex(env, ['uncollectible', 'commission'], 'r4');
+  assert.ok(routed);
+  // Only one term can discriminate, so a single hit has to be enough.
+  assert.deepEqual(routed.map(row => row.caseNumber), ['FC1176']);
+});
+
+test('term index routing ranks a two-term match above a one-term match', async () => {
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
+    940: shardFor({ uncollectible: [2, 'FC1176', 'FC1184'] }, 940),
+    3990: shardFor({ storm: [5, 'FC1176'] }, 3990)
+  });
+  const routed = await routeCasesByTermIndex(env, ['uncollectible', 'storm'], 'r5');
+  assert.ok(routed);
+  assert.deepEqual(routed.map(row => row.caseNumber), ['FC1176', 'FC1184']);
+  assert.ok(routed[0].filterScore > routed[1].filterScore);
+});
+
+test('term index routing keeps a rare-term match a ubiquitous term would hide', async () => {
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
+    940: shardFor({ uncollectible: [2, 'FC1184'] }, 940),
+    // Present in three quarters of the corpus: matching it is not evidence.
+    1680: shardFor({ commission: [30_000, 'FC9999', 'FC8888'] }, 1680)
+  });
+  const routed = await routeCasesByTermIndex(env, ['uncollectible', 'commission'], 'r6');
+  assert.ok(routed);
+  // FC1184 matches one term and outranks cases matching only the common term.
+  assert.equal(routed[0].caseNumber, 'FC1184');
 });

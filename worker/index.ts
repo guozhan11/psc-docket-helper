@@ -1,4 +1,13 @@
 import { TERM_FILTER_HASHES, termMayExist, tokenizeForFilter } from "../shared/compactSearch.ts";
+import {
+  TERM_INDEX_KEY,
+  TERM_INDEX_VERSION,
+  inverseDocumentFrequency,
+  termIndexShardKey,
+  termShard,
+  type TermIndexManifest,
+  type TermIndexShard
+} from "../shared/termIndex.ts";
 
 type WorkerEnv = Env & {
   OPENAI_API_KEY?: string;
@@ -164,6 +173,9 @@ const CASE_ROUTER_VERSION = 2;
 const CASE_ROUTER_INDEX_KEY = `case-router/v${CASE_ROUTER_VERSION}/index.json`;
 const CASE_ROUTER_CANDIDATES = 8;
 const CASE_ROUTER_VERIFIED_CASES = 2;
+// Each query term costs one shard read, so bound the reads per question. The
+// inverted index covers every case regardless; this caps I/O, not coverage.
+const TERM_INDEX_MAX_QUERY_TERMS = 8;
 // Cross-case questions must stay within the Worker CPU budget. The complete
 // router is intentionally split into 16 independent hash partitions; sample a
 // deterministic window instead of inflating and scanning all 12 MB per chat.
@@ -918,6 +930,149 @@ function compareRoutedCases(left: RoutedCase, right: RoutedCase): number {
     || String(right.latestReceivedDate || "").localeCompare(String(left.latestReceivedDate || ""));
 }
 
+function isTermIndexManifest(value: unknown): value is TermIndexManifest {
+  if (!isRecord(value)) return false;
+  return value.version === TERM_INDEX_VERSION
+    && typeof value.generation === "string"
+    && typeof value.updatedAt === "string"
+    && value.complete === true
+    && Number.isInteger(value.shardCount)
+    && Number(value.shardCount) > 0
+    && Number.isInteger(value.cases)
+    && Number(value.cases) > 0
+    && typeof value.shardKeyPrefix === "string"
+    && value.shardKeyPrefix.startsWith("term-index/");
+}
+
+async function loadTermIndexManifest(env: WorkerEnv): Promise<TermIndexManifest | null> {
+  const object = await env.DOCUMENTS.get(TERM_INDEX_KEY);
+  if (!object || object.size > 64 * 1024) return null;
+  const payload = await readR2Json(object, TERM_INDEX_KEY);
+  return isTermIndexManifest(payload) ? payload : null;
+}
+
+/**
+ * Cross-case routing over the inverted index.
+ *
+ * The Bloom router tests every case, so it costs O(cases) and had to sample one
+ * partition. Here a question reads only the shards holding its own terms, which
+ * costs O(terms) and covers every case. Scoring is IDF-weighted, so a hit on a
+ * term present in most filings cannot outweigh a hit on a rare one.
+ *
+ * Returns null — not an empty list — when the index is unavailable, so the
+ * caller can fall back to the Bloom router rather than treat it as "no match".
+ */
+export async function routeCasesByTermIndex(
+  env: WorkerEnv,
+  terms: string[],
+  requestId: string
+): Promise<RoutedCase[] | null> {
+  if (!terms.length) return null;
+  const startedAt = performance.now();
+  const manifest = await loadTermIndexManifest(env);
+  if (!manifest) {
+    logChatStage(requestId, "term-index", startedAt, { outcome: "unavailable" });
+    return null;
+  }
+
+  const wanted = terms.slice(0, TERM_INDEX_MAX_QUERY_TERMS);
+  // Several terms can land in one shard; read each shard once.
+  const shardTerms = new Map<number, string[]>();
+  for (const term of wanted) {
+    const shard = termShard(term, manifest.shardCount);
+    shardTerms.set(shard, [...(shardTerms.get(shard) ?? []), term]);
+  }
+
+  const scores = new Map<string, { score: number; hits: number }>();
+  let shardsRead = 0;
+  let cappedTerms = 0;
+  const shardEntries = Array.from(shardTerms.entries());
+  const results = await Promise.all(shardEntries.map(async ([shardIndex, shardTermList]) => {
+    const key = termIndexShardKey(
+      manifest.activeSlot,
+      shardIndex,
+      manifest.shardCount
+    );
+    try {
+      const object = await env.DOCUMENTS.get(key);
+      if (!object || object.size > 8 * 1024 * 1024) return null;
+      const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
+      const payload = JSON.parse(await new Response(stream).text()) as TermIndexShard;
+      if (payload.version !== TERM_INDEX_VERSION
+        || payload.generation !== manifest.generation
+        || payload.shardCount !== manifest.shardCount
+        || !isRecord(payload.terms)) return null;
+      return { shardTermList, payload };
+    } catch (error) {
+      console.error(JSON.stringify({
+        message: "term index shard unavailable",
+        error: error instanceof Error ? error.message : String(error),
+        key
+      }));
+      return null;
+    }
+  }));
+
+  for (const result of results) {
+    if (!result) continue;
+    shardsRead += 1;
+    for (const term of result.shardTermList) {
+      const entry = result.payload.terms[term];
+      if (!Array.isArray(entry) || !entry.length) continue;
+      const documentFrequency = Number(entry[0]) || 0;
+      const cases = entry.slice(1) as string[];
+      if (!cases.length) {
+        // Above the frequency cap: kept for its frequency, no postings. Such a
+        // term appears nearly everywhere and cannot separate cases.
+        cappedTerms += 1;
+        continue;
+      }
+      const weight = inverseDocumentFrequency(documentFrequency, manifest.cases);
+      if (weight <= 0) continue;
+      for (const caseNumber of cases) {
+        if (typeof caseNumber !== "string") continue;
+        const current = scores.get(caseNumber) ?? { score: 0, hits: 0 };
+        current.score += weight;
+        current.hits += 1;
+        scores.set(caseNumber, current);
+      }
+    }
+  }
+
+  // The Bloom router required two term matches because a single hit was often a
+  // filter false positive. Postings are exact, and IDF already discounts terms
+  // that cannot discriminate, so a hit count would now do harm: it would admit
+  // a case matching two ubiquitous terms while rejecting one matching only the
+  // rare term the question turns on. Rank by accumulated IDF instead.
+  const candidates: RoutedCase[] = Array.from(scores.entries())
+    .map(([caseNumber, value]) => ({
+      caseNumber,
+      filterHits: value.hits,
+      filterScore: value.score,
+      documentCount: 0,
+      contentDocuments: 0,
+      latestReceivedDate: null,
+      filterBits: 0
+    }))
+    // IDF score leads: matching more rare terms beats matching more terms.
+    .sort((left, right) => right.filterScore - left.filterScore
+      || right.filterHits - left.filterHits
+      || left.caseNumber.localeCompare(right.caseNumber))
+    .slice(0, CASE_ROUTER_CANDIDATES);
+
+  logChatStage(requestId, "term-index", startedAt, {
+    outcome: "complete",
+    shardsRead,
+    expectedShards: shardEntries.length,
+    totalShards: manifest.shardCount,
+    terms: wanted.length,
+    cappedTerms,
+    matchedCases: scores.size,
+    candidates: candidates.length
+  });
+  return candidates;
+}
+
 async function routeCases(
   env: WorkerEnv,
   terms: string[],
@@ -1259,7 +1414,11 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
     }
   } else if (terms.length) {
     try {
-      const routedCases = await routeCases(env, terms, requestId);
+      // The inverted index covers every case; the Bloom router samples one of
+      // sixteen partitions. Prefer the index and keep the router as a fallback
+      // until the index has been published for the whole corpus.
+      const routedCases = await routeCasesByTermIndex(env, terms, requestId)
+        ?? await routeCases(env, terms, requestId);
       const routedGroups: SearchRow[][] = [];
       for (const candidate of routedCases.slice(0, CASE_ROUTER_VERIFIED_CASES)) {
         const rows = await searchCompactDocuments(
@@ -1617,7 +1776,8 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       legacyMetadataPayload,
       metadataCoveragePayloads,
       ingestionShards,
-      caseRouterPayload
+      caseRouterPayload,
+      termIndexPayload
     ] = await Promise.all([
       Promise.all(searchDatabases(env).map(database => database.prepare(
       `SELECT COUNT(*) AS documents,
@@ -1645,7 +1805,8 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
           return isRecord(fallback) ? fallback : null;
         })
       )),
-      readR2JsonWithRetry(env.DOCUMENTS, CASE_ROUTER_INDEX_KEY)
+      readR2JsonWithRetry(env.DOCUMENTS, CASE_ROUTER_INDEX_KEY),
+      readR2JsonWithRetry(env.DOCUMENTS, TERM_INDEX_KEY)
     ]);
     const counts = shardCounts.reduce((total, shard) => ({
       documents: total.documents + (shard?.documents ?? 0),
@@ -1708,6 +1869,23 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
           compressedBytes: caseRouterPayload.compressedBytes
         }
       : { status: "missing" };
+    // The inverted index is being rolled out. While it is absent the Worker
+    // falls back to the Bloom router, so report its state without degrading
+    // health; once published, staleness is worth flagging.
+    const termIndexReady = isTermIndexManifest(termIndexPayload);
+    const termIndex = termIndexReady
+      ? {
+          status: isFreshTimestamp(termIndexPayload.updatedAt) ? "ready" : "stale",
+          version: termIndexPayload.version,
+          updatedAt: termIndexPayload.updatedAt,
+          shardCount: termIndexPayload.shardCount,
+          cases: termIndexPayload.cases,
+          terms: termIndexPayload.terms,
+          postings: termIndexPayload.postings,
+          compressedBytes: termIndexPayload.compressedBytes,
+          coverage: "all-cases"
+        }
+      : { status: "not-published", coverage: "case-router-sample" };
     const metadataStateAvailable = metadataCoverageShards.every(item => item !== null);
     const ingestionStateAvailable = ingestionShards.every(item => item !== null);
     const routerReady = isCaseRouterIndex(caseRouterPayload);
@@ -1722,6 +1900,7 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       !routerReady ? "case-router-unavailable" : null,
       !metadataFresh ? "metadata-stale" : null,
       !routerFresh ? "case-router-stale" : null,
+      termIndexReady && termIndex.status === "stale" ? "term-index-stale" : null,
       !turnstileConfigurationValid ? "turnstile-misconfigured" : null,
       !env.TURNSTILE_SECRET ? "turnstile-disabled" : null
     ].filter((issue): issue is string => issue !== null);
@@ -1739,6 +1918,7 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       metadataCoverage,
       ingestionShards,
       caseRouter,
+      termIndex,
       security: {
         rateLimiting: "enabled",
         turnstile: env.TURNSTILE_SECRET ? "enabled" : "disabled"
