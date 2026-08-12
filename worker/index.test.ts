@@ -2,10 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   COMPACT_DOCUMENT_GROUP_TARGET,
+  DEFAULT_RANKING_WEIGHTS,
   EVIDENCE_MAX_PER_DOCUMENT,
   EVIDENCE_ROW_BUDGET,
   documentRankingScore,
   extractQueryYears,
+  filterFillRatio,
+  saturationAdjustedHits,
   fullTextCoverageSummary,
   isCredentialOrPromptExtractionRequest,
   openAiRequestPayload,
@@ -132,6 +135,31 @@ test('document selection spreads evidence across filings before depth', () => {
   // Every filing contributes before any filing contributes a second excerpt.
   assert.deepEqual(selected.slice(0, 3).map(row => row.filing_id), [1, 2, 3]);
   assert.equal(new Set(selected.map(row => row.filing_id)).size, 3);
+});
+
+test('filter fill ratio counts set bits', () => {
+  assert.equal(filterFillRatio(new Uint8Array([0, 0])), 0);
+  assert.equal(filterFillRatio(new Uint8Array([0xff, 0xff])), 1);
+  assert.equal(filterFillRatio(new Uint8Array([0b1010_1010, 0])), 0.25);
+  assert.equal(filterFillRatio(new Uint8Array()), 0);
+});
+
+test('saturation adjustment discounts hits a full filter would invent', () => {
+  // An empty filter invents nothing, so its hits survive intact.
+  assert.equal(saturationAdjustedHits(3, 5, 0), 3);
+  // A completely full filter matches every term by chance, so no hit is evidence.
+  assert.equal(saturationAdjustedHits(5, 5, 1), 0);
+  // Partial fill removes the expected false hits without going negative.
+  assert.ok(saturationAdjustedHits(4, 6, 0.5) < 4);
+  assert.ok(saturationAdjustedHits(1, 12, 0.9) >= 0);
+});
+
+test('ranking weights default to date weighting without saturation adjustment', () => {
+  // Saturation adjustment showed no measurable benefit and the available
+  // quality metrics are length-confounded; see DEFAULT_RANKING_WEIGHTS.
+  assert.equal(DEFAULT_RANKING_WEIGHTS.saturationAdjusted, false);
+  assert.ok(DEFAULT_RANKING_WEIGHTS.queryYearMatch > 0);
+  assert.ok(DEFAULT_RANKING_WEIGHTS.recency > 0);
 });
 
 test('retrieval budget invariant: reading more filings than slots is wasted work', () => {

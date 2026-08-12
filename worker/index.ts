@@ -1,4 +1,4 @@
-import { termMayExist, tokenizeForFilter } from "../shared/compactSearch.ts";
+import { TERM_FILTER_HASHES, termMayExist, tokenizeForFilter } from "../shared/compactSearch.ts";
 
 type WorkerEnv = Env & {
   OPENAI_API_KEY?: string;
@@ -42,7 +42,13 @@ export interface SearchRow {
 
 type GlobalResultIdentity = Pick<SearchRow, "case_number" | "filing_id" | "page_number">;
 
-type RankableCandidate = { filing_id: number; received_date: string | null; filterHits: number };
+type RankableCandidate = {
+  filing_id: number;
+  received_date: string | null;
+  filterHits: number;
+  /** Fraction of filter bits set; drives the saturation discount. */
+  filterFill?: number;
+};
 
 export interface CompactDocumentRow {
   filing_id: number;
@@ -166,9 +172,36 @@ const CASE_ROUTER_PART_READ_LIMIT = 1;
 // saturated filter matches more terms than a short current one. These weights
 // stay below a single extra term match so recency nudges comparable documents
 // without letting a recent weak match outrank a strong older one.
-const QUERY_YEAR_MATCH_WEIGHT = 0.9;
-const RECENCY_WEIGHT = 0.6;
-const RECENCY_SPAN_YEARS = 12;
+export interface RankingWeights {
+  queryYearMatch: number;
+  recency: number;
+  recencySpanYears: number;
+  // Discount a document's hit count by the false hits its filter fill predicts.
+  // Long filings set more bits, so they match more terms by chance; without
+  // this the date weights end up arbitrating a large tie at the top instead of
+  // acting on documents that genuinely differ in term evidence.
+  saturationAdjusted: boolean;
+}
+
+// Date weighting is on because it is measured: across the year-bearing
+// evaluation questions it lifts year coverage from 5/9 to 9/9 while leaving the
+// genuine term evidence of retrieved filings unchanged (4.00 vs 4.00 distinct
+// terms, against an oracle ceiling of 4.19).
+//
+// Saturation adjustment is off. It reorders results substantially yet showed no
+// measurable benefit: term evidence stayed flat (4.01 vs 4.00) and year coverage
+// stayed at 9/9. Its only visible effect was shifting median evidence age from 0
+// to 1 year. The available quality metrics are confounded by length — longer
+// filings genuinely contain more distinct terms — so they cannot validate a
+// correction whose whole purpose is to remove a length bias. Deciding this needs
+// relevance judgements the evaluation set does not yet carry. Re-measure with
+// `npm run eval:retrieval -- --weights` before turning it on.
+export const DEFAULT_RANKING_WEIGHTS: RankingWeights = {
+  queryYearMatch: 0.9,
+  recency: 0.6,
+  recencySpanYears: 12,
+  saturationAdjusted: false
+};
 // Evidence budget sent to the model. Excerpt slots are filled round-robin, one
 // per filing, before any filing receives a second excerpt.
 export const EVIDENCE_ROW_BUDGET = 8;
@@ -513,7 +546,8 @@ export function documentRankingScore(
   filterHits: number,
   receivedDate: string | null,
   queryYears: number[],
-  now = Date.now()
+  now = Date.now(),
+  weights: RankingWeights = DEFAULT_RANKING_WEIGHTS
 ): number {
   const year = documentYear(receivedDate);
   if (year === null) return filterHits;
@@ -522,11 +556,41 @@ export function documentRankingScore(
     // A filing reporting on a year is normally submitted during it or shortly
     // after, so accept the named year and the one following it.
     const matchesQueryYear = queryYears.some(queryYear => year === queryYear || year === queryYear + 1);
-    if (matchesQueryYear) score += QUERY_YEAR_MATCH_WEIGHT;
+    if (matchesQueryYear) score += weights.queryYearMatch;
   }
   const ageYears = new Date(now).getUTCFullYear() - year;
-  const freshness = Math.min(1, Math.max(0, 1 - ageYears / RECENCY_SPAN_YEARS));
-  return score + RECENCY_WEIGHT * freshness;
+  const freshness = Math.min(1, Math.max(0, 1 - ageYears / weights.recencySpanYears));
+  return score + weights.recency * freshness;
+}
+
+/** Fraction of bits set in a term filter. Rises with document length. */
+export function filterFillRatio(filter: Uint8Array): number {
+  if (!filter.byteLength) return 0;
+  let bits = 0;
+  for (const byte of filter) {
+    let value = byte;
+    while (value) {
+      value &= value - 1;
+      bits += 1;
+    }
+  }
+  return bits / (filter.byteLength * 8);
+}
+
+/**
+ * Removes the hits a filter of this fill would produce by chance. A Bloom
+ * filter reports a false positive with probability fill^hashes, so a long
+ * saturated filing gets its inflated hit count corrected back toward the
+ * evidence it actually carries.
+ */
+export function saturationAdjustedHits(
+  filterHits: number,
+  termCount: number,
+  fillRatio: number,
+  hashes = TERM_FILTER_HASHES
+): number {
+  const falsePositiveRate = Math.pow(Math.min(1, Math.max(0, fillRatio)), hashes);
+  return Math.max(0, filterHits - termCount * falsePositiveRate);
 }
 
 // Shared by the Worker and the offline retrieval evaluation so that measured
@@ -534,11 +598,21 @@ export function documentRankingScore(
 export function rankCompactCandidates<T extends RankableCandidate>(
   candidates: T[],
   queryYears: number[],
-  now = Date.now()
+  now = Date.now(),
+  weights: RankingWeights = DEFAULT_RANKING_WEIGHTS,
+  termCount = 0
 ): T[] {
   const scoreOf = new Map(candidates.map(document => [
     document.filing_id,
-    documentRankingScore(document.filterHits, document.received_date, queryYears, now)
+    documentRankingScore(
+      weights.saturationAdjusted
+        ? saturationAdjustedHits(document.filterHits, termCount || document.filterHits, document.filterFill ?? 0)
+        : document.filterHits,
+      document.received_date,
+      queryYears,
+      now,
+      weights
+    )
   ]));
   return [...candidates].sort((left, right) =>
     (scoreOf.get(right.filing_id) ?? 0) - (scoreOf.get(left.filing_id) ?? 0)
@@ -1027,7 +1101,7 @@ async function searchCompactDocuments(
   minimumTermMatches = 1,
   queryYears: number[] = []
 ): Promise<SearchRow[]> {
-  const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number }>();
+  const candidateMap = new Map<number, CompactDocumentRow & { filterHits: number; filterFill: number }>();
   const addCandidate = (document: CompactDocumentRow) => {
     if (!document.r2_key || !document.term_filter) return;
     const filter = toFilterBytes(document.term_filter);
@@ -1035,7 +1109,7 @@ async function searchCompactDocuments(
     if (filterHits < minimumTermMatches) return;
     const existing = candidateMap.get(document.filing_id);
     if (!existing || filterHits > existing.filterHits) {
-      candidateMap.set(document.filing_id, { ...document, filterHits });
+      candidateMap.set(document.filing_id, { ...document, filterHits, filterFill: filterFillRatio(filter) });
     }
   };
 
@@ -1070,7 +1144,13 @@ async function searchCompactDocuments(
     }
     logChatStage(requestId, "d1-fallback", d1StartedAt, { caseNumber, queries: d1Queries });
   }
-  const candidates = rankCompactCandidates(Array.from(candidateMap.values()), queryYears);
+  const candidates = rankCompactCandidates(
+    Array.from(candidateMap.values()),
+    queryYears,
+    Date.now(),
+    DEFAULT_RANKING_WEIGHTS,
+    terms.length
+  );
   const selected = candidates.slice(0, maxDocumentReads);
   // Keep each filing's excerpts together so the evidence budget can be shared
   // across filings rather than filled by whichever document is read first.

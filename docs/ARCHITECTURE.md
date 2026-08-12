@@ -21,7 +21,13 @@ PDFs are temporary during extraction and are not permanently duplicated in proje
 
 Bloom-filter hit counts alone favour long historical filings, because a saturated filter matches more query terms than a short current one. Candidate documents are therefore ranked on a blended score: filter hits stay the dominant term, a filing dated in a year named by the question gains a fixed bonus, and remaining filings decay gently over a twelve-year span. The weights are deliberately smaller than one extra term match, so a recent weak match never outranks a strong older one. Filings with no usable date keep their unmodified hit count.
 
-Evidence slots are then filled round-robin across filings rather than depth-first, and the Worker keeps reading until several distinct filings have matched. Depth-first selection let one long filing consume the entire evidence budget, which could hide a more current filing that answered the question directly.
+Evidence slots are then filled round-robin across filings rather than depth-first, and the Worker keeps reading until several distinct filings have matched. Depth-first selection let one long filing consume the entire evidence budget, which could hide a more current filing that answered the question directly. Reads run a batch at a time, so a batch may overshoot the target; the surplus lowest-ranked filings are dropped, which reserves the remaining slots for the best-ranked filings to contribute a second excerpt. Filings beyond the evidence budget can never win a slot, so the group target must stay at or below it — a test enforces the bound.
+
+## Retrieval Evaluation
+
+`npm run eval:validate` checks that the evaluation set is well formed. `npm run eval:retrieval` scores it: it runs the questions against the local `.rag-data` corpus and imports the Worker's own ranking, excerpt, and selection functions, so measured behaviour cannot drift from production. Only the R2 fetch loop is modelled locally. `--sweep` compares breadth against depth, and `--weights` compares ranking weightings.
+
+Ground truth comes from the corpus rather than from labels: the Bloom filter reports that a term may be present, while the stored text says whether it is. Two cautions apply. Metrics built on term counts are confounded by length, because longer filings genuinely contain more distinct terms, so they cannot validate a change intended to remove a length bias. Year coverage does not carry that confound. Term evidence is also not topical relevance — a filing can contain every query term without answering the question — so deciding between rankings that score alike still needs relevance judgements the evaluation set does not yet carry.
 
 ## Compact Index Design
 

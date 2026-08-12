@@ -11,22 +11,32 @@
  * ranking, excerpt, and selection functions, so what is measured here is what
  * production does. Only the R2/D1 fetch loop is modelled locally.
  *
+ * Read oracleOverlap with care. The oracle ranks by the number of distinct
+ * query terms a filing genuinely contains, which rises with document length, so
+ * the metric rewards retrieving long filings. It is useful for spotting large
+ * reorderings, not for deciding whether a reordering was an improvement.
+ * retrievedTrueTerms carries the same length confound. yearCoverage does not.
+ *
  * Usage:
- *   npm run eval:retrieval
- *   npm run eval:retrieval -- --sweep 4,6,8
- *   npm run eval:retrieval -- --json
+ *   npm run eval:retrieval                        score at current constants
+ *   npm run eval:retrieval -- --sweep 4,6,8       breadth/depth trade-off
+ *   npm run eval:retrieval -- --weights           compare ranking weightings
+ *   npm run eval:retrieval -- --json              machine-readable output
  */
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import {
   COMPACT_DOCUMENT_GROUP_TARGET,
+  DEFAULT_RANKING_WEIGHTS,
   EVIDENCE_ROW_BUDGET,
   buildSearchTerms,
   extractQueryYears,
+  filterFillRatio,
   findPageExcerpts,
   rankCompactCandidates,
   selectDiverseDocumentResults,
   type CompactDocumentRow,
+  type RankingWeights,
   type SearchRow
 } from '../worker/index.ts';
 import { createTermFilter, termMayExist } from '../shared/compactSearch.ts';
@@ -40,7 +50,10 @@ interface EvaluationQuestion {
 
 interface LocalDocument extends CompactDocumentRow {
   filterBytes: Uint8Array;
+  filterFill: number;
   html: string;
+  /** Lowercased full text, used to compute exact-match ground truth. */
+  plainText: string;
 }
 
 interface QuestionResult {
@@ -52,6 +65,11 @@ interface QuestionResult {
   candidates: number;
   maxFilterHits: number;
   tiedAtTop: number;
+  trueMatches: number;
+  bloomPrecision: number | null;
+  oracleOverlap: number | null;
+  retrievedTrueTerms: number | null;
+  oracleTrueTerms: number | null;
   documentsRead: number;
   matchedDocuments: number;
   evidenceRows: number;
@@ -77,6 +95,7 @@ function parseArgs(argv: string[]) {
       : undefined;
   return {
     json: argv.includes('--json'),
+    weights: argv.includes('--weights'),
     sweep: sweepRaw
       ? sweepRaw.split(',').map(value => Number(value.trim())).filter(Number.isInteger)
       : null
@@ -158,6 +177,8 @@ async function loadCorpus(): Promise<Map<string, LocalDocument[]>> {
         // scripts/fast_r2_ingest.py does.
         term_filter: null,
         filterBytes: createTermFilter(text),
+        filterFill: filterFillRatio(createTermFilter(text)),
+        plainText: text.toLowerCase(),
         html: toStoredHtml(filingId, caseNumber, pages)
       };
       const bucket = byCase.get(caseNumber) ?? [];
@@ -171,7 +192,8 @@ async function loadCorpus(): Promise<Map<string, LocalDocument[]>> {
 function runRetrieval(
   documents: LocalDocument[],
   question: string,
-  groupTarget: number
+  groupTarget: number,
+  weights: RankingWeights = DEFAULT_RANKING_WEIGHTS
 ): Omit<QuestionResult, 'id' | 'category' | 'question' | 'caseNumber'> {
   const terms = buildSearchTerms(question);
   const queryYears = extractQueryYears(question);
@@ -183,6 +205,18 @@ function runRetrieval(
     }))
     .filter(document => document.filterHits >= 1);
 
+  // Ground truth. The Bloom filter only says a term *may* be present; the full
+  // local text says whether it is. Counting distinct terms a filing genuinely
+  // contains gives an objective ordering to compare the ranking against.
+  // It measures term evidence, not topical relevance — a filing can contain
+  // every term and still not answer the question.
+  const trueTermCount = (document: LocalDocument) =>
+    terms.filter(term => document.plainText.includes(term)).length;
+  const trueMatching = documents.filter(document => trueTermCount(document) >= 1);
+  const oracle = [...trueMatching]
+    .sort((left, right) => trueTermCount(right) - trueTermCount(left)
+      || String(right.received_date || '').localeCompare(String(left.received_date || '')));
+
   // How many candidates tie on term evidence at the top? Filter hits are the
   // dominant ranking term only while they discriminate. If a large share of the
   // corpus ties at the maximum, the date weights stop being a nudge and become
@@ -190,7 +224,8 @@ function runRetrieval(
   const maxFilterHits = candidates.reduce((best, item) => Math.max(best, item.filterHits), 0);
   const tiedAtTop = candidates.filter(item => item.filterHits === maxFilterHits).length;
 
-  const ranked = rankCompactCandidates(candidates, queryYears).slice(0, MAX_DOCUMENT_READS);
+  const ranked = rankCompactCandidates(candidates, queryYears, Date.now(), weights, terms.length)
+    .slice(0, MAX_DOCUMENT_READS);
 
   const excerptGroups: SearchRow[][] = [];
   let documentsRead = 0;
@@ -214,11 +249,29 @@ function runRetrieval(
     .filter((year): year is number => year !== null);
   const topFilingYear = evidence.length ? documentYear(evidence[0].received_date) : null;
 
+  const retrievedIds = new Set(evidence.map(row => row.filing_id));
+  const oracleTop = oracle.slice(0, Math.max(1, retrievedIds.size));
+  const oracleIds = new Set(oracleTop.map(document => document.filing_id));
+  const retrievedDocuments = documents.filter(document => retrievedIds.has(document.filing_id));
+  const mean = (values: number[]) =>
+    values.length ? Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2)) : null;
+
   return {
     queryYears,
     candidates: candidates.length,
     maxFilterHits,
     tiedAtTop,
+    trueMatches: trueMatching.length,
+    // Share of Bloom-passing candidates whose text really contains a term.
+    bloomPrecision: candidates.length
+      ? Number((candidates.filter(item => trueTermCount(item) >= 1).length / candidates.length).toFixed(3))
+      : null,
+    // Overlap between what ranking retrieved and the strongest true matches.
+    oracleOverlap: retrievedIds.size
+      ? Number(([...retrievedIds].filter(id => oracleIds.has(id)).length / retrievedIds.size).toFixed(3))
+      : null,
+    retrievedTrueTerms: mean(retrievedDocuments.map(trueTermCount)),
+    oracleTrueTerms: mean(oracleTop.map(trueTermCount)),
     documentsRead,
     matchedDocuments: excerptGroups.length,
     evidenceRows: evidence.length,
@@ -238,6 +291,13 @@ function runRetrieval(
   };
 }
 
+function mean(values: (number | null)[]): number | null {
+  const present = values.filter((value): value is number => value !== null);
+  return present.length
+    ? Number((present.reduce((sum, value) => sum + value, 0) / present.length).toFixed(3))
+    : null;
+}
+
 function median(values: number[]): number | null {
   if (!values.length) return null;
   const sorted = [...values].sort((left, right) => left - right);
@@ -255,6 +315,10 @@ function summarize(results: QuestionResult[]) {
     meanDistinctFilings: Number((results.reduce((sum, r) => sum + r.distinctFilings, 0) / (results.length || 1)).toFixed(2)),
     meanDocumentsRead: Number((results.reduce((sum, r) => sum + r.documentsRead, 0) / (results.length || 1)).toFixed(2)),
     meanTiedAtTop: Number((results.reduce((sum, r) => sum + r.tiedAtTop, 0) / (results.length || 1)).toFixed(1)),
+    meanBloomPrecision: mean(results.map(r => r.bloomPrecision)),
+    meanOracleOverlap: mean(results.map(r => r.oracleOverlap)),
+    meanRetrievedTrueTerms: mean(results.map(r => r.retrievedTrueTerms)),
+    meanOracleTrueTerms: mean(results.map(r => r.oracleTrueTerms)),
     yearCoverage: withYears.length
       ? `${withYears.filter(r => r.yearsCovered).length}/${withYears.length}`
       : 'n/a',
@@ -284,7 +348,7 @@ if (!scorable.length) {
   process.exit(1);
 }
 
-function scoreAll(groupTarget: number): QuestionResult[] {
+function scoreAll(groupTarget: number, weights: RankingWeights = DEFAULT_RANKING_WEIGHTS): QuestionResult[] {
   return scorable.map(question => {
     const caseNumber = question.expectedCaseNumbers!
       .map(value => value.toUpperCase())
@@ -294,12 +358,39 @@ function scoreAll(groupTarget: number): QuestionResult[] {
       category: question.category,
       question: question.question,
       caseNumber,
-      ...runRetrieval(corpus.get(caseNumber)!, question.question, groupTarget)
+      ...runRetrieval(corpus.get(caseNumber)!, question.question, groupTarget, weights)
     };
   });
 }
 
-if (options.sweep) {
+if (options.weights) {
+  const variants: { label: string; weights: RankingWeights }[] = [
+    { label: 'no date weighting', weights: { ...DEFAULT_RANKING_WEIGHTS, queryYearMatch: 0, recency: 0, saturationAdjusted: false } },
+    { label: 'dates only (shipped v1)', weights: { ...DEFAULT_RANKING_WEIGHTS, saturationAdjusted: false } },
+    { label: 'saturation only', weights: { ...DEFAULT_RANKING_WEIGHTS, queryYearMatch: 0, recency: 0 } },
+    { label: 'saturation + dates', weights: DEFAULT_RANKING_WEIGHTS },
+    { label: 'saturation + half recency', weights: { ...DEFAULT_RANKING_WEIGHTS, recency: 0.3 } },
+    { label: 'saturation + year only', weights: { ...DEFAULT_RANKING_WEIGHTS, recency: 0 } }
+  ];
+  const rows = variants.map(variant => ({
+    variant: variant.label,
+    ...summarize(scoreAll(COMPACT_DOCUMENT_GROUP_TARGET, variant.weights))
+  }));
+  if (options.json) {
+    console.log(JSON.stringify({ mode: 'weights', rows }, null, 2));
+  } else {
+    console.log(`Corpus: ${[...availableCases].join(', ')} — ${scorable.length} scorable question(s), ${skipped} skipped (case not indexed locally)\n`);
+    console.table(rows.map(row => ({
+      variant: row.variant,
+      oracleOverlap: row.meanOracleOverlap,
+      retrievedTrueTerms: row.meanRetrievedTrueTerms,
+      oracleTrueTerms: row.meanOracleTrueTerms,
+      distinctFilings: row.meanDistinctFilings,
+      yearCoverage: row.yearCoverage,
+      medianAgeYears: row.medianEvidenceAgeYears
+    })));
+  }
+} else if (options.sweep) {
   const rows = options.sweep.map(groupTarget => ({ groupTarget, ...summarize(scoreAll(groupTarget)) }));
   if (options.json) {
     console.log(JSON.stringify({ mode: 'sweep', evidenceRowBudget: EVIDENCE_ROW_BUDGET, rows }, null, 2));
