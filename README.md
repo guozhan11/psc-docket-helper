@@ -27,11 +27,14 @@ No installation is required.
 
 - `In FC1176, what drove Pepco's 2025 O&M expense variance?`
 - `Which FC1176 filings discuss bad debt or uncollectible accounts?`
+
+## Questions That Work Partially
+
 - `Which DC PSC cases discuss bad debt or uncollectible accounts?`
 
-Questions with a case number search that case directly. Questions without a case number first use the global case router to shortlist relevant proceedings before verifying exact terms against filing text.
+Questions with a case number search that case directly, and this is the path the tool does best.
 
-Cross-case results are relevance-ranked shortlists, not a guarantee that every potentially relevant proceeding is listed.
+Questions without a case number use the global case router. It currently scans one of sixteen router partitions, so it examines a sample of indexed cases rather than the whole corpus, and which sample it reads shifts with how the question is worded. Relevant proceedings may be missing. Treat cross-case answers as leads to confirm with a case-specific question or the official e-Docket search, not as a complete list.
 
 ## How It Works
 

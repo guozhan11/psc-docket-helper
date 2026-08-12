@@ -1368,7 +1368,12 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
 
 function answerSuffix(message: string, reply: string, rows: SearchRow[]): string {
   const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
-  const scopeNote = extractCaseIdentifier(message) ? "" : "\n\n> **Search scope:** These are relevance-ranked matches from the indexed corpus, not a guarantee that every potentially relevant case is listed.";
+  // Cross-case routing reads one of the router's sixteen partitions, so it
+  // examines a fraction of indexed cases rather than all of them. Say so
+  // plainly: "relevance-ranked matches from the indexed corpus" reads as a
+  // full-corpus ranking, and a reader deciding which proceedings matter would
+  // be misled by it.
+  const scopeNote = extractCaseIdentifier(message) ? "" : "\n\n> **Search scope:** Cross-case search scans a sample of the indexed cases, not the whole corpus, and the sample shifts with how the question is worded. Relevant proceedings may be missing entirely. Treat these as leads, then confirm by asking about a specific case number or by searching the official e-Docket directly.";
   const replyReportsInsufficientEvidence = /\b(?:no|insufficient|not enough)\s+(?:matching\s+)?evidence\b|\bcould(?:n['’]t| not)\s+find\b/i.test(reply);
   if (replyReportsInsufficientEvidence || !sources.length) return scopeNote;
   return `${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>
