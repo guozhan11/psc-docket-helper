@@ -18,6 +18,8 @@ import {
   ShieldCheck,
   AlertTriangle,
   MessageCircle,
+  PanelLeftClose,
+  PanelLeftOpen,
   Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -148,6 +150,13 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [isReceivingContent, setIsReceivingContent] = useState(false);
+  const [corpusPanelOpen, setCorpusPanelOpen] = useState(() => {
+    try {
+      return localStorage.getItem('dc_psc_corpus_panel') !== 'collapsed';
+    } catch {
+      return true;
+    }
+  });
   const [failedRequest, setFailedRequest] = useState<{ sessionId: string; message: string } | null>(null);
   const activeRequestRef = useRef<{ controller: AbortController; sessionId: string } | null>(null);
   const [clientId] = useState(() => {
@@ -190,6 +199,14 @@ export default function App() {
       }
     }
   }, [activeSessionId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('dc_psc_corpus_panel', corpusPanelOpen ? 'expanded' : 'collapsed');
+    } catch {
+      // The preference remains available for the current visit.
+    }
+  }, [corpusPanelOpen]);
 
   useEffect(() => {
     if (confirmClear) {
@@ -548,11 +565,26 @@ export default function App() {
           <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 xl:gap-10 items-start">
               {/* Info Sidebar */}
-              <div className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3">
+              {corpusPanelOpen && <motion.div
+                layout
+                initial={{ opacity: 0, x: -16 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -16 }}
+                className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3"
+              >
                 <div className="sticky top-28 lg:flex lg:h-[calc(100dvh-7rem)] lg:min-h-[520px] lg:max-h-[760px] lg:flex-col lg:gap-4">
-                  <div className="mb-8 rounded-3xl bg-psc-blue p-8 text-white shadow-2xl lg:mb-0 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-6">
+                  <div className="relative mb-8 rounded-3xl bg-psc-blue p-8 text-white shadow-2xl lg:mb-0 lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:p-6">
+                    <button
+                      type="button"
+                      onClick={() => setCorpusPanelOpen(false)}
+                      className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-xl border border-white/15 bg-white/10 text-slate-200 transition-colors hover:bg-white/20 hover:text-white"
+                      aria-label="Collapse RAG document collection panel"
+                      title="Collapse corpus information"
+                    >
+                      <PanelLeftClose className="h-4 w-4" />
+                    </button>
                     <div className="flex h-full flex-col justify-center">
-                      <h2 className="mb-3 text-3xl leading-tight 2xl:text-4xl">RAG Document Collection</h2>
+                      <h2 className="mb-3 pr-8 text-3xl leading-tight 2xl:text-4xl">RAG Document Collection</h2>
                       <p className="text-sm leading-relaxed text-slate-300">
                         Answers are grounded in searchable excerpts from public DC PSC e-Docket filings.
                       </p>
@@ -588,10 +620,17 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-              </div>
+              </motion.div>}
 
               {/* Chat Interface */}
-              <div id="docket-chat" className="order-1 scroll-mt-24 lg:order-2 lg:col-span-8 xl:col-span-9">
+              <motion.div
+                layout
+                id="docket-chat"
+                className={cn(
+                  "order-1 scroll-mt-24 lg:order-2",
+                  corpusPanelOpen ? "lg:col-span-8 xl:col-span-9" : "lg:col-span-12"
+                )}
+              >
                 <div className="bg-white rounded-3xl shadow-xl border border-slate-200 flex h-[calc(100dvh-7rem)] min-h-[520px] max-h-[760px] overflow-hidden relative z-10">
                   {/* Left Chat History Pane */}
                   <div className={cn(
@@ -708,6 +747,18 @@ export default function App() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
+                        {!corpusPanelOpen && (
+                          <button
+                            type="button"
+                            onClick={() => setCorpusPanelOpen(true)}
+                            className="flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-500 transition-colors hover:bg-psc-blue/5 hover:text-psc-blue"
+                            aria-label="Expand RAG document collection panel"
+                            title="Show corpus information"
+                          >
+                            <PanelLeftOpen className="h-4 w-4" />
+                            <span className="hidden sm:inline">Corpus info</span>
+                          </button>
+                        )}
                         <a
                           href="mailto:gz163@georgetown.edu?subject=PSC%20Docket%20Helper%20feedback"
                           className="p-2 rounded-lg text-slate-400 hover:text-psc-blue hover:bg-psc-blue/5 transition-colors"
@@ -883,7 +934,7 @@ export default function App() {
                     </form>
                   </div>
                 </div>
-              </div>
+              </motion.div>
             </div>
           </div>
         </section>
