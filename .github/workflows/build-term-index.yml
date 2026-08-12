@@ -21,6 +21,11 @@ on:
         required: false
         default: "4096"
         type: string
+      concurrency:
+        description: "Parallel R2 readers; a full pass is ~200k round trips"
+        required: false
+        default: "16"
+        type: string
 
 concurrency:
   # Two builds would write different generations into the same slot.
@@ -52,3 +57,4 @@ jobs:
           python -u scripts/build_term_index.py
           --shard-count ${{ inputs.shard-count || '4096' }}
           --limit ${{ inputs.limit || '0' }}
+          --concurrency ${{ inputs.concurrency || '16' }}
