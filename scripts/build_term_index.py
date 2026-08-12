@@ -25,6 +25,7 @@ import re
 import shutil
 import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -36,6 +37,11 @@ DEFAULT_SHARD_COUNT = 4096
 INTERMEDIATE_BUCKETS = 64
 TERM_INDEX_KEY = f"term-index/v{TERM_INDEX_VERSION}/index.json"
 MAX_DOCUMENT_FREQUENCY = 0.15
+# A share is meaningless on a small corpus: over 200 cases the cap would be 30,
+# so ordinary terms would lose their postings and a canary run would not
+# resemble production. Against the real corpus the share is ~6,000 and this
+# floor never binds.
+MIN_DOCUMENT_FREQUENCY_CAP = 32
 MAX_COMPRESSED_SHARD_BYTES = 8 * 1024 * 1024
 STATE_KEY = f"term-index/v{TERM_INDEX_VERSION}/build-state.json"
 
@@ -124,30 +130,51 @@ def write_postings(
     work_dir: Path,
     shard_count: int,
     progress_every: int,
+    concurrency: int = 1,
 ) -> tuple[int, int]:
-    """Stream (term, case) postings into intermediate bucket files."""
+    """Stream (term, case) postings into intermediate bucket files.
+
+    A full pass makes roughly 200,000 R2 round trips. Serially that runs past
+    GitHub's six-hour job limit, so cases are fetched by a thread pool while
+    writing stays on this thread — the file handles are not thread-safe.
+    Batching bounds how many case term-sets are held at once.
+    """
     handles = [
         (work_dir / f"bucket-{index:03d}.txt").open("w", encoding="utf-8")
         for index in range(INTERMEDIATE_BUCKETS)
     ]
     cases_written = 0
     postings = 0
+    ordered = sorted(grouped)
+    batch_size = max(1, concurrency * 8)
     try:
-        for position, case_number in enumerate(sorted(grouped), start=1):
-            terms = case_terms(r2, bucket, sorted(grouped[case_number]))
-            if not terms:
-                continue
-            cases_written += 1
-            for term in terms:
-                shard = term_shard(term, shard_count)
-                handles[shard % INTERMEDIATE_BUCKETS].write(f"{shard}\t{term}\t{case_number}\n")
-                postings += 1
-            if progress_every and position % progress_every == 0:
-                print(
-                    f"  scanned {position:,}/{len(grouped):,} cases; "
-                    f"{postings:,} postings so far",
-                    flush=True,
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            for start in range(0, len(ordered), batch_size):
+                batch = ordered[start:start + batch_size]
+                results = pool.map(
+                    lambda case_number: (
+                        case_number,
+                        case_terms(r2, bucket, sorted(grouped[case_number])),
+                    ),
+                    batch,
                 )
+                for case_number, terms in results:
+                    if not terms:
+                        continue
+                    cases_written += 1
+                    for term in terms:
+                        shard = term_shard(term, shard_count)
+                        handles[shard % INTERMEDIATE_BUCKETS].write(
+                            f"{shard}\t{term}\t{case_number}\n"
+                        )
+                        postings += 1
+                scanned = min(start + batch_size, len(ordered))
+                if progress_every and scanned % progress_every < batch_size:
+                    print(
+                        f"  scanned {scanned:,}/{len(ordered):,} cases; "
+                        f"{postings:,} postings so far",
+                        flush=True,
+                    )
     finally:
         for handle in handles:
             handle.close()
@@ -164,7 +191,7 @@ def publish_shards(
     generation: str,
 ) -> tuple[int, int, int]:
     """Aggregate each intermediate bucket and upload its shards."""
-    frequency_cap = max(1, int(total_cases * MAX_DOCUMENT_FREQUENCY))
+    frequency_cap = max(MIN_DOCUMENT_FREQUENCY_CAP, int(total_cases * MAX_DOCUMENT_FREQUENCY))
     total_terms = 0
     kept_postings = 0
     compressed_bytes = 0
@@ -237,7 +264,14 @@ def load_previous_index(r2: Any, bucket: str) -> dict[str, Any] | None:
         raise
 
 
-def build(r2: Any, bucket: str, shard_count: int, limit: int, progress_every: int) -> dict[str, Any]:
+def build(
+    r2: Any,
+    bucket: str,
+    shard_count: int,
+    limit: int,
+    progress_every: int,
+    concurrency: int = 1,
+) -> dict[str, Any]:
     grouped = manifest_keys_by_case(r2, bucket)
     if not grouped:
         raise RuntimeError("No v2 case manifests were found in R2")
@@ -252,7 +286,7 @@ def build(r2: Any, bucket: str, shard_count: int, limit: int, progress_every: in
     try:
         print(f"Scanning {len(grouped):,} cases...", flush=True)
         cases_written, postings = write_postings(
-            r2, bucket, grouped, work_dir, shard_count, progress_every
+            r2, bucket, grouped, work_dir, shard_count, progress_every, concurrency
         )
         print(f"Publishing {shard_count} shards to slot {slot}...", flush=True)
         total_terms, kept_postings, compressed_bytes = publish_shards(
@@ -292,6 +326,7 @@ def main() -> None:
     parser.add_argument("--shard-count", type=int, default=DEFAULT_SHARD_COUNT)
     parser.add_argument("--limit", type=int, default=0, help="Only index the first N cases")
     parser.add_argument("--progress-every", type=int, default=250)
+    parser.add_argument("--concurrency", type=int, default=8, help="Parallel R2 readers")
     args = parser.parse_args()
     if not 64 <= args.shard_count <= 16384:
         raise RuntimeError("--shard-count must be between 64 and 16384")
@@ -306,7 +341,9 @@ def main() -> None:
         aws_secret_access_key=require_env("R2_SECRET_ACCESS_KEY"),
         region_name="auto",
     )
-    index = build(r2, bucket, args.shard_count, args.limit, args.progress_every)
+    index = build(
+        r2, bucket, args.shard_count, args.limit, args.progress_every, args.concurrency
+    )
     print(
         "Term index complete: "
         f"{index['cases']:,} cases; {index['terms']:,} terms; "

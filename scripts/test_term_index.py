@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from build_term_index import (
+    TERM_INDEX_KEY as TERM_INDEX_KEY_NAME,
     DEFAULT_SHARD_COUNT,
     MAX_DOCUMENT_FREQUENCY,
     document_terms,
@@ -142,6 +143,159 @@ class FrequencyCapTests(unittest.TestCase):
         }
         body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"), 9)
         self.assertEqual(json.loads(gzip.decompress(body)), payload)
+
+
+
+class FakeR2:
+    """Minimal in-memory stand-in for the boto3 S3 client build() uses."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.put_calls = 0
+
+    def get_paginator(self, name: str):
+        assert name == "list_objects_v2"
+        objects = self.objects
+
+        class Paginator:
+            def paginate(self, Bucket: str, Prefix: str = ""):  # noqa: N803
+                contents = [
+                    {"Key": key} for key in sorted(objects) if key.startswith(Prefix)
+                ]
+                yield {"Contents": contents}
+
+        return Paginator()
+
+    def get_object(self, Bucket: str, Key: str):  # noqa: N803
+        if Key not in self.objects:
+            raise RuntimeError(f"NoSuchKey: {Key}")
+        import io
+
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, Bucket: str, Key: str, Body: bytes, **kwargs):  # noqa: N803
+        self.put_calls += 1
+        self.objects[Key] = Body
+
+
+def _seed(r2: FakeR2, cases: dict[str, dict[str, str]]) -> None:
+    """cases: case number -> {filing id: document text}."""
+    for case_number, documents in cases.items():
+        manifest_documents = []
+        for filing_id, text in documents.items():
+            r2_key = f"filings/2025/{filing_id}.html.gz"
+            document_html = (
+                '<!doctype html><html><body>'
+                f'<main data-filing-id="{filing_id}" data-case="{case_number}">'
+                f'<section data-page="1"><pre>{text}</pre></section>'
+                "</main></body></html>"
+            )
+            r2.objects[r2_key] = gzip.compress(document_html.encode("utf-8"))
+            manifest_documents.append({"filing_id": int(filing_id), "r2_key": r2_key})
+        r2.objects[f"manifests-v2/{case_number}/part-0-of-4.json.gz"] = gzip.compress(
+            json.dumps({"caseNumber": case_number, "documents": manifest_documents}).encode()
+        )
+
+
+class BuildIntegrationTests(unittest.TestCase):
+    """Exercises build() end to end against an in-memory bucket."""
+
+    def _build(self, cases, shard_count=64):
+        from build_term_index import build
+
+        r2 = FakeR2()
+        _seed(r2, cases)
+        index = build(r2, "bucket", shard_count, 0, 0)
+        return r2, index
+
+    def _shard_terms(self, r2, index, term, shard_count=64):
+        key = shard_key(index["activeSlot"], term_shard(term, shard_count), shard_count)
+        return json.loads(gzip.decompress(r2.objects[key]))["terms"]
+
+    def test_term_resolves_to_the_case_that_contains_it(self):
+        r2, index = self._build({
+            "FC1176": {"1": "Uncollectible accounts rose sharply."},
+            "FC1184": {"2": "Storm restoration costs were deferred."},
+        })
+        self.assertEqual(index["cases"], 2)
+        self.assertEqual(
+            self._shard_terms(r2, index, "uncollectible")["uncollectible"],
+            [1, "FC1176"],
+        )
+        self.assertEqual(
+            self._shard_terms(r2, index, "storm")["storm"], [1, "FC1184"]
+        )
+
+    def test_a_term_in_two_cases_lists_both(self):
+        r2, index = self._build({
+            "FC1176": {"1": "deferred storm costs"},
+            "FC1184": {"2": "storm restoration"},
+        })
+        self.assertEqual(
+            self._shard_terms(r2, index, "storm")["storm"], [2, "FC1176", "FC1184"]
+        )
+
+    def test_a_case_contributes_each_term_once_across_its_documents(self):
+        r2, index = self._build({
+            "FC1176": {"1": "storm storm storm", "2": "storm again"},
+        })
+        # One posting per case, not per document.
+        self.assertEqual(self._shard_terms(r2, index, "storm")["storm"], [1, "FC1176"])
+
+    def test_ubiquitous_term_keeps_frequency_but_drops_postings(self):
+        # 300 cases, so the 15% share (45) clears the floor and governs.
+        cases = {
+            f"FC{1000 + index}": {str(index): "commission ruling"}
+            for index in range(300)
+        }
+        cases["FC9999"] = {"9999": "commission uncollectible"}
+        r2, index = self._build(cases)
+        commission = self._shard_terms(r2, index, "commission")["commission"]
+        # Frequency retained for IDF; the case list is dropped.
+        self.assertEqual(commission, [301])
+        # The rare term keeps its postings.
+        self.assertEqual(
+            self._shard_terms(r2, index, "uncollectible")["uncollectible"],
+            [1, "FC9999"],
+        )
+
+    def test_every_shard_is_published_and_index_written_last(self):
+        r2, index = self._build({"FC1176": {"1": "storm"}}, shard_count=64)
+        shard_keys = [key for key in r2.objects if "/slots/" in key]
+        self.assertEqual(len(shard_keys), 64)
+        self.assertIn(TERM_INDEX_KEY_NAME, r2.objects)
+        self.assertTrue(index["complete"])
+
+    def test_second_build_alternates_slots(self):
+        from build_term_index import build
+
+        r2 = FakeR2()
+        _seed(r2, {"FC1176": {"1": "storm"}})
+        first = build(r2, "bucket", 64, 0, 0)
+        second = build(r2, "bucket", 64, 0, 0)
+        # Alternating slots let a new generation publish without disturbing the
+        # one the Worker is currently reading.
+        self.assertNotEqual(first["activeSlot"], second["activeSlot"])
+
+    def test_small_builds_keep_postings_via_the_cap_floor(self):
+        """Without a floor the share-based cap makes a canary run useless.
+
+        Over two cases the 15% share rounds to a cap of 0, so a term in both
+        would lose its postings even though nothing about it is ubiquitous at
+        production scale.
+        """
+        r2, index = self._build({
+            "FC1176": {"1": "deferred storm costs"},
+            "FC1184": {"2": "storm restoration"},
+        })
+        self.assertEqual(
+            self._shard_terms(r2, index, "storm")["storm"], [2, "FC1176", "FC1184"]
+        )
+
+    def test_markup_does_not_become_searchable_terms(self):
+        r2, index = self._build({"FC1176": {"1": "storm"}})
+        terms = self._shard_terms(r2, index, "section")
+        self.assertNotIn("section", terms)
 
 
 if __name__ == "__main__":
