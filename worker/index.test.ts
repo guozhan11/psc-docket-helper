@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  COMPACT_DOCUMENT_GROUP_TARGET,
+  EVIDENCE_MAX_PER_DOCUMENT,
+  EVIDENCE_ROW_BUDGET,
   documentRankingScore,
   extractQueryYears,
   fullTextCoverageSummary,
@@ -129,6 +132,31 @@ test('document selection spreads evidence across filings before depth', () => {
   // Every filing contributes before any filing contributes a second excerpt.
   assert.deepEqual(selected.slice(0, 3).map(row => row.filing_id), [1, 2, 3]);
   assert.equal(new Set(selected.map(row => row.filing_id)).size, 3);
+});
+
+test('retrieval budget invariant: reading more filings than slots is wasted work', () => {
+  // Round-robin gives the first EVIDENCE_ROW_BUDGET filings one slot each, so a
+  // filing read beyond that can never contribute. Raising the group target above
+  // the budget would only buy extra R2 GETs and gzip decodes. Measure the
+  // trade-off with `npm run eval:retrieval -- --sweep 4,6,8` before changing it.
+  assert.ok(
+    COMPACT_DOCUMENT_GROUP_TARGET <= EVIDENCE_ROW_BUDGET,
+    `COMPACT_DOCUMENT_GROUP_TARGET (${COMPACT_DOCUMENT_GROUP_TARGET}) must not exceed `
+      + `EVIDENCE_ROW_BUDGET (${EVIDENCE_ROW_BUDGET}); filings past the budget win no slot`
+  );
+
+  // The stated purpose of staying below the ceiling is to leave room for a
+  // second excerpt from the best-ranked filings.
+  const groups = Array.from({ length: COMPACT_DOCUMENT_GROUP_TARGET }, (_, group) =>
+    Array.from({ length: EVIDENCE_MAX_PER_DOCUMENT }, (_, page) => ({
+      case_number: 'FC1176',
+      filing_id: group + 1,
+      page_number: page + 1
+    })));
+  const selected = selectDiverseDocumentResults(groups);
+  const secondExcerpts = selected.filter(row => row.page_number === 2).length;
+  assert.equal(selected.length, EVIDENCE_ROW_BUDGET);
+  assert.equal(secondExcerpts, EVIDENCE_ROW_BUDGET - COMPACT_DOCUMENT_GROUP_TARGET);
 });
 
 test('document selection honours the total evidence budget', () => {

@@ -27,7 +27,7 @@ interface TurnstileSiteverifyResponse {
   "error-codes"?: string[];
 }
 
-interface SearchRow {
+export interface SearchRow {
   filing_id: number;
   case_number: string;
   docket_number: string | null;
@@ -42,7 +42,9 @@ interface SearchRow {
 
 type GlobalResultIdentity = Pick<SearchRow, "case_number" | "filing_id" | "page_number">;
 
-interface CompactDocumentRow {
+type RankableCandidate = { filing_id: number; received_date: string | null; filterHits: number };
+
+export interface CompactDocumentRow {
   filing_id: number;
   case_number: string;
   docket_number: string | null;
@@ -167,9 +169,21 @@ const CASE_ROUTER_PART_READ_LIMIT = 1;
 const QUERY_YEAR_MATCH_WEIGHT = 0.9;
 const RECENCY_WEIGHT = 0.6;
 const RECENCY_SPAN_YEARS = 12;
+// Evidence budget sent to the model. Excerpt slots are filled round-robin, one
+// per filing, before any filing receives a second excerpt.
+export const EVIDENCE_ROW_BUDGET = 8;
+export const EVIDENCE_MAX_PER_DOCUMENT = 2;
 // Read enough distinct filings that a well-ranked but lower-placed document
 // still reaches the evidence set instead of being cut off by earlier hits.
-const COMPACT_DOCUMENT_GROUP_TARGET = 6;
+//
+// This MUST stay at or below EVIDENCE_ROW_BUDGET: round-robin gives the first
+// EVIDENCE_ROW_BUDGET filings a slot each, so any filing read beyond that can
+// never win one, and reading it only costs an R2 GET plus a full gzip decode.
+// Staying below the ceiling is also deliberate — it reserves slots for the
+// best-ranked filings to contribute a second excerpt, which keeps a table and
+// its surrounding discussion together instead of splitting them.
+// `retrieval budget invariant` in worker/index.test.ts enforces the bound.
+export const COMPACT_DOCUMENT_GROUP_TARGET = 6;
 const API_HEADERS = {
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff"
@@ -464,8 +478,8 @@ export function selectDiverseGlobalResults<T extends GlobalResultIdentity>(
 // evidence budget even when other filings answer the question better.
 export function selectDiverseDocumentResults<T extends GlobalResultIdentity>(
   groups: T[][],
-  maxPerDocument = 2,
-  totalLimit = 8
+  maxPerDocument = EVIDENCE_MAX_PER_DOCUMENT,
+  totalLimit = EVIDENCE_ROW_BUDGET
 ): T[] {
   const selected = new Map<string, T>();
   for (let depth = 0; depth < maxPerDocument; depth += 1) {
@@ -513,6 +527,22 @@ export function documentRankingScore(
   const ageYears = new Date(now).getUTCFullYear() - year;
   const freshness = Math.min(1, Math.max(0, 1 - ageYears / RECENCY_SPAN_YEARS));
   return score + RECENCY_WEIGHT * freshness;
+}
+
+// Shared by the Worker and the offline retrieval evaluation so that measured
+// ranking behaviour cannot drift from what production actually does.
+export function rankCompactCandidates<T extends RankableCandidate>(
+  candidates: T[],
+  queryYears: number[],
+  now = Date.now()
+): T[] {
+  const scoreOf = new Map(candidates.map(document => [
+    document.filing_id,
+    documentRankingScore(document.filterHits, document.received_date, queryYears, now)
+  ]));
+  return [...candidates].sort((left, right) =>
+    (scoreOf.get(right.filing_id) ?? 0) - (scoreOf.get(left.filing_id) ?? 0)
+    || String(right.received_date || "").localeCompare(String(left.received_date || "")));
 }
 
 function isOfficialPscUrl(value: string): boolean {
@@ -762,7 +792,7 @@ const STOP_WORDS = new Set([
   "in", "is", "it", "of", "or", "to"
 ]);
 
-function buildSearchTerms(message: string): string[] {
+export function buildSearchTerms(message: string): string[] {
   const quoted = Array.from(message.matchAll(/[“\"]([^”\"]{2,80})[”\"]/g), match => match[1]);
   const words = (quoted.join(" ") + " " + message)
     .toLowerCase()
@@ -957,7 +987,7 @@ async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<Cas
   };
 }
 
-function findPageExcerpts(
+export function findPageExcerpts(
   html: string,
   terms: string[],
   document: CompactDocumentRow,
@@ -1040,14 +1070,7 @@ async function searchCompactDocuments(
     }
     logChatStage(requestId, "d1-fallback", d1StartedAt, { caseNumber, queries: d1Queries });
   }
-  const candidates = Array.from(candidateMap.values());
-  const scoreOf = new Map(candidates.map(document => [
-    document.filing_id,
-    documentRankingScore(document.filterHits, document.received_date, queryYears)
-  ]));
-  candidates.sort((left, right) => (scoreOf.get(right.filing_id) ?? 0) - (scoreOf.get(left.filing_id) ?? 0)
-    || String(right.received_date || "").localeCompare(String(left.received_date || "")));
-
+  const candidates = rankCompactCandidates(Array.from(candidateMap.values()), queryYears);
   const selected = candidates.slice(0, maxDocumentReads);
   // Keep each filing's excerpts together so the evidence budget can be shared
   // across filings rather than filled by whichever document is read first.
@@ -1066,7 +1089,14 @@ async function searchCompactDocuments(
       return findPageExcerpts(html, terms, document, minimumTermMatches);
     }));
     excerptGroups.push(...batchRows.filter(group => group.length));
-    if (excerptGroups.length >= COMPACT_DOCUMENT_GROUP_TARGET) break;
+    if (excerptGroups.length >= COMPACT_DOCUMENT_GROUP_TARGET) {
+      // Reads run a batch at a time, so a batch can overshoot the target. Drop
+      // the surplus lowest-ranked filings: keeping them would fill every slot
+      // with a first excerpt and leave no room for the best-ranked filings to
+      // contribute a second one.
+      excerptGroups.length = COMPACT_DOCUMENT_GROUP_TARGET;
+      break;
+    }
   }
   const contentRows = selectDiverseDocumentResults(excerptGroups);
   logChatStage(requestId, "r2-documents", documentStartedAt, {

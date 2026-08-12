@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.json",
+  "comment": "The retrieval harness imports worker/index.ts, so it needs Workers types. Those conflict with the DOM lib the client project uses, hence a separate project.",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "types": ["node"]
+  },
+  "include": [
+    "./evaluate-retrieval.ts",
+    "../shared/compactSearch.ts",
+    "../worker/index.ts",
+    "../worker-configuration.d.ts"
+  ],
+  "exclude": []
+}

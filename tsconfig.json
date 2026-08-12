@@ -23,5 +23,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "exclude": ["worker", "worker-configuration.d.ts"]
+  "exclude": ["worker", "worker-configuration.d.ts", "scripts/evaluate-retrieval.ts"]
 }
