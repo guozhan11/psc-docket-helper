@@ -545,7 +545,7 @@ export default function App() {
 
         {/* Chatbot Section */}
         <section id="assistant" className="scroll-mt-20 py-8 bg-psc-light">
-          <div className="mx-auto w-full max-w-[1920px] px-4 sm:px-6 lg:px-8 2xl:px-0">
+          <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 xl:gap-10 items-start">
               {/* Info Sidebar */}
               <div className="order-2 lg:order-1 lg:col-span-4 xl:col-span-3">
