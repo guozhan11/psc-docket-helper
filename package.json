@@ -10,6 +10,7 @@
     "rag:publish-cloud": "tsx scripts/publish-cloud-rag.ts",
     "rag:metadata-cloud": "python3 scripts/metadata_r2_ingest.py --mode auto --all-shards --shard-count 4",
     "rag:router-cloud": "python3 scripts/build_case_router.py --shard-count 16",
+    "rag:term-index-cloud": "python3 scripts/build_term_index.py --shard-count 4096",
     "rag:ingest-shard-0-cloud": "python3 scripts/fast_r2_ingest.py --all --concurrency 4 --max-hours 5.25 --shard-index 0 --shard-count 4",
     "rag:ingest-d1-legacy": "python3 scripts/cloud_ingest.py --all --no-ocr",
     "build:client": "vite build",
