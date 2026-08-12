@@ -18,6 +18,7 @@ import {
   selectDiverseDocumentResults,
   selectDiverseGlobalResults
 } from './index.ts';
+import { inverseDocumentFrequency, termShard } from '../shared/termIndex.ts';
 
 test('OpenAI response stream parser returns only text deltas', () => {
   assert.equal(openAiStreamDelta('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}'), 'Hello');
@@ -135,6 +136,38 @@ test('document selection spreads evidence across filings before depth', () => {
   // Every filing contributes before any filing contributes a second excerpt.
   assert.deepEqual(selected.slice(0, 3).map(row => row.filing_id), [1, 2, 3]);
   assert.equal(new Set(selected.map(row => row.filing_id)).size, 3);
+});
+
+test('term shard assignment matches the builder golden vectors', () => {
+  // Shared with GOLDEN_SHARDS in scripts/test_term_index.py. A disagreement
+  // would not fail loudly — the Worker would read the wrong shard, find no
+  // postings, and quietly answer nothing — so both sides are pinned.
+  const golden: Record<string, number> = {
+    '2025': 3878,
+    uncollectible: 940,
+    pepco: 2924,
+    'o&m': 2847,
+    'rate-base': 2723,
+    commission: 1680,
+    "pepco's": 3910,
+    a: 2348,
+    zzz: 2205,
+    storm: 3990
+  };
+  for (const [term, expected] of Object.entries(golden)) {
+    assert.equal(termShard(term, 4096), expected, `shard drift for ${term}`);
+  }
+});
+
+test('inverse document frequency ranks a rare term above a ubiquitous one', () => {
+  const totalCases = 40_598;
+  // "commission" appears in almost every DC PSC filing; it must not be able to
+  // separate cases. This is what the Bloom router could not express.
+  const ubiquitous = inverseDocumentFrequency(39_000, totalCases);
+  const rare = inverseDocumentFrequency(12, totalCases);
+  assert.ok(rare > ubiquitous * 10);
+  assert.equal(inverseDocumentFrequency(0, totalCases), 0);
+  assert.equal(inverseDocumentFrequency(5, 0), 0);
 });
 
 test('filter fill ratio counts set bits', () => {
