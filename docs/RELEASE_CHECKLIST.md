@@ -31,6 +31,9 @@ Release threshold: no fabricated filing, page, quotation, date, or URL; 100% wor
 
 - `/api/health` returns HTTP 200 with `status: "ok"` and no issues.
 - Metadata and case-router timestamps are less than 36 hours old.
+- `termIndex.status` is `ready`, and `termIndex.cases` is close to `caseRouter.contentCases`. A much smaller number means a partial index — a canary run, or a build that stopped early — and the Worker prefers it over the router, so cross-case answers would cover less than the router did while claiming to cover everything.
+- A cross-case answer carries the exhaustive scope note; a case-specific answer carries none.
+- Chat request CPU time stays inside the Workers plan limit. Workers Free allows 10 ms per request and tolerates infrequent overruns, so a Worker that exceeds it under real traffic starts returning Error 1102. Check with `npx wrangler tail psc-docket-assistant --format json` while submitting a cross-case question.
 - Turnstile is enabled and a real browser submission succeeds.
 - Reusing a Turnstile token fails.
 - More than 30 chat submissions from one test browser within a minute receives HTTP 429.
