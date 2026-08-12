@@ -14,6 +14,7 @@ import {
   openAiRequestPayload,
   openAiStreamDelta,
   parseChatRequestBody,
+  answerSuffix,
   readR2JsonWithRetry,
   routeCasesByTermIndex,
   selectDiverseDocumentResults,
@@ -360,4 +361,30 @@ test('term index routing keeps a rare-term match a ubiquitous term would hide', 
   assert.ok(routed);
   // FC1184 matches one term and outranks cases matching only the common term.
   assert.equal(routed[0].caseNumber, 'FC1184');
+});
+
+test('scope note describes exhaustive routing only when it happened', () => {
+  const row = (routing?: 'exhaustive' | 'sampled') => ({
+    filing_id: 1,
+    case_number: 'FC1176',
+    docket_number: null,
+    title: 'Filing',
+    received_date: '2025-01-01T00:00:00',
+    official_pdf_url: 'https://edocket.dcpsc.org/apis/api/Filing/download?attachId=1&guidFileName=a.pdf',
+    page_number: 1,
+    text: 'excerpt',
+    rank: -1,
+    ...(routing ? { routing } : {})
+  });
+  const exhaustive = answerSuffix('which cases discuss bad debt', 'reply', [row('exhaustive')]);
+  assert.match(exhaustive, /Every indexed case was searched/);
+
+  const sampled = answerSuffix('which cases discuss bad debt', 'reply', [row('sampled')]);
+  assert.match(sampled, /scans a sample of the indexed cases/);
+
+  // Nothing proves the exhaustive path ran, so claim the narrower scope.
+  assert.match(answerSuffix('which cases discuss bad debt', 'reply', []), /scans a sample/);
+
+  // A case-specific question carries no scope note at all.
+  assert.doesNotMatch(answerSuffix('what happened in FC1176', 'reply', [row('exhaustive')]), /Search scope/);
 });

@@ -47,6 +47,12 @@ export interface SearchRow {
   text: string;
   rank: number;
   evidence_kind?: "content" | "metadata";
+  /**
+   * How the case was reached. Cross-case answers carry a scope note, and the
+   * note has to describe what actually happened: the inverted index covers
+   * every case, the Bloom router samples one partition of sixteen.
+   */
+  routing?: "exhaustive" | "sampled";
 }
 
 type GlobalResultIdentity = Pick<SearchRow, "case_number" | "filing_id" | "page_number">;
@@ -1417,8 +1423,9 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
       // The inverted index covers every case; the Bloom router samples one of
       // sixteen partitions. Prefer the index and keep the router as a fallback
       // until the index has been published for the whole corpus.
-      const routedCases = await routeCasesByTermIndex(env, terms, requestId)
-        ?? await routeCases(env, terms, requestId);
+      const termIndexRouted = await routeCasesByTermIndex(env, terms, requestId);
+      const routedCases = termIndexRouted ?? await routeCases(env, terms, requestId);
+      const routing = termIndexRouted ? "exhaustive" as const : "sampled" as const;
       const routedGroups: SearchRow[][] = [];
       for (const candidate of routedCases.slice(0, CASE_ROUTER_VERIFIED_CASES)) {
         const rows = await searchCompactDocuments(
@@ -1436,7 +1443,7 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
       }
       const routedRows = selectDiverseGlobalResults(routedGroups);
       if (routedRows.length) {
-        return routedRows;
+        return routedRows.map(row => ({ ...row, routing }));
       }
     } catch (error) {
       console.error(JSON.stringify({
@@ -1525,14 +1532,21 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
   };
 }
 
-function answerSuffix(message: string, reply: string, rows: SearchRow[]): string {
+export function answerSuffix(message: string, reply: string, rows: SearchRow[]): string {
   const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
   // Cross-case routing reads one of the router's sixteen partitions, so it
   // examines a fraction of indexed cases rather than all of them. Say so
   // plainly: "relevance-ranked matches from the indexed corpus" reads as a
   // full-corpus ranking, and a reader deciding which proceedings matter would
   // be misled by it.
-  const scopeNote = extractCaseIdentifier(message) ? "" : "\n\n> **Search scope:** Cross-case search scans a sample of the indexed cases, not the whole corpus, and the sample shifts with how the question is worded. Relevant proceedings may be missing entirely. Treat these as leads, then confirm by asking about a specific case number or by searching the official e-Docket directly.";
+  // Default to the narrower claim: with no rows there is nothing to prove the
+  // exhaustive path ran, and overstating coverage is the worse error.
+  const exhaustive = rows.some(row => row.routing === "exhaustive");
+  const scopeNote = extractCaseIdentifier(message)
+    ? ""
+    : exhaustive
+      ? "\n\n> **Search scope:** Every indexed case was searched for your terms. Ranking favours rarer, more distinctive terms. Filings still being indexed, and filings whose text could not be extracted, are not covered."
+      : "\n\n> **Search scope:** Cross-case search scans a sample of the indexed cases, not the whole corpus, and the sample shifts with how the question is worded. Relevant proceedings may be missing entirely. Treat these as leads, then confirm by asking about a specific case number or by searching the official e-Docket directly.";
   const replyReportsInsufficientEvidence = /\b(?:no|insufficient|not enough)\s+(?:matching\s+)?evidence\b|\bcould(?:n['’]t| not)\s+find\b/i.test(reply);
   if (replyReportsInsufficientEvidence || !sources.length) return scopeNote;
   return `${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>

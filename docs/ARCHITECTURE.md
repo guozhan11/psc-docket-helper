@@ -29,6 +29,16 @@ Evidence slots are then filled round-robin across filings rather than depth-firs
 
 Ground truth comes from the corpus rather than from labels: the Bloom filter reports that a term may be present, while the stored text says whether it is. Two cautions apply. Metrics built on term counts are confounded by length, because longer filings genuinely contain more distinct terms, so they cannot validate a change intended to remove a length bias. Year coverage does not carry that confound. Term evidence is also not topical relevance — a filing can contain every query term without answering the question — so deciding between rankings that score alike still needs relevance judgements the evaluation set does not yet carry.
 
+## Inverted Term Index
+
+The case router stores case to terms, so answering "which cases contain these terms?" means testing every case. That costs time proportional to the corpus, which is why the Worker read one of sixteen router partitions and covered roughly a sixteenth of indexed cases — with the partition chosen by a hash of the query terms, so rewording a question moved the search to a different slice.
+
+The inverted index stores the opposite direction: term to the cases containing it. A question reads only the shards holding its own terms, so the cost follows the question rather than the corpus, and every case is covered. Terms are assigned to 4,096 shards by hash. `scripts/build_term_index.py` writes them; `shared/termIndex.ts` holds the format both sides depend on, with shard assignment pinned to golden vectors in both test suites because a disagreement would fail silently rather than loudly.
+
+Each posting list carries its document frequency, which gives inverse document frequency ranking. This is what the Bloom filters could not express: they counted a hit on a term appearing in nearly every filing the same as a hit on a rare one, so questions built mostly from common words left a large block of cases tied at the top, with filing dates left to break the tie. Terms above 15 percent document frequency keep their frequency for ranking but drop their posting lists, since they cannot separate one case from another.
+
+Cross-case answers carry a scope note describing the path actually taken, so the note narrows automatically when the Worker falls back to the router. Generations publish into alternating slots and the index object is written last, so readers only ever see a complete generation.
+
 ## Compact Index Design
 
 The initial design duplicated full filing text in D1 and used FTS5. The next compact design moved text to R2 and retained per-filing filters in D1. The current fast-backfill design also moves those filters into four compressed R2 manifest parts per case, removing D1's daily write quota from the historical ingestion path while allowing safe parallel writers. Existing FC1176 D1 data and version-1 R2 manifests remain available as compatibility fallbacks.

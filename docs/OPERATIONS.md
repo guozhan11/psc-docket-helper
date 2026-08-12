@@ -73,6 +73,18 @@ To build or refresh metadata locally:
 npm run rag:metadata-cloud
 ```
 
+## Term Index
+
+The `Build term index` workflow rebuilds the inverted index that serves cross-case questions. It runs weekly, on its own schedule rather than inside ingestion: a full pass reads every stored document, and the ingestion jobs are already sized against GitHub's six-hour job limit. Weekly rather than daily because each run rewrites every shard and R2 bills Class A operations past one million per month, while the corpus barely moves between runs. It uses the same four secrets as ingestion.
+
+Run it by hand from the Actions tab. `limit` caps how many cases are indexed — use a small number for a canary before a full pass — and `concurrency` sets how many documents are fetched in parallel; a full pass is roughly 200,000 R2 round trips, so a serial run does not finish inside the job limit.
+
+```bash
+npm run rag:term-index-cloud
+```
+
+Until an index has been published for the whole corpus, the Worker falls back to the case router and says so in the scope note attached to cross-case answers. `/api/health` reports `termIndex.status` as `not-published`, `ready`, or `stale`. A partial index — for example one left by a canary run — is still served in preference to the router, so follow a canary with a full pass before deploying a Worker that reads it.
+
 To rebuild the global router locally after manifests change:
 
 ```bash
