@@ -313,3 +313,37 @@ class BuildIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShrinkGuardTests(unittest.TestCase):
+    """A limited run must not quietly replace a full index."""
+
+    def _seeded(self, count):
+        from build_term_index import build
+
+        r2 = FakeR2()
+        _seed(r2, {f"FC{2000 + i}": {str(i): f"storm term{i}"} for i in range(count)})
+        return r2, build(r2, "bucket", 64, 0, 0)
+
+    def test_refuses_to_publish_a_much_smaller_index(self):
+        from build_term_index import build
+
+        r2, first = self._seeded(40)
+        self.assertEqual(first["cases"], 40)
+        # A canary-sized run over the same bucket: the Worker prefers any
+        # published index, so this would narrow coverage while answers still
+        # claim every case was searched.
+        with self.assertRaises(RuntimeError) as caught:
+            build(r2, "bucket", 64, 5, 0)
+        self.assertIn("Refusing to publish", str(caught.exception))
+        # The live index is untouched.
+        published = json.loads(r2.objects[TERM_INDEX_KEY_NAME])
+        self.assertEqual(published["cases"], 40)
+        self.assertEqual(published["generation"], first["generation"])
+
+    def test_allow_shrink_overrides_the_guard(self):
+        from build_term_index import build
+
+        r2, _ = self._seeded(40)
+        smaller = build(r2, "bucket", 64, 5, 0, 1, True)
+        self.assertEqual(smaller["cases"], 5)

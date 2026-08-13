@@ -290,6 +290,7 @@ def build(
     limit: int,
     progress_every: int,
     concurrency: int = 1,
+    allow_shrink: bool = False,
 ) -> dict[str, Any]:
     grouped = manifest_keys_by_case(r2, bucket)
     if not grouped:
@@ -313,6 +314,18 @@ def build(
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+    # The Worker prefers any published index over the case router, so replacing
+    # a full index with a limited one silently narrows cross-case coverage while
+    # answers still claim every case was searched. Refuse rather than publish it.
+    if previous and not allow_shrink:
+        previous_cases = int(previous.get("cases") or 0)
+        if previous_cases and cases_written < previous_cases * 0.5:
+            raise RuntimeError(
+                f"Refusing to publish {cases_written:,} cases over an existing "
+                f"index of {previous_cases:,}. Re-run without --limit, or pass "
+                "--allow-shrink if the corpus really did shrink."
+            )
 
     index = {
         "version": TERM_INDEX_VERSION,
@@ -347,6 +360,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Only index the first N cases")
     parser.add_argument("--progress-every", type=int, default=250)
     parser.add_argument("--concurrency", type=int, default=8, help="Parallel R2 readers")
+    parser.add_argument(
+        "--allow-shrink",
+        action="store_true",
+        help="Publish even if the new index covers far fewer cases than the current one",
+    )
     args = parser.parse_args()
     if not 64 <= args.shard_count <= 16384:
         raise RuntimeError("--shard-count must be between 64 and 16384")
@@ -362,7 +380,13 @@ def main() -> None:
         region_name="auto",
     )
     index = build(
-        r2, bucket, args.shard_count, args.limit, args.progress_every, args.concurrency
+        r2,
+        bucket,
+        args.shard_count,
+        args.limit,
+        args.progress_every,
+        args.concurrency,
+        args.allow_shrink,
     )
     print(
         "Term index complete: "
