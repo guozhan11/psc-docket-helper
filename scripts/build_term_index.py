@@ -24,7 +24,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +42,9 @@ MAX_DOCUMENT_FREQUENCY = 0.15
 # resemble production. Against the real corpus the share is ~6,000 and this
 # floor never binds.
 MIN_DOCUMENT_FREQUENCY_CAP = 32
+# Postings interleave each case with the number of its documents holding the
+# term. Readers that predate this fall back to treating every posting as one.
+POSTING_FORMAT = "case-tf"
 MAX_COMPRESSED_SHARD_BYTES = 8 * 1024 * 1024
 STATE_KEY = f"term-index/v{TERM_INDEX_VERSION}/build-state.json"
 
@@ -98,8 +101,14 @@ def load_gzip_json(r2: Any, bucket: str, key: str) -> Any:
     return json.loads(gzip.decompress(response["Body"].read()))
 
 
-def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> set[str]:
-    """Union of terms across every stored document in one case."""
+def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> Counter[str]:
+    """Terms in one case, counted by how many of its documents contain each.
+
+    Presence alone cannot rank within a match set: IDF is a per-term constant,
+    so every case holding the same terms scores identically. The document count
+    is what separates a case that discusses a topic throughout from one that
+    mentions it once.
+    """
     seen_r2_keys: set[str] = set()
     for manifest_key in manifest_keys:
         try:
@@ -111,7 +120,7 @@ def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> set[str]:
             if isinstance(r2_key, str) and r2_key:
                 seen_r2_keys.add(r2_key)
 
-    terms: set[str] = set()
+    counts: Counter[str] = Counter()
     for r2_key in sorted(seen_r2_keys):
         try:
             response = r2.get_object(Bucket=bucket, Key=r2_key)
@@ -119,8 +128,8 @@ def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> set[str]:
             document_html = gzip.decompress(raw).decode("utf-8", "replace")
         except Exception:
             continue
-        terms |= document_terms(document_html)
-    return terms
+        counts.update(document_terms(document_html))
+    return counts
 
 
 def write_postings(
@@ -162,10 +171,10 @@ def write_postings(
                     if not terms:
                         continue
                     cases_written += 1
-                    for term in terms:
+                    for term, documents_with_term in terms.items():
                         shard = term_shard(term, shard_count)
                         handles[shard % INTERMEDIATE_BUCKETS].write(
-                            f"{shard}\t{term}\t{case_number}\n"
+                            f"{shard}\t{term}\t{case_number}\t{documents_with_term}\n"
                         )
                         postings += 1
                 scanned = min(start + batch_size, len(ordered))
@@ -198,28 +207,37 @@ def publish_shards(
 
     for bucket_index in range(INTERMEDIATE_BUCKETS):
         path = work_dir / f"bucket-{bucket_index:03d}.txt"
-        by_shard: dict[int, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+        by_shard: dict[int, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(dict))
         if path.exists():
             with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
-                    shard_text, _, rest = line.rstrip("\n").partition("\t")
-                    term, _, case_number = rest.partition("\t")
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) != 4:
+                        continue
+                    shard_text, term, case_number, count_text = parts
                     if not term or not case_number:
                         continue
-                    by_shard[int(shard_text)][term].append(case_number)
+                    try:
+                        count = int(count_text)
+                    except ValueError:
+                        continue
+                    by_shard[int(shard_text)][term][case_number] = count
 
         for shard_index in range(bucket_index, shard_count, INTERMEDIATE_BUCKETS):
             terms_payload: dict[str, list[Any]] = {}
-            for term, cases in by_shard.get(shard_index, {}).items():
-                unique_cases = sorted(set(cases))
-                frequency = len(unique_cases)
+            for term, case_counts in by_shard.get(shard_index, {}).items():
+                frequency = len(case_counts)
                 total_terms += 1
                 if frequency > frequency_cap:
                     # Keep the frequency so IDF still works, drop the postings:
                     # a term this common cannot separate one case from another.
                     terms_payload[term] = [frequency]
                     continue
-                terms_payload[term] = [frequency, *unique_cases]
+                interleaved: list[Any] = [frequency]
+                for case_number in sorted(case_counts):
+                    interleaved.append(case_number)
+                    interleaved.append(case_counts[case_number])
+                terms_payload[term] = interleaved
                 kept_postings += frequency
 
             payload = {
@@ -227,6 +245,7 @@ def publish_shards(
                 "generation": generation,
                 "shardIndex": shard_index,
                 "shardCount": shard_count,
+                "postingFormat": POSTING_FORMAT,
                 "terms": terms_payload,
             }
             body = gzip.compress(
@@ -307,6 +326,7 @@ def build(
         "postings": kept_postings,
         "scannedPostings": postings,
         "compressedBytes": compressed_bytes,
+        "postingFormat": POSTING_FORMAT,
         "shardKeyPrefix": f"term-index/v{TERM_INDEX_VERSION}/slots/{slot}/",
     }
     # The index object is written last, so readers only ever see a complete

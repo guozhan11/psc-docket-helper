@@ -22,6 +22,19 @@ export const TERM_INDEX_KEY = `term-index/v${TERM_INDEX_VERSION}/index.json`;
  */
 export const TERM_INDEX_MAX_DOCUMENT_FREQUENCY = 0.15;
 
+/**
+ * How posting lists encode their cases.
+ *
+ * "case" lists case numbers only. It cannot rank within a match set: IDF is a
+ * per-term constant, so every case holding the same terms scores identically
+ * and the order falls back to whatever the tie-break is.
+ *
+ * "case-tf" interleaves each case with the number of its documents containing
+ * the term, which is what separates a case that discusses a topic throughout
+ * from one that mentions it once.
+ */
+export type TermPostingFormat = "case" | "case-tf";
+
 export interface TermIndexManifest {
   version: number;
   generation: string;
@@ -34,6 +47,8 @@ export interface TermIndexManifest {
   postings: number;
   compressedBytes: number;
   shardKeyPrefix: string;
+  /** Absent on the first published generation, which was "case". */
+  postingFormat?: TermPostingFormat;
 }
 
 /** One shard: term -> document frequency and the cases holding it. */
@@ -47,7 +62,8 @@ export interface TermIndexShard {
    * cap stores its frequency with no case list, so IDF still works while the
    * postings stay out of the index.
    */
-  terms: Record<string, [number, ...string[]]>;
+  terms: Record<string, [number, ...(string | number)[]]>;
+  postingFormat?: TermPostingFormat;
 }
 
 /** FNV-1a. Matches term_shard() in scripts/build_term_index.py. */
@@ -73,4 +89,35 @@ export function termIndexShardKey(slot: string, shardIndex: number, shardCount =
 export function inverseDocumentFrequency(documentFrequency: number, totalCases: number): number {
   if (documentFrequency <= 0 || totalCases <= 0) return 0;
   return Math.max(0, Math.log((totalCases + 1) / (documentFrequency + 1)));
+}
+
+/**
+ * Sublinear term frequency. A case with twenty filings on a topic outranks one
+ * with two, but not ten times over — filing counts vary for reasons unrelated
+ * to how central the topic is.
+ */
+export function termFrequencyWeight(documentsWithTerm: number): number {
+  if (documentsWithTerm <= 0) return 0;
+  return 1 + Math.log(documentsWithTerm);
+}
+
+/** Walks a posting list in either format, yielding each case and its weight. */
+export function* postingEntries(
+  entry: readonly (string | number)[],
+  format: TermPostingFormat
+): Generator<{ caseNumber: string; documentsWithTerm: number }> {
+  const body = entry.slice(1);
+  if (format === "case-tf") {
+    for (let index = 0; index + 1 < body.length; index += 2) {
+      const caseNumber = body[index];
+      const count = Number(body[index + 1]);
+      if (typeof caseNumber === "string" && Number.isFinite(count)) {
+        yield { caseNumber, documentsWithTerm: count };
+      }
+    }
+    return;
+  }
+  for (const caseNumber of body) {
+    if (typeof caseNumber === "string") yield { caseNumber, documentsWithTerm: 1 };
+  }
 }

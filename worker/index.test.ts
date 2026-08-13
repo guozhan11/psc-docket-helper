@@ -24,6 +24,8 @@ import { gzipSync } from 'node:zlib';
 import {
   TERM_INDEX_KEY,
   inverseDocumentFrequency,
+  postingEntries,
+  termFrequencyWeight,
   termIndexShardKey,
   termShard
 } from '../shared/termIndex.ts';
@@ -387,4 +389,46 @@ test('scope note describes exhaustive routing only when it happened', () => {
 
   // A case-specific question carries no scope note at all.
   assert.doesNotMatch(answerSuffix('what happened in FC1176', 'reply', [row('exhaustive')]), /Search scope/);
+});
+
+test('term frequency separates cases that IDF alone ties', () => {
+  // IDF is constant per term, so two cases holding the same terms score alike.
+  // Document counts are what tell a case discussing a topic throughout from one
+  // that mentions it once.
+  assert.ok(termFrequencyWeight(20) > termFrequencyWeight(2));
+  // Sublinear: ten times the filings is not ten times the relevance.
+  assert.ok(termFrequencyWeight(20) < termFrequencyWeight(2) * 10);
+  assert.equal(termFrequencyWeight(1), 1);
+  assert.equal(termFrequencyWeight(0), 0);
+});
+
+test('posting lists are read in both published formats', () => {
+  const withCounts = [2, 'FC1176', 7, 'FC1184', 1];
+  assert.deepEqual([...postingEntries(withCounts, 'case-tf')], [
+    { caseNumber: 'FC1176', documentsWithTerm: 7 },
+    { caseNumber: 'FC1184', documentsWithTerm: 1 }
+  ]);
+  // The first generation stored case numbers only; each counts as one document
+  // so an older index stays readable instead of being rejected.
+  const namesOnly = [2, 'FC1176', 'FC1184'];
+  assert.deepEqual([...postingEntries(namesOnly, 'case')], [
+    { caseNumber: 'FC1176', documentsWithTerm: 1 },
+    { caseNumber: 'FC1184', documentsWithTerm: 1 }
+  ]);
+});
+
+test('term index routing ranks by term frequency within a match set', async () => {
+  const manifest = { ...TERM_INDEX_MANIFEST, postingFormat: 'case-tf' };
+  const env = termIndexEnv(manifest, {
+    940: {
+      ...shardFor({}, 940),
+      postingFormat: 'case-tf',
+      terms: { uncollectible: [3, 'FC1176', 1, 'FC1184', 12, 'FC9999', 4] }
+    }
+  });
+  const routed = await routeCasesByTermIndex(env, ['uncollectible'], 'tf1');
+  assert.ok(routed);
+  // Same term, same IDF: only the document counts can order these.
+  assert.deepEqual(routed.map(row => row.caseNumber), ['FC1184', 'FC9999', 'FC1176']);
+  assert.ok(routed[0].filterScore > routed[2].filterScore);
 });

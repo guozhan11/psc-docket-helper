@@ -33,10 +33,13 @@ import { buildSearchTerms } from '../worker/index.ts';
 import {
   TERM_INDEX_KEY,
   inverseDocumentFrequency,
+  postingEntries,
+  termFrequencyWeight,
   termIndexShardKey,
   termShard,
   type TermIndexManifest,
-  type TermIndexShard
+  type TermIndexShard,
+  type TermPostingFormat
 } from '../shared/termIndex.ts';
 
 const BUCKET = process.env.R2_BUCKET_NAME || 'psc-docket-assistant-documents';
@@ -80,6 +83,7 @@ interface Routed {
 
 function route(manifest: TermIndexManifest, terms: string[]): Routed {
   const wanted = terms.slice(0, MAX_QUERY_TERMS);
+  const format: TermPostingFormat = manifest.postingFormat === 'case-tf' ? 'case-tf' : 'case';
   const scores = new Map<string, { score: number; hits: number }>();
   const discriminating: string[] = [];
   const capped: string[] = [];
@@ -96,18 +100,17 @@ function route(manifest: TermIndexManifest, terms: string[]): Routed {
       continue;
     }
     const documentFrequency = Number(entry[0]) || 0;
-    const cases = entry.slice(1) as string[];
-    if (!cases.length) {
+    if (entry.length < 2) {
       capped.push(term);
       continue;
     }
     discriminating.push(term);
     const weight = inverseDocumentFrequency(documentFrequency, manifest.cases);
-    for (const caseNumber of cases) {
-      const current = scores.get(caseNumber) ?? { score: 0, hits: 0 };
-      current.score += weight;
+    for (const posting of postingEntries(entry, format)) {
+      const current = scores.get(posting.caseNumber) ?? { score: 0, hits: 0 };
+      current.score += weight * termFrequencyWeight(posting.documentsWithTerm);
       current.hits += 1;
-      scores.set(caseNumber, current);
+      scores.set(posting.caseNumber, current);
     }
   }
 
@@ -183,7 +186,8 @@ const results = questions.map(question => {
 if (json) {
   console.log(JSON.stringify({ manifest: { cases: manifest.cases, generation: manifest.generation }, results }, null, 2));
 } else {
-  console.log(`Term index: ${manifest.cases.toLocaleString()} cases, generation ${manifest.generation}\n`);
+  console.log(`Term index: ${manifest.cases.toLocaleString()} cases, `
+    + `posting format ${manifest.postingFormat ?? 'case'}, generation ${manifest.generation}\n`);
   for (const result of results) {
     console.log(`${result.id} [${result.category}] ${result.question}`);
     console.log(`  terms: ${result.terms.join(', ') || '(none)'}`);

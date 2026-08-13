@@ -3,10 +3,13 @@ import {
   TERM_INDEX_KEY,
   TERM_INDEX_VERSION,
   inverseDocumentFrequency,
+  postingEntries,
+  termFrequencyWeight,
   termIndexShardKey,
   termShard,
   type TermIndexManifest,
-  type TermIndexShard
+  type TermIndexShard,
+  type TermPostingFormat
 } from "../shared/termIndex.ts";
 
 type WorkerEnv = Env & {
@@ -990,6 +993,9 @@ export async function routeCasesByTermIndex(
   }
 
   const scores = new Map<string, { score: number; hits: number }>();
+  // The first published generation stored case numbers only; treat its
+  // postings as one document each rather than refusing to read it.
+  const format: TermPostingFormat = manifest.postingFormat === "case-tf" ? "case-tf" : "case";
   let shardsRead = 0;
   let cappedTerms = 0;
   const shardEntries = Array.from(shardTerms.entries());
@@ -1026,8 +1032,7 @@ export async function routeCasesByTermIndex(
       const entry = result.payload.terms[term];
       if (!Array.isArray(entry) || !entry.length) continue;
       const documentFrequency = Number(entry[0]) || 0;
-      const cases = entry.slice(1) as string[];
-      if (!cases.length) {
+      if (entry.length < 2) {
         // Above the frequency cap: kept for its frequency, no postings. Such a
         // term appears nearly everywhere and cannot separate cases.
         cappedTerms += 1;
@@ -1035,12 +1040,14 @@ export async function routeCasesByTermIndex(
       }
       const weight = inverseDocumentFrequency(documentFrequency, manifest.cases);
       if (weight <= 0) continue;
-      for (const caseNumber of cases) {
-        if (typeof caseNumber !== "string") continue;
-        const current = scores.get(caseNumber) ?? { score: 0, hits: 0 };
-        current.score += weight;
+      // IDF alone cannot order a match set — it is constant per term, so every
+      // case holding the same terms scores alike. Term frequency is what
+      // separates them.
+      for (const posting of postingEntries(entry, format)) {
+        const current = scores.get(posting.caseNumber) ?? { score: 0, hits: 0 };
+        current.score += weight * termFrequencyWeight(posting.documentsWithTerm);
         current.hits += 1;
-        scores.set(caseNumber, current);
+        scores.set(posting.caseNumber, current);
       }
     }
   }
@@ -1073,6 +1080,7 @@ export async function routeCasesByTermIndex(
     totalShards: manifest.shardCount,
     terms: wanted.length,
     cappedTerms,
+    postingFormat: format,
     matchedCases: scores.size,
     candidates: candidates.length
   });
