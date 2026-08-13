@@ -1905,6 +1905,9 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
           terms: termIndexPayload.terms,
           postings: termIndexPayload.postings,
           compressedBytes: termIndexPayload.compressedBytes,
+          // Determines whether ranking can order a match set at all: without
+          // term frequencies every case holding the same terms scores alike.
+          postingFormat: termIndexPayload.postingFormat ?? "case",
           coverage: "all-cases"
         }
       : { status: "not-published", coverage: "case-router-sample" };
