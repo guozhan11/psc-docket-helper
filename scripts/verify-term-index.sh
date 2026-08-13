@@ -68,9 +68,16 @@ for term in terms:
         print(f"  MISS {term!r}: shard {shard} holds no entry (term absent from corpus, or shard drift)")
         failures += 1
         continue
-    frequency, *cases = entry
-    shown = ", ".join(cases[:5]) if cases else "(above frequency cap, postings dropped)"
-    print(f"  OK   {term!r}: {frequency:,} cases -> {shown}")
+    frequency, *body = entry
+    fmt = payload.get("postingFormat") or index.get("postingFormat") or "case"
+    if fmt == "case-tf":
+        pairs = [(body[i], body[i + 1]) for i in range(0, len(body) - 1, 2)]
+        shown = ", ".join(f"{case} x{count}" for case, count in pairs[:5])
+    else:
+        shown = ", ".join(str(case) for case in body[:5])
+    if not body:
+        shown = "(above frequency cap, postings dropped)"
+    print(f"  OK   {term!r} [{fmt}]: {frequency:,} cases -> {shown}")
 
 print()
 if failures:
