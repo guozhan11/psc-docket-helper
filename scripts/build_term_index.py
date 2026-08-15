@@ -61,6 +61,11 @@ MANIFEST_KEY_PATTERN = re.compile(
     r"^manifests-v2/([A-Z][A-Z0-9-]{2,30})/part-\d+-of-\d+\.json\.gz$"
 )
 TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9'-]{1,39}")
+# Must match stemTerm() in shared/termIndex.ts. The stem is always a prefix of
+# the word it came from, which is what lets the Worker verify excerpts with a
+# plain substring match instead of needing morphology at read time.
+MIN_STEM_LENGTH = 5
+STEM_SUFFIXES = ("ations", "ation", "ions", "ing", "ion", "ed", "es", "s")
 TAG_PATTERN = re.compile(r"<[^>]*>")
 
 
@@ -87,10 +92,28 @@ def shard_key(slot: str, shard_index: int, shard_count: int) -> str:
     )
 
 
+def stem_term(term: str) -> str:
+    """Prefix-preserving stem. Must match stemTerm() in shared/termIndex.ts."""
+    word = term.lower()
+    if len(word) <= MIN_STEM_LENGTH:
+        return word
+    for suffix in STEM_SUFFIXES:
+        if not word.endswith(suffix):
+            continue
+        stem = word[: len(word) - len(suffix)]
+        if len(stem) >= MIN_STEM_LENGTH:
+            return stem
+    return word
+
+
 def document_terms(document_html: str) -> set[str]:
-    """Distinct terms in stored page HTML, tokenized as the filters are."""
+    """Distinct stems in stored page HTML, tokenized as the filters are.
+
+    Indexing the stem is what lets a question about "disconnections" reach a
+    filing that only ever wrote "disconnection".
+    """
     text = html.unescape(TAG_PATTERN.sub(" ", document_html))
-    return set(TOKEN_PATTERN.findall(text.lower()))
+    return {stem_term(token) for token in TOKEN_PATTERN.findall(text.lower())}
 
 
 def manifest_keys_by_case(r2: Any, bucket: str) -> dict[str, list[str]]:

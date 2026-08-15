@@ -370,3 +370,36 @@ class ShrinkGuardTests(unittest.TestCase):
         r2, _ = self._seeded(40)
         smaller = build(r2, "bucket", 64, 5, 0, 1, True)
         self.assertEqual(smaller["cases"], 5)
+
+
+class StemTests(unittest.TestCase):
+    """Both sides must stem identically or the Worker reads the wrong shard."""
+
+    def test_inflections_collapse_to_one_stem(self) -> None:
+        from build_term_index import stem_term
+
+        stem = stem_term("disconnect")
+        for word in ("disconnections", "disconnection", "disconnected"):
+            self.assertEqual(stem_term(word), stem)
+            # Verification is a substring match, so the stem must stay a prefix.
+            self.assertTrue(word.startswith(stem))
+
+    def test_short_words_survive_stemming(self) -> None:
+        from build_term_index import stem_term
+
+        for word in ("rates", "gas", "storm"):
+            self.assertEqual(stem_term(word), word)
+
+    def test_matches_worker_golden_stems(self) -> None:
+        from build_term_index import stem_term
+
+        # Shared with worker/index.test.ts.
+        golden = {
+            "disconnections": "disconnect",
+            "reporting": "report",
+            "arrearages": "arrearag",
+            "rates": "rates",
+            "compliance": "compliance",
+        }
+        for word, expected in golden.items():
+            self.assertEqual(stem_term(word), expected, f"stem drift for {word!r}")

@@ -21,6 +21,9 @@ import {
   parseFeedbackRequestBody,
   answerSuffix,
   createCitationRelinker,
+  documentReadBudget,
+  isFollowUpQuestion,
+  recentlyCitedCases,
   relinkBareCitations,
   readR2JsonWithRetry,
   routeCasesByTermIndex,
@@ -33,6 +36,7 @@ import {
   TERM_INDEX_KEY,
   inverseDocumentFrequency,
   postingEntries,
+  stemTerm,
   termFrequencyWeight,
   termIndexShardKey,
   termShard
@@ -378,8 +382,28 @@ const TERM_INDEX_MANIFEST = {
   shardKeyPrefix: 'term-index/v1/slots/a/'
 };
 
-function shardFor(terms: Record<string, [number, ...string[]]>, shardIndex: number) {
-  return { version: 1, generation: 'g1', shardIndex, shardCount: 4096, terms };
+/**
+ * Builds a shard the way the builder does: keyed by stem, in the stem's shard.
+ * Keying fixtures by the raw word would let routing and the index drift apart
+ * without a test noticing.
+ */
+function shardForTerm(term: string, entry: (number | string)[], extra: Record<string, unknown> = {}) {
+  const stem = stemTerm(term);
+  return {
+    shardIndex: termShard(stem, 4096),
+    payload: {
+      version: 1,
+      generation: 'g1',
+      shardIndex: termShard(stem, 4096),
+      shardCount: 4096,
+      terms: { [stem]: entry },
+      ...extra
+    }
+  };
+}
+
+function shardsFor(...built: ReturnType<typeof shardForTerm>[]) {
+  return Object.fromEntries(built.map(item => [item.shardIndex, item.payload]));
 }
 
 test('term index routing yields to the case router when unpublished', async () => {
@@ -389,17 +413,19 @@ test('term index routing yields to the case router when unpublished', async () =
 });
 
 test('term index routing falls back when a shard is from a superseded generation', async () => {
-  const stale = { ...shardFor({ uncollectible: [2, 'FC1176'] }, 940), generation: 'g0' };
-  const env = termIndexEnv(TERM_INDEX_MANIFEST, { 940: stale });
+  const built = shardForTerm('uncollectible', [2, 'FC1176']);
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
+    [built.shardIndex]: { ...built.payload, generation: 'g0' }
+  });
   assert.equal(await routeCasesByTermIndex(env, ['uncollectible'], 'r2'), null);
 });
 
 test('term index routing rejects partial results when one query shard is missing', async () => {
-  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
-    940: shardFor({ uncollectible: [2, 'FC1176'] }, 940)
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, shardsFor(
+    shardForTerm('uncollectible', [2, 'FC1176'])
     // The shard for "storm" is intentionally absent. Returning FC1176 from
     // only the first shard would overstate the search as exhaustive.
-  });
+  ));
   assert.equal(
     await routeCasesByTermIndex(env, ['uncollectible', 'storm'], 'r-partial'),
     null
@@ -407,10 +433,10 @@ test('term index routing rejects partial results when one query shard is missing
 });
 
 test('term index routing ranks a rare term above a common one', async () => {
-  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
-    940: shardFor({ uncollectible: [2, 'FC1176', 'FC1184'] }, 940),
-    1680: shardFor({ commission: [30_000, 'FC1176', 'FC9999'] }, 1680)
-  });
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, shardsFor(
+    shardForTerm('uncollectible', [2, 'FC1176', 'FC1184']),
+    shardForTerm('commission', [30_000, 'FC1176', 'FC9999'])
+  ));
   const routed = await routeCasesByTermIndex(env, ['uncollectible', 'commission'], 'r3');
   assert.ok(routed);
   // FC1176 matches both terms; FC1184 matches only the rare one but must still
@@ -420,11 +446,11 @@ test('term index routing ranks a rare term above a common one', async () => {
 });
 
 test('term index routing drops postings-free entries above the frequency cap', async () => {
-  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
-    940: shardFor({ uncollectible: [2, 'FC1176'] }, 940),
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, shardsFor(
+    shardForTerm('uncollectible', [2, 'FC1176']),
     // Above the cap: frequency retained for IDF, no case list.
-    1680: shardFor({ commission: [30_000] }, 1680)
-  });
+    shardForTerm('commission', [30_000])
+  ));
   const routed = await routeCasesByTermIndex(env, ['uncollectible', 'commission'], 'r4');
   assert.ok(routed);
   // Only one term can discriminate, so a single hit has to be enough.
@@ -432,10 +458,10 @@ test('term index routing drops postings-free entries above the frequency cap', a
 });
 
 test('term index routing ranks a two-term match above a one-term match', async () => {
-  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
-    940: shardFor({ uncollectible: [2, 'FC1176', 'FC1184'] }, 940),
-    3990: shardFor({ storm: [5, 'FC1176'] }, 3990)
-  });
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, shardsFor(
+    shardForTerm('uncollectible', [2, 'FC1176', 'FC1184']),
+    shardForTerm('storm', [5, 'FC1176'])
+  ));
   const routed = await routeCasesByTermIndex(env, ['uncollectible', 'storm'], 'r5');
   assert.ok(routed);
   assert.deepEqual(routed.map(row => row.caseNumber), ['FC1176', 'FC1184']);
@@ -443,11 +469,11 @@ test('term index routing ranks a two-term match above a one-term match', async (
 });
 
 test('term index routing keeps a rare-term match a ubiquitous term would hide', async () => {
-  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
-    940: shardFor({ uncollectible: [2, 'FC1184'] }, 940),
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, shardsFor(
+    shardForTerm('uncollectible', [2, 'FC1184']),
     // Present in three quarters of the corpus: matching it is not evidence.
-    1680: shardFor({ commission: [30_000, 'FC9999', 'FC8888'] }, 1680)
-  });
+    shardForTerm('commission', [30_000, 'FC9999', 'FC8888'])
+  ));
   const routed = await routeCasesByTermIndex(env, ['uncollectible', 'commission'], 'r6');
   assert.ok(routed);
   // FC1184 matches one term and outranks cases matching only the common term.
@@ -518,13 +544,10 @@ test('posting lists are read in both published formats', () => {
 
 test('term index routing ranks by term frequency within a match set', async () => {
   const manifest = { ...TERM_INDEX_MANIFEST, postingFormat: 'case-tf' };
-  const env = termIndexEnv(manifest, {
-    940: {
-      ...shardFor({}, 940),
-      postingFormat: 'case-tf',
-      terms: { uncollectible: [3, 'FC1176', 1, 'FC1184', 12, 'FC9999', 4] }
-    }
-  });
+  const env = termIndexEnv(manifest, shardsFor(
+    shardForTerm('uncollectible', [3, 'FC1176', 1, 'FC1184', 12, 'FC9999', 4],
+      { postingFormat: 'case-tf' })
+  ));
   const routed = await routeCasesByTermIndex(env, ['uncollectible'], 'tf1');
   assert.ok(routed);
   // Same term, same IDF: only the document counts can order these.
@@ -663,4 +686,74 @@ test('a repaired citation is pulled into the sentence around it', () => {
 test('line breaks around ordinary brackets are left alone', () => {
   const text = 'First line\n[not a citation]\n, second.';
   assert.equal(streamThrough([text]), text);
+});
+
+// --- Follow-up questions and read depth ------------------------------------
+
+test('the best-ranked case is read more deeply than the tail', () => {
+  // A flat two-document split dated from the free plan's CPU ceiling; with the
+  // ranking ordering cases meaningfully, the top candidate earns more.
+  assert.ok(documentReadBudget(0) > documentReadBudget(1));
+  assert.ok(documentReadBudget(1) > documentReadBudget(4));
+  assert.equal(documentReadBudget(4), documentReadBudget(9));
+});
+
+test('cases cited in the last answer are recoverable for a follow-up', () => {
+  const history = [
+    { role: 'user', content: 'Which cases discuss disconnections?' },
+    { role: 'model', content: 'See ARDIR2020-01 and DRGD2020-01-M for details.' }
+  ] as ChatMessage[];
+  assert.deepEqual(recentlyCitedCases(history), ['ARDIR2020-01', 'DRGD2020-01-M']);
+});
+
+test('capitalised prose is not mistaken for a case number', () => {
+  const history = [
+    { role: 'model', content: 'The PSC and OPC agreed. See FC1176 for the record.' }
+  ] as ChatMessage[];
+  // Case numbers carry digits; bare acronyms do not.
+  assert.deepEqual(recentlyCitedCases(history), ['FC1176']);
+});
+
+test('only the most recent answer defines the current subject', () => {
+  const history = [
+    { role: 'model', content: 'Older answer about FC1119.' },
+    { role: 'user', content: 'and storm costs?' },
+    { role: 'model', content: 'Newer answer about ARDIR2024-01.' }
+  ] as ChatMessage[];
+  assert.deepEqual(recentlyCitedCases(history), ['ARDIR2024-01']);
+});
+
+test('follow-ups are recognised without capturing fresh questions', () => {
+  assert.equal(isFollowUpQuestion('What about 2024?', ['2024']), true);
+  assert.equal(isFollowUpQuestion('And for Pepco?', ['pepco']), true);
+  assert.equal(isFollowUpQuestion('storm costs?', ['storm', 'costs']), true);
+  // A question that names its own subject must route on its own terms.
+  assert.equal(
+    isFollowUpQuestion('Which DC PSC cases discuss pipeline safety and gas upgrades?',
+      ['pipeline', 'safety', 'gas', 'upgrades']),
+    false
+  );
+  // A case number is explicit subject; never treat it as a follow-up.
+  assert.equal(isFollowUpQuestion('What about FC1176?', ['1176']), false);
+});
+
+test('stems collapse inflections and stay a prefix of the original', () => {
+  // The prefix property is load-bearing: excerpts are verified by substring
+  // match, so a stem that rewrote letters would route cases that then verify
+  // to nothing.
+  for (const word of ['disconnections', 'disconnection', 'disconnected', 'reporting', 'companies']) {
+    assert.ok(word.startsWith(stemTerm(word)), `${word} must start with its stem`);
+  }
+  const stem = stemTerm('disconnect');
+  for (const inflection of ['disconnections', 'disconnection', 'disconnected']) {
+    assert.equal(stemTerm(inflection), stem);
+    assert.ok(inflection.includes(stem), 'substring verification must still match');
+  }
+});
+
+test('stemming stops before it destroys a short word', () => {
+  // "rates" must not become "rat".
+  assert.equal(stemTerm('rates'), 'rates');
+  assert.equal(stemTerm('gas'), 'gas');
+  assert.equal(stemTerm('storm'), 'storm');
 });

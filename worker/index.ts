@@ -4,6 +4,7 @@ import {
   TERM_INDEX_VERSION,
   inverseDocumentFrequency,
   postingEntries,
+  stemTerm,
   termIndexShardKey,
   termShard,
   type TermIndexManifest,
@@ -1251,7 +1252,9 @@ export async function routeCasesByTermIndex(
     return null;
   }
 
-  const wanted = terms.slice(0, TERM_INDEX_MAX_QUERY_TERMS);
+  // The index is keyed by stem so a question asking about "disconnections"
+  // reaches cases that only ever wrote "disconnection".
+  const wanted = Array.from(new Set(terms.map(stemTerm))).slice(0, TERM_INDEX_MAX_QUERY_TERMS);
   // Several terms can land in one shard; read each shard once.
   const shardTerms = new Map<number, string[]>();
   for (const term of wanted) {
@@ -1305,6 +1308,19 @@ export async function routeCasesByTermIndex(
       expectedShards: shardEntries.length,
       totalShards: manifest.shardCount,
       terms: wanted.length
+    });
+    return null;
+  }
+
+  // Every shard the question needs must be readable and of this generation.
+  // Ranking on a subset would silently narrow the search while the answer goes
+  // on claiming every indexed case was covered; the case router is the honest
+  // fallback in that state.
+  if (results.some(result => !result)) {
+    logChatStage(requestId, "term-index", startedAt, {
+      outcome: "incomplete",
+      shardsRead: results.filter(Boolean).length,
+      expectedShards: shardEntries.length
     });
     return null;
   }
@@ -1619,7 +1635,10 @@ async function searchCompactDocuments(
       documentsRead += 1;
       const stream = object.body.pipeThrough(new DecompressionStream("gzip"));
       const html = await new Response(stream).text();
-      return findPageExcerpts(html, terms, document, minimumTermMatches);
+      // Bloom filters were built from exact tokens, so candidate selection
+      // above must use them. Verification is a substring match, where the stem
+      // also catches the inflections the question did not happen to use.
+      return findPageExcerpts(html, terms.map(stemTerm), document, minimumTermMatches);
     }));
     excerptGroups.push(...batchRows.filter(group => group.length));
     if (excerptGroups.length >= COMPACT_DOCUMENT_GROUP_TARGET) {
@@ -1699,7 +1718,64 @@ async function searchLegacyFts(env: WorkerEnv, caseNumber: string | null, terms:
   return result.results ?? [];
 }
 
-async function searchDockets(env: WorkerEnv, message: string, requestId: string): Promise<SearchRow[]> {
+/**
+ * How many filings to open in a routed case, by its rank.
+ *
+ * Every case used to get two reads, a flat split from when the free plan's CPU
+ * ceiling made each read precious. The ranking now orders cases meaningfully,
+ * so the best candidate earns a deeper look while the tail still contributes
+ * breadth.
+ */
+export function documentReadBudget(rank: number): number {
+  if (rank === 0) return 5;
+  if (rank === 1) return 3;
+  return 2;
+}
+
+/**
+ * Case numbers the assistant has already cited in this conversation.
+ *
+ * A follow-up such as "what about 2024?" carries none of the original subject,
+ * so routing it on its own words searches for the wrong thing entirely. The
+ * cases under discussion are recoverable from the citations already shown.
+ */
+export function recentlyCitedCases(history: ChatMessage[], limit = 6): string[] {
+  const seen: string[] = [];
+  for (const item of [...history].reverse()) {
+    if (item.role !== "model") continue;
+    for (const match of String(item.content).matchAll(/\b([A-Z][A-Z0-9]{1,12}(?:-[A-Z0-9]{1,6}){0,3})\b/g)) {
+      const candidate = match[1];
+      // Case numbers carry digits; prose in capitals does not.
+      if (!/\d/.test(candidate) || !/^[A-Z][A-Z0-9-]{2,30}$/.test(candidate)) continue;
+      if (!seen.includes(candidate)) seen.push(candidate);
+      if (seen.length >= limit) return seen;
+    }
+    // Only the most recent answer defines the current subject.
+    if (seen.length) return seen;
+  }
+  return seen;
+}
+
+/**
+ * Whether a question leans on what was just discussed rather than naming its
+ * own subject. Kept deliberately narrow: treating a fresh question as a
+ * follow-up would silently confine it to the previous answer's cases.
+ */
+export function isFollowUpQuestion(message: string, terms: string[]): boolean {
+  if (extractCaseIdentifier(message)) return false;
+  if (/\b(?:what about|how about|and (?:in|for)|same for|those|these|that case|it|they)\b/i.test(message)) {
+    return true;
+  }
+  // Very few content words left after stop-word removal: nothing to route on.
+  return terms.length > 0 && terms.length <= 2 && message.trim().split(/\s+/).length <= 8;
+}
+
+async function searchDockets(
+  env: WorkerEnv,
+  message: string,
+  requestId: string,
+  history: ChatMessage[] = []
+): Promise<SearchRow[]> {
   const terms = buildSearchTerms(message);
   const caseNumber = extractCaseIdentifier(message);
   const queryYears = extractQueryYears(message);
@@ -1718,14 +1794,30 @@ async function searchDockets(env: WorkerEnv, message: string, requestId: string)
       const termIndexRouted = await routeCasesByTermIndex(env, terms, requestId);
       const routedCases = termIndexRouted ?? await routeCases(env, terms, requestId);
       const routing = termIndexRouted ? "exhaustive" as const : "sampled" as const;
+
+      // A follow-up names no subject of its own. Lead with the cases already
+      // under discussion, then fall through to the fresh ranking so a genuine
+      // change of subject is not trapped in the previous answer.
+      const carried = isFollowUpQuestion(message, terms) ? recentlyCitedCases(history) : [];
+      const ordered = [
+        ...carried,
+        ...routedCases.map(candidate => candidate.caseNumber).filter(name => !carried.includes(name))
+      ].slice(0, CASE_ROUTER_VERIFIED_CASES);
+      if (carried.length) {
+        logChatStage(requestId, "follow-up", performance.now(), {
+          carriedCases: carried.length,
+          searching: ordered.length
+        });
+      }
+
       const routedGroups: SearchRow[][] = [];
-      for (const candidate of routedCases.slice(0, CASE_ROUTER_VERIFIED_CASES)) {
+      for (const [rank, caseName] of ordered.entries()) {
         const rows = await searchCompactDocuments(
           env,
-          candidate.caseNumber,
+          caseName,
           terms,
           requestId,
-          2,
+          documentReadBudget(rank),
           Math.min(2, terms.length),
           queryYears
         );
@@ -2460,7 +2552,7 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
           ? staticAssistantStream(directCaseReply, requestId, feedbackToken)
           : json({ reply: directCaseReply, requestId, feedbackToken });
       }
-      const rows = await searchDockets(env, message, requestId);
+      const rows = await searchDockets(env, message, requestId, body.history);
       if (wantsEventStream) {
         logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "stream-start", rows: rows.length });
         return streamAnswerWithOpenAi(

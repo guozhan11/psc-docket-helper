@@ -77,6 +77,32 @@ export interface TermIndexShard {
   postingFormat?: TermPostingFormat;
 }
 
+/**
+ * Reduces a word to a stem that is also a prefix of its inflections.
+ *
+ * The prefix property is what makes this safe here: excerpts are verified by
+ * plain substring match against page text, so a stem like "disconnect" matches
+ * "disconnection", "disconnections" and "disconnected" without the verifier
+ * needing to know anything about morphology. A stemmer that rewrote letters
+ * ("companies" to "compani") would break that and leave routed cases failing
+ * verification with nothing to show.
+ *
+ * Deliberately conservative: only suffixes that strip cleanly, and never below
+ * a stem length where the remainder stops being a word.
+ */
+export const MIN_STEM_LENGTH = 5;
+
+export function stemTerm(term: string): string {
+  const word = term.toLowerCase();
+  if (word.length <= MIN_STEM_LENGTH) return word;
+  for (const suffix of ["ations", "ation", "ions", "ing", "ion", "ed", "es", "s"]) {
+    if (!word.endsWith(suffix)) continue;
+    const stem = word.slice(0, word.length - suffix.length);
+    if (stem.length >= MIN_STEM_LENGTH) return stem;
+  }
+  return word;
+}
+
 /** FNV-1a. Matches term_shard() in scripts/build_term_index.py. */
 export function termShard(term: string, shardCount = TERM_INDEX_SHARDS): number {
   let hash = 0x811c9dc5;
