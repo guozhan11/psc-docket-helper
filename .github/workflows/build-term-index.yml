@@ -63,7 +63,10 @@ jobs:
     # Scheduled runs have no one watching them; an ingest shard died on a
     # transient R2 error in August 2026 and went unnoticed for two days.
     needs: [build]
-    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    if: >-
+      ${{ always() &&
+          (contains(needs.*.result, 'failure') ||
+           contains(needs.*.result, 'cancelled')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -76,13 +79,15 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TITLE: "Term index build failed"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
+          summary=$(jq -r 'to_entries | map("\(.key)=\(.value.result)") | join(", ")' <<< "$NEEDS_JSON")
           existing=$(gh issue list --state open --search "$TITLE in:title" \
             --json number,title -q "[.[] | select(.title == \"$TITLE\")] | .[0].number // empty")
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "Failed again: [run]($RUN_URL)"
+            gh issue comment "$existing" --body "Did not complete again ($summary): [run]($RUN_URL)"
           else
             gh issue create --title "$TITLE" \
-              --body "$(printf '%s\n' "A scheduled run failed." "" "[Run]($RUN_URL)" "" "Close this once the next run succeeds.")"
+              --body "$(printf '%s\n' "A scheduled run failed or was cancelled." "" "Job results: \`$summary\`" "" "[Run]($RUN_URL)" "" "A cancelled job may indicate its timeout was reached or a manual cancellation; the linked run shows which step stopped." "" "Close this once the next run succeeds.")"
           fi

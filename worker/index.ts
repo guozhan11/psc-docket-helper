@@ -348,6 +348,19 @@ function rateLimitActor(request: Request, clientId: string | null): string {
   return `ip:${clientIp}`;
 }
 
+export type ChatAdmissionFailure = "actor-rate-limit" | "turnstile" | "global-rate-limit";
+
+export async function admitChatRequest(
+  checkActorLimit: () => Promise<boolean>,
+  verifyChallenge: () => Promise<boolean>,
+  checkGlobalLimit: () => Promise<boolean>
+): Promise<ChatAdmissionFailure | null> {
+  if (!(await checkActorLimit())) return "actor-rate-limit";
+  if (!(await verifyChallenge())) return "turnstile";
+  if (!(await checkGlobalLimit())) return "global-rate-limit";
+  return null;
+}
+
 async function verifyTurnstile(
   request: Request,
   env: WorkerEnv,
@@ -467,6 +480,10 @@ async function lastKnownGoodHealth(request: Request): Promise<Record<string, unk
     }));
     return null;
   }
+}
+
+export function allowsLastKnownGoodHealth(url: URL): boolean {
+  return url.searchParams.get("live") !== "1";
 }
 
 export function fullTextCoverageSummary(
@@ -1032,6 +1049,21 @@ export async function routeCasesByTermIndex(
       return null;
     }
   }));
+
+  // A partial posting set is not an exhaustive corpus search. Treat one
+  // missing, corrupt, or superseded shard as an unavailable index so the
+  // caller can fall back to the bounded case router and describe that narrower
+  // scope honestly.
+  if (results.some(result => result === null)) {
+    logChatStage(requestId, "term-index", startedAt, {
+      outcome: "partial",
+      shardsRead: results.filter(result => result !== null).length,
+      expectedShards: shardEntries.length,
+      totalShards: manifest.shardCount,
+      terms: wanted.length
+    });
+    return null;
+  }
 
   for (const result of results) {
     if (!result) continue;
@@ -1963,16 +1995,21 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       context.waitUntil(cacheHealthySnapshot(request, healthPayload));
       return json(healthPayload);
     }
-    const cachedHealth = await lastKnownGoodHealth(request);
-    if (cachedHealth) {
-      return json({
-        ...cachedHealth,
-        healthSource: "last-known-good",
-        liveIssues: issues
-      }, 200, {
-        "X-Health-Source": "last-known-good",
-        "X-Health-Live-Issues": issues.join(",")
-      });
+    // Public UI requests may use a short last-known-good snapshot to avoid
+    // flickering during a transient R2 read failure. Automated monitoring asks
+    // for live=1 and must receive the real degraded status and non-2xx code.
+    if (allowsLastKnownGoodHealth(url)) {
+      const cachedHealth = await lastKnownGoodHealth(request);
+      if (cachedHealth) {
+        return json({
+          ...cachedHealth,
+          healthSource: "last-known-good",
+          liveIssues: issues
+        }, 200, {
+          "X-Health-Source": "last-known-good",
+          "X-Health-Live-Issues": issues.join(",")
+        });
+      }
     }
     return json(healthPayload, 503);
   }
@@ -2030,17 +2067,20 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
         error: `Message is required and must be at most ${MAX_MESSAGE_LENGTH} characters; history must contain at most ${MAX_HISTORY_MESSAGES} valid messages.`
       }, 400);
     }
-    const [actorLimit, globalLimit] = await Promise.all([
-      env.CHAT_RATE_LIMITER.limit({ key: rateLimitActor(request, body.clientId) }),
-      env.CHAT_GLOBAL_RATE_LIMITER.limit({ key: "chat" })
-    ]);
-    if (!actorLimit.success || !globalLimit.success) {
+    const admissionFailure = await admitChatRequest(
+      async () => (await env.CHAT_RATE_LIMITER.limit({
+        key: rateLimitActor(request, body.clientId)
+      })).success,
+      () => verifyTurnstile(request, env, body.turnstileToken, requestId),
+      async () => (await env.CHAT_GLOBAL_RATE_LIMITER.limit({ key: "chat" })).success
+    );
+    if (admissionFailure === "actor-rate-limit" || admissionFailure === "global-rate-limit") {
       return json({
         error: "Rate limit exceeded",
         userMessage: "The assistant is receiving too many requests. Please wait one minute and try again."
       }, 429, { "Retry-After": "60" });
     }
-    if (!(await verifyTurnstile(request, env, body.turnstileToken, requestId))) {
+    if (admissionFailure === "turnstile") {
       return json({
         error: "Turnstile verification failed",
         userMessage: "Security verification expired or failed. Please retry the challenge and submit again."

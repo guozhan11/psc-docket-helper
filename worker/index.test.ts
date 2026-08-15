@@ -5,6 +5,8 @@ import {
   DEFAULT_RANKING_WEIGHTS,
   EVIDENCE_MAX_PER_DOCUMENT,
   EVIDENCE_ROW_BUDGET,
+  admitChatRequest,
+  allowsLastKnownGoodHealth,
   documentRankingScore,
   extractQueryYears,
   filterFillRatio,
@@ -30,6 +32,33 @@ import {
   termIndexShardKey,
   termShard
 } from '../shared/termIndex.ts';
+
+test('live health mode bypasses the last-known-good snapshot', () => {
+  assert.equal(allowsLastKnownGoodHealth(new URL('https://example.com/api/health')), true);
+  assert.equal(allowsLastKnownGoodHealth(new URL('https://example.com/api/health?live=1')), false);
+});
+
+test('invalid Turnstile requests do not consume the global chat limit', async () => {
+  const calls: string[] = [];
+  const failure = await admitChatRequest(
+    async () => { calls.push('actor'); return true; },
+    async () => { calls.push('turnstile'); return false; },
+    async () => { calls.push('global'); return true; }
+  );
+  assert.equal(failure, 'turnstile');
+  assert.deepEqual(calls, ['actor', 'turnstile']);
+});
+
+test('verified requests consume the global chat limit last', async () => {
+  const calls: string[] = [];
+  const failure = await admitChatRequest(
+    async () => { calls.push('actor'); return true; },
+    async () => { calls.push('turnstile'); return true; },
+    async () => { calls.push('global'); return true; }
+  );
+  assert.equal(failure, null);
+  assert.deepEqual(calls, ['actor', 'turnstile', 'global']);
+});
 
 test('OpenAI response stream parser returns only text deltas', () => {
   assert.equal(openAiStreamDelta('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello"}'), 'Hello');
@@ -312,10 +341,22 @@ test('term index routing yields to the case router when unpublished', async () =
   assert.equal(await routeCasesByTermIndex(env, ['uncollectible'], 'r1'), null);
 });
 
-test('term index routing ignores a shard from a superseded generation', async () => {
+test('term index routing falls back when a shard is from a superseded generation', async () => {
   const stale = { ...shardFor({ uncollectible: [2, 'FC1176'] }, 940), generation: 'g0' };
   const env = termIndexEnv(TERM_INDEX_MANIFEST, { 940: stale });
-  assert.deepEqual(await routeCasesByTermIndex(env, ['uncollectible'], 'r2'), []);
+  assert.equal(await routeCasesByTermIndex(env, ['uncollectible'], 'r2'), null);
+});
+
+test('term index routing rejects partial results when one query shard is missing', async () => {
+  const env = termIndexEnv(TERM_INDEX_MANIFEST, {
+    940: shardFor({ uncollectible: [2, 'FC1176'] }, 940)
+    // The shard for "storm" is intentionally absent. Returning FC1176 from
+    // only the first shard would overstate the search as exhaustive.
+  });
+  assert.equal(
+    await routeCasesByTermIndex(env, ['uncollectible', 'storm'], 'r-partial'),
+    null
+  );
 });
 
 test('term index routing ranks a rare term above a common one', async () => {

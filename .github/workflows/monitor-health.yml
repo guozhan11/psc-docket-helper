@@ -23,7 +23,7 @@ permissions:
   issues: write
 
 env:
-  HEALTH_URL: ${{ inputs.health-url || 'https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health' }}
+  HEALTH_URL: ${{ inputs.health-url || 'https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health?live=1' }}
   # One open issue per condition, reused rather than reopened, so a long outage
   # does not bury the repository under a new issue every half hour.
   ALERT_TITLE: "Health check: /api/health is not ok"
@@ -33,21 +33,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
       - name: Read health
         id: health
         run: |
-          set -uo pipefail
-          code=$(curl -sS -o response.json -w '%{http_code}' --max-time 30 "$HEALTH_URL" || echo 000)
+          set -euo pipefail
+          code=$(curl -sS -o response.json -w '%{http_code}' --max-time 30 "$HEALTH_URL" || true)
+          code=${code:-000}
           echo "http_code=$code" >> "$GITHUB_OUTPUT"
-          if [ "$code" != "200" ]; then
-            echo "status=unreachable" >> "$GITHUB_OUTPUT"
-            echo "issues=HTTP $code" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          status=$(python3 -c "import json;print(json.load(open('response.json')).get('status','unknown'))")
-          issues=$(python3 -c "import json;print(', '.join(json.load(open('response.json')).get('issues') or []) or 'none')")
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          echo "issues=$issues" >> "$GITHUB_OUTPUT"
+          python3 scripts/parse_health_response.py \
+            --http-code "$code" \
+            --response response.json >> "$GITHUB_OUTPUT"
 
       - name: Open or close the alert
         env:
