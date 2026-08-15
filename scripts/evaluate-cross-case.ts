@@ -34,6 +34,7 @@ import {
   TERM_INDEX_KEY,
   inverseDocumentFrequency,
   postingEntries,
+  stemTerm,
   termIndexShardKey,
   termShard,
   type TermIndexManifest,
@@ -81,7 +82,10 @@ interface Routed {
 }
 
 function route(manifest: TermIndexManifest, terms: string[]): Routed {
-  const wanted = terms.slice(0, MAX_QUERY_TERMS);
+  // The index is keyed by stem, and routeCasesByTermIndex stems before it
+  // looks up. Measuring with raw terms would report stemmed words as absent
+  // and understate recall.
+  const wanted = Array.from(new Set(terms.map(stemTerm))).slice(0, MAX_QUERY_TERMS);
   const format: TermPostingFormat = manifest.postingFormat === 'case-bm25'
     ? 'case-bm25'
     : manifest.postingFormat === 'case-tf' ? 'case-tf' : 'case';
