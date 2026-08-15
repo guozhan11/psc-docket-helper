@@ -70,9 +70,10 @@ for term in terms:
         continue
     frequency, *body = entry
     fmt = payload.get("postingFormat") or index.get("postingFormat") or "case"
-    if fmt == "case-tf":
+    if fmt in ("case-tf", "case-bm25"):
         pairs = [(body[i], body[i + 1]) for i in range(0, len(body) - 1, 2)]
-        shown = ", ".join(f"{case} x{count}" for case, count in pairs[:5])
+        label = "x" if fmt == "case-tf" else "w"
+        shown = ", ".join(f"{case} {label}{count}" for case, count in pairs[:5])
     else:
         shown = ", ".join(str(case) for case in body[:5])
     if not body:
