@@ -203,7 +203,11 @@ const TERM_INDEX_FRESHNESS_MS = 10 * 24 * 60 * 60 * 1_000;
 const CASE_ROUTER_VERSION = 2;
 const CASE_ROUTER_INDEX_KEY = `case-router/v${CASE_ROUTER_VERSION}/index.json`;
 const CASE_ROUTER_CANDIDATES = 8;
-const CASE_ROUTER_VERIFIED_CASES = 2;
+// Set to 2 when the Bloom router's shortlist was unreliable and each
+// verification was likely wasted. BM25 ranking now puts genuinely on-topic
+// cases at the top, so opening more of them widens the answer rather than
+// adding noise, and the Paid plan's CPU ceiling leaves ample room.
+const CASE_ROUTER_VERIFIED_CASES = 5;
 // Each query term costs one shard read, so bound the reads per question. The
 // inverted index covers every case regardless; this caps I/O, not coverage.
 const TERM_INDEX_MAX_QUERY_TERMS = 8;
@@ -245,9 +249,11 @@ export const DEFAULT_RANKING_WEIGHTS: RankingWeights = {
   recencySpanYears: 12,
   saturationAdjusted: false
 };
+// Distinct filings listed under "Official filing sources".
+export const ANSWER_SOURCE_LIMIT = 10;
 // Evidence budget sent to the model. Excerpt slots are filled round-robin, one
 // per filing, before any filing receives a second excerpt.
-export const EVIDENCE_ROW_BUDGET = 8;
+export const EVIDENCE_ROW_BUDGET = 12;
 export const EVIDENCE_MAX_PER_DOCUMENT = 2;
 // Read enough distinct filings that a well-ranked but lower-placed document
 // still reaches the evidence set instead of being cut off by earlier hits.
@@ -259,7 +265,7 @@ export const EVIDENCE_MAX_PER_DOCUMENT = 2;
 // best-ranked filings to contribute a second excerpt, which keeps a table and
 // its surrounding discussion together instead of splitting them.
 // `retrieval budget invariant` in worker/index.test.ts enforces the bound.
-export const COMPACT_DOCUMENT_GROUP_TARGET = 6;
+export const COMPACT_DOCUMENT_GROUP_TARGET = 10;
 const API_HEADERS = {
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff"
@@ -661,7 +667,7 @@ export function isFreshTimestamp(
 export function selectDiverseGlobalResults<T extends GlobalResultIdentity>(
   groups: T[][],
   maxPerCase = 3,
-  totalLimit = 8
+  totalLimit = EVIDENCE_ROW_BUDGET
 ): T[] {
   const selected = new Map<string, T>();
   for (const group of groups) {
@@ -1703,7 +1709,8 @@ Keep exact keyword matches distinct from interpretation. Always include the offi
 }
 
 export function answerSuffix(message: string, reply: string, rows: SearchRow[]): string {
-  const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values()).slice(0, 5);
+  const sources = Array.from(new Map(rows.map(row => [row.filing_id, row])).values())
+    .slice(0, ANSWER_SOURCE_LIMIT);
   // Cross-case routing reads one of the router's sixteen partitions, so it
   // examines a fraction of indexed cases rather than all of them. Say so
   // plainly: "relevance-ranked matches from the indexed corpus" reads as a
@@ -1722,11 +1729,17 @@ export function answerSuffix(message: string, reply: string, rows: SearchRow[]):
   // Truncate here as the inline citations do. e-Docket puts a whole order's
   // operative text in some filings' description, so an untruncated title turns
   // one source line into a wall of link text.
-  return `${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>
-    row.evidence_kind === "metadata"
-      ? `- [${row.case_number}: ${citationTitle(row.title)}](${row.official_pdf_url}) — metadata indexed; full text pending`
-      : `- [${row.case_number}: ${citationTitle(row.title)} — page ${row.page_number}](${officialPdfPageUrl(row)})`
-  ).join("\n")}`;
+  //
+  // Recurring filings reuse one description — a utility's monthly report is
+  // filed under the same title every month — so two distinct filings can render
+  // as identical lines. The date is what tells them apart.
+  return `${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row => {
+    const filed = formatEdocketDate(row.received_date);
+    const dated = filed ? `${citationTitle(row.title)} (${filed})` : citationTitle(row.title);
+    return row.evidence_kind === "metadata"
+      ? `- [${row.case_number}: ${dated}](${row.official_pdf_url}) — metadata indexed; full text pending`
+      : `- [${row.case_number}: ${dated} — page ${row.page_number}](${officialPdfPageUrl(row)})`;
+  }).join("\n")}`;
 }
 
 function formatOpenAiReply(message: string, rawReply: string, rows: SearchRow[]): string {

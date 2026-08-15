@@ -304,11 +304,13 @@ test('retrieval budget invariant: reading more filings than slots is wasted work
 });
 
 test('document selection honours the total evidence budget', () => {
-  const groups = Array.from({ length: 6 }, (_, group) => [
+  // Enough groups to overshoot whatever the budget is, so this keeps testing
+  // the cap rather than a hardcoded number that drifts when the budget moves.
+  const groups = Array.from({ length: EVIDENCE_ROW_BUDGET + 4 }, (_, group) => [
     { case_number: 'FC1176', filing_id: group + 1, page_number: 1 },
     { case_number: 'FC1176', filing_id: group + 1, page_number: 2 }
   ]);
-  assert.equal(selectDiverseDocumentResults(groups).length, 8);
+  assert.equal(selectDiverseDocumentResults(groups).length, EVIDENCE_ROW_BUDGET);
 });
 
 test('global result selection preserves cross-case diversity', () => {

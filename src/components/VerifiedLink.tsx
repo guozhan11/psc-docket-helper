@@ -108,13 +108,16 @@ export default function VerifiedLink({ href, children, className, fallbackHref =
       href={finalHref}
       target="_blank"
       rel="noopener noreferrer"
+      // Inline, not inline-flex: a flex box cannot break across lines, so a
+      // citation long enough to exceed the remaining space jumped to a line of
+      // its own and stranded the surrounding punctuation.
       className={cn(
-        "text-psc-blue hover:text-psc-blue/80 dark:text-blue-450 dark:hover:text-blue-350 underline font-bold transition-all inline-flex items-center gap-1.5",
+        "text-psc-blue hover:text-psc-blue/80 dark:text-blue-450 dark:hover:text-blue-350 underline font-bold transition-all",
         className
       )}
     >
       {children}
-      <ExternalLink className="w-3.5 h-3.5 inline-block opacity-85" />
+      <ExternalLink className="w-3.5 h-3.5 inline-block align-[-0.125em] ml-1 opacity-85" />
     </a>
   );
 }
