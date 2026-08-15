@@ -645,3 +645,22 @@ test('an unclosed bracket is released rather than stalling the stream', () => {
   const released = relinker.push('x'.repeat(40));
   assert.ok(released.includes('x'), 'a long unclosed bracket must not hold the stream');
 });
+
+test('a repaired citation is pulled into the sentence around it', () => {
+  // The model often puts a citation on its own line; Markdown then renders it
+  // as a separate paragraph and leaves the following comma stranded.
+  const out = streamThrough([
+    'reporting for low-income customer segments\n',
+    "[WGL's Monthly Report, pursuant to Order No. 15134. — p. 2]",
+    '\n,\n',
+    'and further detail.'
+  ]);
+  assert.ok(!/segments\s*\n\s*\[/.test(out), 'citation must not start its own line');
+  assert.ok(!/\n\s*,/.test(out), 'punctuation must not be stranded on its own line');
+  assert.match(out, /\]\(https:\/\/edocket\.dcpsc\.org/);
+});
+
+test('line breaks around ordinary brackets are left alone', () => {
+  const text = 'First line\n[not a citation]\n, second.';
+  assert.equal(streamThrough([text]), text);
+});

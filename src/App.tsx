@@ -340,12 +340,38 @@ export default function App() {
 
   useEffect(() => () => activeRequestRef.current?.controller.abort(), []);
 
+  // Following the stream to the bottom must never fight the reader. Scrolling
+  // to the bottom fires a scroll event of its own, which used to be read as the
+  // reader returning to the bottom and re-armed the follow — so scrolling up
+  // during generation was undone by the next delta, and only a lucky race let
+  // the reader escape.
+  const programmaticScrollRef = useRef(false);
+
   const handleMessagesScroll = () => {
     const container = messagesContainerRef.current;
     if (!container) return;
+    if (programmaticScrollRef.current) {
+      programmaticScrollRef.current = false;
+      return;
+    }
 
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     shouldAutoScrollRef.current = distanceFromBottom <= 64;
+  };
+
+  // Wheel and touch say what the reader wants directly, with no race against
+  // an in-flight programmatic scroll.
+  const handleMessagesWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY < 0) shouldAutoScrollRef.current = false;
+  };
+
+  const touchStartYRef = useRef(0);
+  const handleMessagesTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    touchStartYRef.current = event.touches[0]?.clientY ?? 0;
+  };
+  const handleMessagesTouchMove = (event: React.TouchEvent<HTMLDivElement>) => {
+    const y = event.touches[0]?.clientY ?? 0;
+    if (y > touchStartYRef.current + 8) shouldAutoScrollRef.current = false;
   };
 
   useLayoutEffect(() => {
@@ -353,7 +379,8 @@ export default function App() {
 
     const frame = requestAnimationFrame(() => {
       const container = messagesContainerRef.current;
-      if (container) {
+      if (container && shouldAutoScrollRef.current) {
+        programmaticScrollRef.current = true;
         container.scrollTop = container.scrollHeight;
       }
     });
@@ -844,6 +871,9 @@ export default function App() {
                       ref={messagesContainerRef}
                       data-testid="messages-container"
                       onScroll={handleMessagesScroll}
+                      onWheel={handleMessagesWheel}
+                      onTouchStart={handleMessagesTouchStart}
+                      onTouchMove={handleMessagesTouchMove}
                       className="flex-grow space-y-4 overflow-y-auto bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] bg-fixed p-3 sm:space-y-6 sm:p-6"
                     >
                       {messages.map((msg, idx) => (

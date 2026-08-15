@@ -880,22 +880,40 @@ export function relinkBareCitations(reply: string, rows: SearchRow[]): string {
  */
 export function createCitationRelinker(rows: SearchRow[], maxHold = 320) {
   let pending = "";
+  // Whether anything has gone out at all, across calls. A held line break comes
+  // from an earlier delta, so the current call's buffer says nothing about
+  // whether the citation has a sentence to join.
+  let emitted = false;
 
   const drain = (final: boolean): string => {
     let out = "";
     for (;;) {
       const open = pending.indexOf("[");
       if (open === -1) {
-        out += pending;
-        pending = "";
+        if (final) {
+          out += pending;
+          pending = "";
+          return out;
+        }
+        // Hold a trailing line break: a citation may follow that belongs to the
+        // sentence just emitted, and text already sent cannot be taken back.
+        const trailing = pending.match(/[ \t]*\n[ \t\n]*$/);
+        const keep = trailing ? trailing[0].length : 0;
+        out += pending.slice(0, pending.length - keep);
+        pending = pending.slice(pending.length - keep);
         return out;
       }
-      out += pending.slice(0, open);
-      pending = pending.slice(open);
 
-      const close = pending.indexOf("]");
+      // Whitespace immediately before the bracket travels with it.
+      const before = pending.slice(0, open);
+      const leading = before.match(/[ \t]*\n[ \t\n]*$/)?.[0] ?? "";
+      out += before.slice(0, before.length - leading.length);
+      pending = leading + pending.slice(open);
+
+      const bracket = leading.length;
+      const close = pending.indexOf("]", bracket);
       if (close === -1) {
-        // A bracket this long is not a citation; stop holding the stream.
+        // Not a citation if it runs this long; stop holding the stream.
         if (final || pending.length > maxHold) {
           out += pending;
           pending = "";
@@ -903,18 +921,35 @@ export function createCitationRelinker(rows: SearchRow[], maxHold = 320) {
         }
         return out;
       }
-      // One character past "]" decides whether a target follows.
+      // One character past "]" decides whether the model supplied a target.
       if (!final && pending.length < close + 2) return out;
-      const span = pending.slice(0, close + 1);
+
+      const span = pending.slice(bracket, close + 1);
       const next = pending[close + 1] ?? "";
+      const rendered = next === "(" ? span : relinkBareCitations(span, rows);
       pending = pending.slice(close + 1);
-      out += next === "(" ? span : relinkBareCitations(span, rows);
+
+      if (rendered === span) {
+        // Left as written: restore the line break exactly as the model wrote it.
+        out += leading + span;
+        continue;
+      }
+      // A citation belongs inside its sentence. The model often puts one on a
+      // line of its own, which Markdown renders as a separate paragraph and
+      // strands the comma or full stop that follows on a line by itself.
+      out += (emitted && leading ? " " : leading) + rendered;
+      pending = pending.replace(/^[ \t]*\n[ \t\n]*(?=[),.;:])/, "");
     }
   };
 
+  const record = (text: string) => {
+    if (text.trim()) emitted = true;
+    return text;
+  };
+
   return {
-    push: (delta: string) => { pending += delta; return drain(false); },
-    flush: () => drain(true)
+    push: (delta: string) => { pending += delta; return record(drain(false)); },
+    flush: () => record(drain(true))
   };
 }
 
