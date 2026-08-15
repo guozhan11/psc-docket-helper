@@ -1,4 +1,9 @@
-import type { HealthSummary, Message, NewsUpdate, PublicAppConfig } from "../types";
+import type { AnswerFeedback, HealthSummary, Message, NewsUpdate, PublicAppConfig } from "../types";
+
+export interface AssistantResponse {
+  reply: string;
+  feedbackToken: string | null;
+}
 
 export class AssistantRequestError extends Error {
   public readonly userMessage: string;
@@ -56,7 +61,7 @@ export async function chatWithDocketAssistant(
   turnstileToken: string | null,
   signal?: AbortSignal,
   onDelta?: (delta: string) => void
-): Promise<string> {
+): Promise<AssistantResponse> {
   try {
     const response = await fetch("/api/chat", {
       method: "POST",
@@ -91,6 +96,7 @@ export async function chatWithDocketAssistant(
       const decoder = new TextDecoder();
       let buffer = "";
       let reply = "";
+      let feedbackToken: string | null = null;
 
       const processFrame = (frame: string) => {
         const event = frame.split(/\r?\n/).find(line => line.startsWith("event:"))?.slice(6).trim();
@@ -104,6 +110,10 @@ export async function chatWithDocketAssistant(
           && "delta" in payload && typeof payload.delta === "string") {
           reply += payload.delta;
           onDelta?.(payload.delta);
+        }
+        if (event === "done" && payload && typeof payload === "object"
+          && "feedbackToken" in payload && typeof payload.feedbackToken === "string") {
+          feedbackToken = payload.feedbackToken;
         }
         if (event === "error") {
           const userMessage = payload && typeof payload === "object" && "userMessage" in payload
@@ -129,7 +139,7 @@ export async function chatWithDocketAssistant(
           "Docket Assistant stream completed without text"
         );
       }
-      return reply;
+      return { reply, feedbackToken };
     }
 
     const data: unknown = await response.json();
@@ -139,7 +149,12 @@ export async function chatWithDocketAssistant(
         "Docket Assistant backend returned invalid JSON"
       );
     }
-    return data.reply;
+    return {
+      reply: data.reply,
+      feedbackToken: "feedbackToken" in data && typeof data.feedbackToken === "string"
+        ? data.feedbackToken
+        : null
+    };
   } catch (error) {
     if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
       throw new AssistantRequestCancelledError();
@@ -150,5 +165,19 @@ export async function chatWithDocketAssistant(
       "The assistant could not be reached. Check your connection and retry the request.",
       error instanceof Error ? error.message : String(error)
     );
+  }
+}
+
+export async function submitAnswerFeedback(feedback: AnswerFeedback): Promise<void> {
+  const response = await fetch('/api/feedback', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify(feedback)
+  });
+  if (!response.ok) {
+    throw new Error(`Feedback returned HTTP ${response.status}`);
   }
 }

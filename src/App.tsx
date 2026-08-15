@@ -20,18 +20,29 @@ import {
   MessageCircle,
   PanelLeftClose,
   PanelLeftOpen,
-  Square
+  Square,
+  ThumbsUp,
+  ThumbsDown,
+  Check
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { cn } from './lib/utils';
-import { AssistantRequestCancelledError, AssistantRequestError, getHealthSummary, getLatestPSCUpdates, getPublicAppConfig, chatWithDocketAssistant } from './services/geminiService';
-import { Message, NewsUpdate, ChatSession, HealthSummary, PublicAppConfig } from './types';
+import { AssistantRequestCancelledError, AssistantRequestError, getHealthSummary, getLatestPSCUpdates, getPublicAppConfig, chatWithDocketAssistant, submitAnswerFeedback } from './services/geminiService';
+import { Message, NewsUpdate, ChatSession, HealthSummary, PublicAppConfig, FeedbackReason } from './types';
 import VerifiedLink, { normalizeUrl } from './components/VerifiedLink';
 import TurnstileWidget from './components/TurnstileWidget';
 
 const EXAMPLE_QUESTIONS = [
   "In FC1176, what drove Pepco's 2025 O&M expense variance?",
   'Which FC1176 filings discuss bad debt or uncollectible accounts?'
+];
+
+const FEEDBACK_REASONS: Array<{ value: FeedbackReason; label: string }> = [
+  { value: 'incorrect', label: 'Incorrect or misleading' },
+  { value: 'missing', label: 'Missed important information' },
+  { value: 'citation', label: 'Citation or source problem' },
+  { value: 'unclear', label: 'Unclear or hard to use' },
+  { value: 'other', label: 'Other' }
 ];
 
 function LatestUpdatesSection({ news, loading }: { news: NewsUpdate[]; loading: boolean }) {
@@ -158,6 +169,11 @@ export default function App() {
     }
   });
   const [failedRequest, setFailedRequest] = useState<{ sessionId: string; message: string } | null>(null);
+  const [feedbackFormToken, setFeedbackFormToken] = useState<string | null>(null);
+  const [feedbackReason, setFeedbackReason] = useState<FeedbackReason>('incorrect');
+  const [feedbackComment, setFeedbackComment] = useState('');
+  const [feedbackSubmittingToken, setFeedbackSubmittingToken] = useState<string | null>(null);
+  const [feedbackErrorToken, setFeedbackErrorToken] = useState<string | null>(null);
   const activeRequestRef = useRef<{ controller: AbortController; sessionId: string } | null>(null);
   const [clientId] = useState(() => {
     const storageKey = 'dc_psc_anonymous_client_id';
@@ -411,8 +427,17 @@ export default function App() {
           });
         }
       );
-      if (!streamedContent) {
-        updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content: response || "I'm sorry, I couldn't process that request." }]);
+      if (streamedContent) {
+        updateSessionMessages(targetSessionId, prev => prev.at(-1)?.role === 'model'
+          ? [...prev.slice(0, -1), { ...prev.at(-1)!, feedbackToken: response.feedbackToken ?? undefined }]
+          : prev
+        );
+      } else {
+        updateSessionMessages(targetSessionId, prev => [...prev, {
+          role: 'model',
+          content: response.reply || "I'm sorry, I couldn't process that request.",
+          feedbackToken: response.feedbackToken ?? undefined
+        }]);
       }
     } catch (error) {
       if (error instanceof AssistantRequestCancelledError) return;
@@ -459,6 +484,37 @@ export default function App() {
 
   const handleStopGenerating = () => {
     cancelActiveRequest();
+  };
+
+  const recordFeedback = async (
+    messageIndex: number,
+    message: Message,
+    rating: 'up' | 'down'
+  ) => {
+    if (!message.feedbackToken || feedbackSubmittingToken) return;
+    const question = messages.slice(0, messageIndex).reverse().find(item => item.role === 'user')?.content;
+    setFeedbackSubmittingToken(message.feedbackToken);
+    setFeedbackErrorToken(null);
+    try {
+      await submitAnswerFeedback({
+        token: message.feedbackToken,
+        rating,
+        reason: rating === 'down' ? feedbackReason : undefined,
+        comment: rating === 'down' ? feedbackComment : undefined,
+        question: rating === 'down' ? question?.slice(0, 1500) : undefined,
+        answerExcerpt: rating === 'down' ? message.content.slice(0, 2500) : undefined
+      });
+      updateSessionMessages(activeSessionId, previous => previous.map((item, index) =>
+        index === messageIndex ? { ...item, feedbackRating: rating } : item
+      ));
+      setFeedbackFormToken(null);
+      setFeedbackComment('');
+    } catch (error) {
+      console.error('Feedback submission failed:', error);
+      setFeedbackErrorToken(message.feedbackToken);
+    } finally {
+      setFeedbackSubmittingToken(null);
+    }
   };
 
   return (
@@ -825,6 +881,103 @@ export default function App() {
                                 {msg.content}
                               </ReactMarkdown>
                             </div>
+                            {msg.role === 'model' && msg.feedbackToken && appConfig?.feedbackEnabled && (
+                              <div className="mt-3 border-t border-slate-200 pt-3">
+                                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                                  <span>Was this answer useful?</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => void recordFeedback(idx, msg, 'up')}
+                                    disabled={feedbackSubmittingToken === msg.feedbackToken}
+                                    aria-label="Mark this answer as useful"
+                                    aria-pressed={msg.feedbackRating === 'up'}
+                                    className={cn(
+                                      "rounded-lg border p-1.5 transition-colors",
+                                      msg.feedbackRating === 'up'
+                                        ? "border-emerald-300 bg-emerald-50 text-emerald-700"
+                                        : "border-slate-200 bg-white text-slate-500 hover:border-emerald-300 hover:text-emerald-700"
+                                    )}
+                                  >
+                                    <ThumbsUp className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setFeedbackFormToken(msg.feedbackToken ?? null);
+                                      setFeedbackReason('incorrect');
+                                      setFeedbackComment('');
+                                      setFeedbackErrorToken(null);
+                                    }}
+                                    disabled={feedbackSubmittingToken === msg.feedbackToken}
+                                    aria-label="Report a problem with this answer"
+                                    aria-pressed={msg.feedbackRating === 'down'}
+                                    className={cn(
+                                      "rounded-lg border p-1.5 transition-colors",
+                                      msg.feedbackRating === 'down'
+                                        ? "border-rose-300 bg-rose-50 text-rose-700"
+                                        : "border-slate-200 bg-white text-slate-500 hover:border-rose-300 hover:text-rose-700"
+                                    )}
+                                  >
+                                    <ThumbsDown className="h-3.5 w-3.5" />
+                                  </button>
+                                  {msg.feedbackRating && feedbackFormToken !== msg.feedbackToken && (
+                                    <span className="inline-flex items-center gap-1 text-emerald-700">
+                                      <Check className="h-3.5 w-3.5" /> Feedback recorded
+                                    </span>
+                                  )}
+                                </div>
+
+                                {feedbackFormToken === msg.feedbackToken && (
+                                  <div className="mt-3 space-y-3 rounded-xl border border-slate-200 bg-white p-3">
+                                    <label className="block text-xs font-semibold text-slate-700">
+                                      What went wrong?
+                                      <select
+                                        value={feedbackReason}
+                                        onChange={event => setFeedbackReason(event.target.value as FeedbackReason)}
+                                        className="mt-1.5 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-700"
+                                      >
+                                        {FEEDBACK_REASONS.map(reason => (
+                                          <option key={reason.value} value={reason.value}>{reason.label}</option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                    <label className="block text-xs font-semibold text-slate-700">
+                                      Details (optional)
+                                      <textarea
+                                        value={feedbackComment}
+                                        onChange={event => setFeedbackComment(event.target.value.slice(0, 1000))}
+                                        rows={3}
+                                        placeholder="Tell us what you expected or which part needs attention."
+                                        className="mt-1.5 w-full resize-y rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs text-slate-700"
+                                      />
+                                    </label>
+                                    <p className="text-[11px] leading-relaxed text-slate-500">
+                                      Submitting sends this question, an answer excerpt, your selected reason, and your comment to the site maintainer. Do not include confidential information.
+                                    </p>
+                                    {feedbackErrorToken === msg.feedbackToken && (
+                                      <p className="text-xs font-medium text-rose-600">Feedback could not be sent. Please try again.</p>
+                                    )}
+                                    <div className="flex justify-end gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => setFeedbackFormToken(null)}
+                                        className="rounded-lg px-3 py-2 text-xs font-semibold text-slate-500 hover:bg-slate-100"
+                                      >
+                                        Cancel
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => void recordFeedback(idx, msg, 'down')}
+                                        disabled={feedbackSubmittingToken === msg.feedbackToken}
+                                        className="rounded-lg bg-psc-blue px-3 py-2 text-xs font-bold text-white hover:bg-psc-blue/90 disabled:opacity-50"
+                                      >
+                                        {feedbackSubmittingToken === msg.feedbackToken ? 'Sending…' : 'Submit feedback'}
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
                         </motion.div>
                       ))}

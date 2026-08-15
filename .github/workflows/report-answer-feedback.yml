@@ -1,0 +1,73 @@
+name: Report answer feedback
+
+on:
+  schedule:
+    # Daily morning digest (09:15 Eastern during daylight-saving time).
+    - cron: "15 13 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: report-answer-feedback
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  REPORT_URL: https://psc-docket-assistant.psc-docket-helper.workers.dev/api/feedback/report
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pending feedback
+        id: feedback
+        env:
+          FEEDBACK_REPORT_TOKEN: ${{ secrets.FEEDBACK_REPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FEEDBACK_REPORT_TOKEN" ]; then
+            echo "::error::Missing GitHub Actions secret: FEEDBACK_REPORT_TOKEN"
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 30 \
+            -H "Authorization: Bearer $FEEDBACK_REPORT_TOKEN" \
+            "$REPORT_URL" > feedback-report.json
+          count=$(jq -r '.count // 0' feedback-report.json)
+          if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Feedback API returned an invalid count"
+            exit 1
+          fi
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            python3 scripts/build_feedback_digest.py feedback-report.json > feedback-digest.md
+            jq -c '{requestIds: [.feedback[].request_id]}' feedback-report.json > feedback-ack.json
+          fi
+
+      - name: Create the feedback digest issue
+        if: steps.feedback.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DIGEST_DATE: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+          title="Answer feedback digest — ${DIGEST_DATE:0:10}"
+          gh issue create --title "$title" --body-file feedback-digest.md
+
+      - name: Mark included feedback as reported
+        if: steps.feedback.outputs.count != '0'
+        env:
+          FEEDBACK_REPORT_TOKEN: ${{ secrets.FEEDBACK_REPORT_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 30 \
+            -X POST \
+            -H "Authorization: Bearer $FEEDBACK_REPORT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @feedback-ack.json \
+            "$REPORT_URL/ack"

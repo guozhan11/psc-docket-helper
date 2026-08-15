@@ -1,6 +1,8 @@
 export interface Message {
   role: 'user' | 'model';
   content: string;
+  feedbackToken?: string;
+  feedbackRating?: 'up' | 'down';
 }
 
 export interface NewsUpdate {
@@ -20,7 +22,19 @@ export interface ChatSession {
 export interface PublicAppConfig {
   turnstileRequired: boolean;
   turnstileSiteKey: string | null;
+  feedbackEnabled: boolean;
   maxMessageLength: number;
+}
+
+export type FeedbackReason = 'incorrect' | 'missing' | 'unclear' | 'citation' | 'other';
+
+export interface AnswerFeedback {
+  token: string;
+  rating: 'up' | 'down';
+  reason?: FeedbackReason;
+  comment?: string;
+  question?: string;
+  answerExcerpt?: string;
 }
 
 export interface HealthSummary {

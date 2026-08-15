@@ -47,6 +47,25 @@ The browser sends a single-use token with each chat request. The Worker calls Cl
 
 AI Gateway spend limits and alerts are account-level controls and must be confirmed in the Cloudflare dashboard before release; they cannot be guaranteed by repository configuration alone.
 
+## Answer Feedback and Daily Digest
+
+Generated answers expose thumbs-up and thumbs-down controls. A negative response asks for a reason and an optional comment, and tells the user that the question and an answer excerpt will be sent to the maintainer. Positive feedback stores only the vote. Feedback is written to the `answer_feedback` table in the primary D1 database; no IP address or user profile is stored.
+
+The Worker signs a seven-day feedback token for each completed chat response. Configure one random value in both secret stores without committing it:
+
+```bash
+npx wrangler secret put FEEDBACK_SECRET
+gh secret set FEEDBACK_REPORT_TOKEN
+```
+
+The `Report answer feedback` GitHub Actions workflow runs daily at 13:15 UTC. It retrieves unreported feedback through the authenticated report endpoint, creates a GitHub Issue containing vote totals and negative-response context, then acknowledges only the rows included in the successfully created issue. It can also be run manually from the Actions tab.
+
+Apply migration `0005_answer_feedback.sql` to all D1 bindings before deploying the UI and API:
+
+```bash
+npm run cloudflare:db:remote
+```
+
 The committed `wrangler.jsonc` binds the production R2 bucket and three D1 shards. Apply migrations to every shard before the first ingestion run. For authenticated AI Gateway requests, configure `CLOUDFLARE_ACCOUNT_ID`, `AI_GATEWAY_ID`, and `CF_AIG_TOKEN` as needed.
 
 For local Worker testing, copy `.dev.vars.example` to `.dev.vars`, then run:

@@ -14,14 +14,17 @@ import {
   fullTextCoverageSummary,
   isFreshTimestamp,
   isCredentialOrPromptExtractionRequest,
+  issueFeedbackToken,
   openAiRequestPayload,
   openAiStreamDelta,
   parseChatRequestBody,
+  parseFeedbackRequestBody,
   answerSuffix,
   readR2JsonWithRetry,
   routeCasesByTermIndex,
   selectDiverseDocumentResults,
-  selectDiverseGlobalResults
+  selectDiverseGlobalResults,
+  verifyFeedbackToken
 } from './index.ts';
 import { gzipSync } from 'node:zlib';
 import {
@@ -58,6 +61,46 @@ test('verified requests consume the global chat limit last', async () => {
   );
   assert.equal(failure, null);
   assert.deepEqual(calls, ['actor', 'turnstile', 'global']);
+});
+
+test('feedback tokens identify one answer and expire after seven days', async () => {
+  const requestId = '123e4567-e89b-42d3-a456-426614174000';
+  const issuedAt = Date.UTC(2026, 7, 15);
+  const token = await issueFeedbackToken('test-feedback-secret', requestId, issuedAt);
+  assert.ok(token);
+  assert.equal(
+    await verifyFeedbackToken('test-feedback-secret', token, issuedAt + 60_000),
+    requestId
+  );
+  assert.equal(
+    await verifyFeedbackToken('test-feedback-secret', `${token}x`, issuedAt + 60_000),
+    null
+  );
+  assert.equal(
+    await verifyFeedbackToken('test-feedback-secret', token, issuedAt + 8 * 24 * 60 * 60 * 1_000),
+    null
+  );
+});
+
+test('negative feedback requires a reason and answer context', () => {
+  const valid = parseFeedbackRequestBody({
+    token: 'signed-token',
+    rating: 'down',
+    reason: 'incorrect',
+    comment: 'The date is wrong.',
+    question: 'When was the order issued?',
+    answerExcerpt: 'The order was issued in 2024.'
+  });
+  assert.equal(valid?.reason, 'incorrect');
+  assert.equal(parseFeedbackRequestBody({ token: 'signed-token', rating: 'down' }), null);
+  assert.deepEqual(parseFeedbackRequestBody({ token: 'signed-token', rating: 'up' }), {
+    token: 'signed-token',
+    rating: 'up',
+    reason: null,
+    comment: null,
+    question: null,
+    answerExcerpt: null
+  });
 });
 
 test('OpenAI response stream parser returns only text deltas', () => {

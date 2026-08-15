@@ -32,6 +32,18 @@ interface ChatRequestBody {
   turnstileToken: string | null;
 }
 
+export type FeedbackRating = "up" | "down";
+export type FeedbackReason = "incorrect" | "missing" | "unclear" | "citation" | "other";
+
+export interface FeedbackRequestBody {
+  token: string;
+  rating: FeedbackRating;
+  reason: FeedbackReason | null;
+  comment: string | null;
+  question: string | null;
+  answerExcerpt: string | null;
+}
+
 interface TurnstileSiteverifyResponse {
   success?: boolean;
   hostname?: string;
@@ -177,6 +189,13 @@ const MAX_MESSAGE_LENGTH = 5_000;
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_HISTORY_MESSAGE_LENGTH = 5_000;
 const MAX_TURNSTILE_TOKEN_LENGTH = 2_048;
+const MAX_FEEDBACK_BODY_BYTES = 16 * 1024;
+const MAX_FEEDBACK_COMMENT_LENGTH = 1_000;
+const MAX_FEEDBACK_QUESTION_LENGTH = 1_500;
+const MAX_FEEDBACK_ANSWER_LENGTH = 2_500;
+const FEEDBACK_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+const FEEDBACK_TOKEN_CLOCK_SKEW_MS = 5 * 60 * 1_000;
+const FEEDBACK_REPORT_LIMIT = 100;
 const HEALTH_FRESHNESS_MS = 36 * 60 * 60 * 1_000;
 // The term index is rebuilt weekly: a full pass reads every stored document,
 // and the corpus barely moves between runs. Judging it against the ingestion
@@ -312,9 +331,111 @@ export function parseChatRequestBody(value: unknown): ChatRequestBody | null {
   return { history: rawHistory, message, clientId, turnstileToken };
 }
 
-async function readLimitedJson(request: Request): Promise<unknown> {
+export function parseFeedbackRequestBody(value: unknown): FeedbackRequestBody | null {
+  if (!isRecord(value) || typeof value.token !== "string" || value.token.length > 512
+    || (value.rating !== "up" && value.rating !== "down")) return null;
+  const reasons: FeedbackReason[] = ["incorrect", "missing", "unclear", "citation", "other"];
+  const reason = typeof value.reason === "string" && reasons.includes(value.reason as FeedbackReason)
+    ? value.reason as FeedbackReason
+    : null;
+  const normalize = (input: unknown, maxLength: number): string | null => {
+    if (typeof input !== "string") return null;
+    const trimmed = input.trim();
+    return trimmed && trimmed.length <= maxLength ? trimmed : null;
+  };
+  const comment = normalize(value.comment, MAX_FEEDBACK_COMMENT_LENGTH);
+  const question = normalize(value.question, MAX_FEEDBACK_QUESTION_LENGTH);
+  const answerExcerpt = normalize(value.answerExcerpt, MAX_FEEDBACK_ANSWER_LENGTH);
+  if (value.rating === "down" && (!reason || !question || !answerExcerpt)) return null;
+  return {
+    token: value.token,
+    rating: value.rating,
+    reason: value.rating === "down" ? reason : null,
+    comment: value.rating === "down" ? comment : null,
+    question: value.rating === "down" ? question : null,
+    answerExcerpt: value.rating === "down" ? answerExcerpt : null
+  };
+}
+
+function feedbackTokenPayload(issuedAt: number, requestId: string): string {
+  return `${issuedAt}.${requestId}`;
+}
+
+async function feedbackHmac(secret: string, payload: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(payload)));
+  return btoa(String.fromCharCode(...signature))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+export async function issueFeedbackToken(
+  secret: string | undefined,
+  requestId: string,
+  issuedAt = Date.now()
+): Promise<string | null> {
+  if (!secret) return null;
+  const payload = feedbackTokenPayload(issuedAt, requestId);
+  return `${payload}.${await feedbackHmac(secret, payload)}`;
+}
+
+export async function verifyFeedbackToken(
+  secret: string | undefined,
+  token: string,
+  now = Date.now()
+): Promise<string | null> {
+  if (!secret) return null;
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const issuedAt = Number(parts[0]);
+  const requestId = parts[1];
+  if (!Number.isSafeInteger(issuedAt)
+    || issuedAt > now + FEEDBACK_TOKEN_CLOCK_SKEW_MS
+    || now - issuedAt > FEEDBACK_TOKEN_TTL_MS
+    || !/^[a-f0-9-]{36}$/i.test(requestId)) return null;
+  const payload = feedbackTokenPayload(issuedAt, requestId);
+  const expected = await feedbackHmac(secret, payload);
+  if (expected.length !== parts[2].length) return null;
+  let difference = 0;
+  for (let index = 0; index < expected.length; index += 1) {
+    difference |= expected.charCodeAt(index) ^ parts[2].charCodeAt(index);
+  }
+  return difference === 0 ? requestId : null;
+}
+
+async function securelyEqual(left: string, right: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const [leftHash, rightHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(left)),
+    crypto.subtle.digest("SHA-256", encoder.encode(right))
+  ]);
+  const leftBytes = new Uint8Array(leftHash);
+  const rightBytes = new Uint8Array(rightHash);
+  let difference = 0;
+  for (let index = 0; index < leftBytes.length; index += 1) {
+    difference |= leftBytes[index] ^ rightBytes[index];
+  }
+  return difference === 0;
+}
+
+async function feedbackReportAuthorized(request: Request, secret: string | undefined): Promise<boolean> {
+  if (!secret) return false;
+  const authorization = request.headers.get("Authorization") ?? "";
+  const provided = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+  return securelyEqual(provided, secret);
+}
+
+async function readLimitedJson(request: Request, maxBytes = MAX_CHAT_BODY_BYTES): Promise<unknown> {
   const contentLength = Number(request.headers.get("Content-Length") ?? 0);
-  if (contentLength > MAX_CHAT_BODY_BYTES) throw new Error("request-too-large");
+  if (contentLength > maxBytes) throw new Error("request-too-large");
   if (!request.body) return null;
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -323,7 +444,7 @@ async function readLimitedJson(request: Request): Promise<unknown> {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > MAX_CHAT_BODY_BYTES) {
+    if (total > maxBytes) {
       await reader.cancel();
       throw new Error("request-too-large");
     }
@@ -1613,11 +1734,11 @@ function encodeAssistantEvent(event: "delta" | "done" | "error", data: unknown):
   return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function staticAssistantStream(reply: string, requestId: string): Response {
+function staticAssistantStream(reply: string, requestId: string, feedbackToken: string | null): Response {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       controller.enqueue(encodeAssistantEvent("delta", { delta: reply }));
-      controller.enqueue(encodeAssistantEvent("done", { requestId }));
+      controller.enqueue(encodeAssistantEvent("done", { requestId, feedbackToken }));
       controller.close();
     }
   });
@@ -1654,10 +1775,11 @@ async function streamAnswerWithOpenAi(
   message: string,
   rows: SearchRow[],
   requestId: string,
+  feedbackToken: string | null,
   requestSignal: AbortSignal
 ): Promise<Response> {
   if (!env.OPENAI_API_KEY) {
-    return staticAssistantStream(buildDirectExcerptReply(rows, "disabled"), requestId);
+    return staticAssistantStream(buildDirectExcerptReply(rows, "disabled"), requestId, feedbackToken);
   }
   const headers: Record<string, string> = {
     Authorization: `Bearer ${env.OPENAI_API_KEY}`,
@@ -1719,7 +1841,7 @@ async function streamAnswerWithOpenAi(
           if (!rawReply.trim()) throw new Error("OpenAI returned no text");
           const suffix = answerSuffix(message, rawReply, rows);
           if (suffix) controller.enqueue(encodeAssistantEvent("delta", { delta: suffix }));
-          controller.enqueue(encodeAssistantEvent("done", { requestId }));
+          controller.enqueue(encodeAssistantEvent("done", { requestId, feedbackToken }));
           logChatStage(requestId, "ai-summary", modelStartedAt, { outcome: "streamed" });
         } catch (error) {
           if (!requestSignal.aborted) {
@@ -1756,7 +1878,7 @@ async function streamAnswerWithOpenAi(
       durationMs: elapsedMs(modelStartedAt),
       error: error instanceof Error ? error.message : String(error)
     }));
-    return staticAssistantStream(buildDirectExcerptReply(rows, "unavailable"), requestId);
+    return staticAssistantStream(buildDirectExcerptReply(rows, "unavailable"), requestId, feedbackToken);
   }
 }
 
@@ -1828,6 +1950,7 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
     return json({
       turnstileRequired: Boolean(env.TURNSTILE_SECRET),
       turnstileSiteKey: env.TURNSTILE_SECRET ? env.TURNSTILE_SITE_KEY ?? null : null,
+      feedbackEnabled: Boolean(env.FEEDBACK_SECRET),
       maxMessageLength: MAX_MESSAGE_LENGTH
     });
   }
@@ -2045,6 +2168,103 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
     }
   }
 
+  if (url.pathname === "/api/feedback" && request.method === "POST") {
+    if (!env.FEEDBACK_SECRET) return json({ error: "Feedback is not configured" }, 503);
+    if (!(request.headers.get("Content-Type") ?? "").toLowerCase().startsWith("application/json")) {
+      return json({ error: "Content-Type must be application/json" }, 415);
+    }
+    const clientIp = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    const feedbackLimit = await env.CHAT_RATE_LIMITER.limit({ key: `feedback:${clientIp}` });
+    if (!feedbackLimit.success) {
+      return json({ error: "Too many feedback submissions" }, 429, { "Retry-After": "60" });
+    }
+    let rawBody: unknown;
+    try {
+      rawBody = await readLimitedJson(request, MAX_FEEDBACK_BODY_BYTES);
+    } catch (error) {
+      if (error instanceof Error && error.message === "request-too-large") {
+        return json({ error: "Feedback body is too large" }, 413);
+      }
+      throw error;
+    }
+    const body = parseFeedbackRequestBody(rawBody);
+    if (!body) return json({ error: "Invalid feedback" }, 400);
+    const requestId = await verifyFeedbackToken(env.FEEDBACK_SECRET, body.token);
+    if (!requestId) return json({ error: "Feedback token is invalid or expired" }, 403);
+    const now = new Date().toISOString();
+    await env.DB.prepare(`
+      INSERT INTO answer_feedback (
+        request_id, rating, reason, comment, question, answer_excerpt,
+        created_at, updated_at, reported_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(request_id) DO UPDATE SET
+        rating = excluded.rating,
+        reason = excluded.reason,
+        comment = excluded.comment,
+        question = excluded.question,
+        answer_excerpt = excluded.answer_excerpt,
+        updated_at = excluded.updated_at,
+        reported_at = NULL
+    `).bind(
+      requestId,
+      body.rating,
+      body.reason,
+      body.comment,
+      body.question,
+      body.answerExcerpt,
+      now,
+      now
+    ).run();
+    console.log(JSON.stringify({ message: "answer feedback stored", requestId, rating: body.rating }));
+    return json({ ok: true });
+  }
+
+  if (url.pathname === "/api/feedback/report" && request.method === "GET") {
+    if (!(await feedbackReportAuthorized(request, env.FEEDBACK_SECRET))) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+    const result = await env.DB.prepare(`
+      SELECT request_id, rating, reason, comment, question, answer_excerpt,
+             created_at, updated_at
+        FROM answer_feedback
+       WHERE reported_at IS NULL
+       ORDER BY updated_at ASC
+       LIMIT ?
+    `).bind(FEEDBACK_REPORT_LIMIT).all<{
+      request_id: string;
+      rating: FeedbackRating;
+      reason: FeedbackReason | null;
+      comment: string | null;
+      question: string | null;
+      answer_excerpt: string | null;
+      created_at: string;
+      updated_at: string;
+    }>();
+    const up = result.results.filter(item => item.rating === "up").length;
+    const down = result.results.filter(item => item.rating === "down").length;
+    return json({ count: result.results.length, up, down, feedback: result.results });
+  }
+
+  if (url.pathname === "/api/feedback/report/ack" && request.method === "POST") {
+    if (!(await feedbackReportAuthorized(request, env.FEEDBACK_SECRET))) {
+      return json({ error: "Unauthorized" }, 401);
+    }
+    const rawBody = await readLimitedJson(request, MAX_FEEDBACK_BODY_BYTES);
+    if (!isRecord(rawBody) || !Array.isArray(rawBody.requestIds)
+      || rawBody.requestIds.length > FEEDBACK_REPORT_LIMIT
+      || !rawBody.requestIds.every(id => typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id))) {
+      return json({ error: "Invalid requestIds" }, 400);
+    }
+    if (rawBody.requestIds.length) {
+      const reportedAt = new Date().toISOString();
+      const statement = env.DB.prepare(
+        "UPDATE answer_feedback SET reported_at = ? WHERE request_id = ? AND reported_at IS NULL"
+      );
+      await env.DB.batch(rawBody.requestIds.map(requestId => statement.bind(reportedAt, requestId)));
+    }
+    return json({ ok: true, acknowledged: rawBody.requestIds.length });
+  }
+
   if (url.pathname === "/api/chat" && request.method === "POST") {
     const requestId = crypto.randomUUID();
     const requestStartedAt = performance.now();
@@ -2086,27 +2306,38 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
         userMessage: "Security verification expired or failed. Please retry the challenge and submit again."
       }, 403);
     }
+    const feedbackToken = await issueFeedbackToken(env.FEEDBACK_SECRET, requestId);
     const message = body.message;
     try {
       if (isCredentialOrPromptExtractionRequest(message)) {
         const reply = "I can’t reveal private instructions, credentials, or secrets. I can help research DC PSC dockets and public filings instead.";
-        return wantsEventStream ? staticAssistantStream(reply, requestId) : json({ reply });
+        return wantsEventStream
+          ? staticAssistantStream(reply, requestId, feedbackToken)
+          : json({ reply, requestId, feedbackToken });
       }
       const directCaseReply = await buildDetailedCaseNumberReply(message);
       if (directCaseReply) {
         logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "direct-case" });
         return wantsEventStream
-          ? staticAssistantStream(directCaseReply, requestId)
-          : json({ reply: directCaseReply, requestId });
+          ? staticAssistantStream(directCaseReply, requestId, feedbackToken)
+          : json({ reply: directCaseReply, requestId, feedbackToken });
       }
       const rows = await searchDockets(env, message, requestId);
       if (wantsEventStream) {
         logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "stream-start", rows: rows.length });
-        return streamAnswerWithOpenAi(env, body.history, message, rows, requestId, request.signal);
+        return streamAnswerWithOpenAi(
+          env,
+          body.history,
+          message,
+          rows,
+          requestId,
+          feedbackToken,
+          request.signal
+        );
       }
       const reply = await answerWithOpenAi(env, body.history, message, rows, requestId);
       logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "success", rows: rows.length });
-      return json({ reply, requestId });
+      return json({ reply, requestId, feedbackToken });
     } catch (error) {
       console.error(JSON.stringify({
         message: "chat failed",
@@ -2116,8 +2347,8 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       }));
       const reply = `⚠️ The assistant could not complete this search right now. Please try again, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`;
       return wantsEventStream
-        ? staticAssistantStream(reply, requestId)
-        : json({ reply, requestId });
+        ? staticAssistantStream(reply, requestId, feedbackToken)
+        : json({ reply, requestId, feedbackToken });
     }
   }
 

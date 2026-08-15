@@ -6,6 +6,9 @@
 	"compatibility_flags": ["nodejs_compat"],
 	"workers_dev": true,
 	"preview_urls": false,
+	"secrets": {
+		"required": ["FEEDBACK_SECRET"]
+	},
 	"assets": {
 		"directory": "./dist",
 		"binding": "ASSETS",

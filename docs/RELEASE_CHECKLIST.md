@@ -41,6 +41,9 @@ Release threshold: no fabricated filing, page, quotation, date, or URL; 100% wor
 - Worker error, latency, and ingestion failure alerts are enabled.
 - The previous public URLs redirect to the canonical URL.
 - Privacy and beta disclosures are visible on desktop and mobile.
+- A newly generated answer displays feedback controls; thumbs up records without sending answer text.
+- Thumbs down records the selected reason, question, answer excerpt, and optional comment after showing the disclosure.
+- The `Report answer feedback` workflow can retrieve a test response, create a digest issue, and acknowledge it without duplicating it on the next run.
 
 ## Rollback
 
