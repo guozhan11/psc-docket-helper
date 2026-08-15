@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      health-url:
+        description: "Override the URL, to confirm the alarm path still fires"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: monitor-health
@@ -17,7 +23,7 @@ permissions:
   issues: write
 
 env:
-  HEALTH_URL: https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health
+  HEALTH_URL: ${{ inputs.health-url || 'https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health' }}
   # One open issue per condition, reused rather than reopened, so a long outage
   # does not bury the repository under a new issue every half hour.
   ALERT_TITLE: "Health check: /api/health is not ok"
