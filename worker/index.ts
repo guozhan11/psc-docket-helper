@@ -837,6 +837,87 @@ function filingCitation(row: SearchRow): string {
   return `[${citationTitle(row.title)} — p. ${row.page_number}](${officialPdfPageUrl(row)})`;
 }
 
+/**
+ * Reattaches the link to a citation the model wrote as bare brackets.
+ *
+ * The instructions ask for each record's exact citation Markdown, but with more
+ * evidence records in context the model began emitting `[Title — p. 2]` without
+ * the URL. Markdown renders that as literal text, and two adjacent ones read as
+ * reference-link syntax, so a whole answer's citations stopped being clickable.
+ * The Worker knows every row's real citation, so repair rather than rely on the
+ * model reproducing a URL verbatim.
+ */
+export function relinkBareCitations(reply: string, rows: SearchRow[]): string {
+  if (!rows.length) return reply;
+  const byTitle = new Map<string, SearchRow>();
+  for (const row of rows) {
+    // Key on what the citation renders as, so a match is exact rather than fuzzy.
+    byTitle.set(citationTitle(row.title).toLowerCase(), row);
+  }
+  // Only an opening parenthesis means the model already supplied a target. A
+  // following "[" must not disqualify it: two adjacent bare citations were the
+  // exact shape that reached users, and Markdown reads that pair as reference
+  // syntax, so both rendered as plain text.
+  return reply.replace(/\[([^\[\]\n]{4,300}?)\](?!\s*\()/g, (whole, inner: string) => {
+    const text = String(inner).trim();
+    const pageMatch = text.match(/^(.*?)\s*[—–-]\s*p(?:age)?\.?\s*(\d+)\s*$/i);
+    const title = (pageMatch ? pageMatch[1] : text).trim().toLowerCase();
+    const row = byTitle.get(title);
+    if (!row) return whole;
+    const page = pageMatch ? Number(pageMatch[2]) : row.page_number;
+    return filingCitation(Number.isFinite(page) ? { ...row, page_number: page } : row);
+  });
+}
+
+/**
+ * Repairs bare citations on a stream, without giving up streaming.
+ *
+ * Answers are emitted delta by delta, so text is already in the browser before
+ * the whole reply exists — repairing afterwards fixes only the non-streaming
+ * path, which the site does not use. This holds back just the span that starts
+ * at an unclosed "[" and releases it once the following character says whether
+ * the model supplied a link target. Everything else streams untouched.
+ */
+export function createCitationRelinker(rows: SearchRow[], maxHold = 320) {
+  let pending = "";
+
+  const drain = (final: boolean): string => {
+    let out = "";
+    for (;;) {
+      const open = pending.indexOf("[");
+      if (open === -1) {
+        out += pending;
+        pending = "";
+        return out;
+      }
+      out += pending.slice(0, open);
+      pending = pending.slice(open);
+
+      const close = pending.indexOf("]");
+      if (close === -1) {
+        // A bracket this long is not a citation; stop holding the stream.
+        if (final || pending.length > maxHold) {
+          out += pending;
+          pending = "";
+          return out;
+        }
+        return out;
+      }
+      // One character past "]" decides whether a target follows.
+      if (!final && pending.length < close + 2) return out;
+      const span = pending.slice(0, close + 1);
+      const next = pending[close + 1] ?? "";
+      pending = pending.slice(close + 1);
+      out += next === "(" ? span : relinkBareCitations(span, rows);
+    }
+  };
+
+  return {
+    push: (delta: string) => { pending += delta; return drain(false); },
+    flush: () => drain(true)
+  };
+}
+
 function replaceOpaqueSourceLabels(reply: string, rows: SearchRow[]): string {
   return rows.reduce((updated, row, index) => {
     const sourceNumber = index + 1;
@@ -1743,7 +1824,7 @@ export function answerSuffix(message: string, reply: string, rows: SearchRow[]):
 }
 
 function formatOpenAiReply(message: string, rawReply: string, rows: SearchRow[]): string {
-  const reply = replaceOpaqueSourceLabels(rawReply, rows);
+  const reply = relinkBareCitations(replaceOpaqueSourceLabels(rawReply, rows), rows);
   return `${reply}${answerSuffix(message, reply, rows)}`;
 }
 
@@ -1834,6 +1915,7 @@ async function streamAnswerWithOpenAi(
         const decoder = new TextDecoder();
         let buffer = "";
         let rawReply = "";
+        const relinker = createCitationRelinker(rows);
         try {
           while (true) {
             const { done, value } = await reader.read();
@@ -1844,7 +1926,8 @@ async function streamAnswerWithOpenAi(
               const delta = openAiStreamDelta(frame);
               if (!delta) continue;
               rawReply += delta;
-              controller.enqueue(encodeAssistantEvent("delta", { delta }));
+              const ready = relinker.push(delta);
+              if (ready) controller.enqueue(encodeAssistantEvent("delta", { delta: ready }));
             }
             if (done) break;
           }
@@ -1852,9 +1935,12 @@ async function streamAnswerWithOpenAi(
             const delta = openAiStreamDelta(buffer);
             if (delta) {
               rawReply += delta;
-              controller.enqueue(encodeAssistantEvent("delta", { delta }));
+              const ready = relinker.push(delta);
+              if (ready) controller.enqueue(encodeAssistantEvent("delta", { delta: ready }));
             }
           }
+          const tail = relinker.flush();
+          if (tail) controller.enqueue(encodeAssistantEvent("delta", { delta: tail }));
           if (!rawReply.trim()) throw new Error("OpenAI returned no text");
           const suffix = answerSuffix(message, rawReply, rows);
           if (suffix) controller.enqueue(encodeAssistantEvent("delta", { delta: suffix }));

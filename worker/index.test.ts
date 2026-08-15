@@ -20,6 +20,8 @@ import {
   parseChatRequestBody,
   parseFeedbackRequestBody,
   answerSuffix,
+  createCitationRelinker,
+  relinkBareCitations,
   readR2JsonWithRetry,
   routeCasesByTermIndex,
   selectDiverseDocumentResults,
@@ -566,4 +568,80 @@ test('source list titles are truncated like inline citations', () => {
   // Still identifiable and still linked to the right page.
   assert.ok(line.includes('The Public Service Commission of the District of Columbia'));
   assert.ok(line.includes('page 6'));
+});
+
+// --- Citation repair on the stream ----------------------------------------
+
+const CITATION_ROW = {
+  filing_id: 42,
+  case_number: 'ARDIR2020-01',
+  docket_number: null,
+  title: "WGL's Monthly Report, pursuant to Order No. 15134.",
+  received_date: '2020-03-15T00:00:00',
+  official_pdf_url: 'https://edocket.dcpsc.org/apis/api/Filing/download?attachId=9&guidFileName=b.pdf',
+  page_number: 2,
+  text: 'excerpt',
+  rank: -1
+};
+
+function streamThrough(chunks: string[], rows = [CITATION_ROW]) {
+  const relinker = createCitationRelinker(rows);
+  return chunks.map(chunk => relinker.push(chunk)).join('') + relinker.flush();
+}
+
+test('a citation the model wrote without a link target is repaired', () => {
+  const out = relinkBareCitations(
+    "See [WGL's Monthly Report, pursuant to Order No. 15134. — p. 2].",
+    [CITATION_ROW]
+  );
+  assert.match(out, /\]\(https:\/\/edocket\.dcpsc\.org/);
+  assert.ok(out.includes('p. 2'));
+});
+
+test('two bare citations in a row are both repaired', () => {
+  // Adjacent brackets are reference-link syntax in Markdown, so the pair
+  // rendered as literal text rather than as two links.
+  const out = relinkBareCitations(
+    "[WGL's Monthly Report, pursuant to Order No. 15134. — p. 2]"
+      + "[WGL's Monthly Report, pursuant to Order No. 15134. — p. 4].",
+    [CITATION_ROW]
+  );
+  assert.equal(out.match(/https:\/\/edocket/g)?.length, 2);
+  assert.ok(out.includes('p. 4'), 'the page the model cited must be kept');
+});
+
+test('an already-linked citation is left alone', () => {
+  const linked = "[Title — p. 2](https://edocket.dcpsc.org/x.pdf#page=2)";
+  assert.equal(relinkBareCitations(linked, [CITATION_ROW]), linked);
+});
+
+test('brackets that are not citations pass through untouched', () => {
+  const text = 'The order [see paragraph 8] is unrelated.';
+  assert.equal(relinkBareCitations(text, [CITATION_ROW]), text);
+});
+
+test('the stream repairs a citation split across deltas', () => {
+  // The model emits a few characters at a time; the repair has to survive a
+  // citation arriving in pieces.
+  const out = streamThrough([
+    'Reports show ', "[WGL's Monthly ", 'Report, pursuant to ', 'Order No. 15134.',
+    ' — p. 2', ']', ' and more text.'
+  ]);
+  assert.match(out, /\]\(https:\/\/edocket\.dcpsc\.org/);
+  assert.ok(out.startsWith('Reports show '));
+  assert.ok(out.endsWith(' and more text.'));
+});
+
+test('the stream emits text before a citation without waiting for it', () => {
+  const relinker = createCitationRelinker([CITATION_ROW]);
+  // Ordinary prose must not be held back behind an unfinished bracket.
+  assert.equal(relinker.push('Plain prose with no brackets.'), 'Plain prose with no brackets.');
+  assert.equal(relinker.push(' Then ['), ' Then ');
+});
+
+test('an unclosed bracket is released rather than stalling the stream', () => {
+  const relinker = createCitationRelinker([CITATION_ROW], 16);
+  relinker.push('[');
+  const released = relinker.push('x'.repeat(40));
+  assert.ok(released.includes('x'), 'a long unclosed bracket must not hold the stream');
 });
