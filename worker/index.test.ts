@@ -10,6 +10,7 @@ import {
   filterFillRatio,
   saturationAdjustedHits,
   fullTextCoverageSummary,
+  isFreshTimestamp,
   isCredentialOrPromptExtractionRequest,
   openAiRequestPayload,
   openAiStreamDelta,
@@ -431,4 +432,16 @@ test('term index routing ranks by term frequency within a match set', async () =
   // Same term, same IDF: only the document counts can order these.
   assert.deepEqual(routed.map(row => row.caseNumber), ['FC1184', 'FC9999', 'FC1176']);
   assert.ok(routed[0].filterScore > routed[2].filterScore);
+});
+
+test('term index freshness is judged against its weekly build, not ingestion', () => {
+  const now = Date.UTC(2026, 7, 15);
+  const twoDaysOld = new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString();
+  // Ingestion runs four times a day, so 36 hours is right for it and wrong for
+  // a weekly index: the same timestamp must read stale there and fresh here.
+  assert.equal(isFreshTimestamp(twoDaysOld, now), false);
+  assert.equal(isFreshTimestamp(twoDaysOld, now, 10 * 24 * 60 * 60 * 1000), true);
+
+  const twelveDaysOld = new Date(now - 12 * 24 * 60 * 60 * 1000).toISOString();
+  assert.equal(isFreshTimestamp(twelveDaysOld, now, 10 * 24 * 60 * 60 * 1000), false);
 });

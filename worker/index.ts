@@ -178,6 +178,10 @@ const MAX_HISTORY_MESSAGES = 10;
 const MAX_HISTORY_MESSAGE_LENGTH = 5_000;
 const MAX_TURNSTILE_TOKEN_LENGTH = 2_048;
 const HEALTH_FRESHNESS_MS = 36 * 60 * 60 * 1_000;
+// The term index is rebuilt weekly: a full pass reads every stored document,
+// and the corpus barely moves between runs. Judging it against the ingestion
+// threshold would report degraded health for most of every week.
+const TERM_INDEX_FRESHNESS_MS = 10 * 24 * 60 * 60 * 1_000;
 const CASE_ROUTER_VERSION = 2;
 const CASE_ROUTER_INDEX_KEY = `case-router/v${CASE_ROUTER_VERSION}/index.json`;
 const CASE_ROUTER_CANDIDATES = 8;
@@ -507,10 +511,14 @@ export function fullTextCoverageSummary(
   };
 }
 
-function isFreshTimestamp(value: unknown, now = Date.now()): boolean {
+export function isFreshTimestamp(
+  value: unknown,
+  now = Date.now(),
+  maxAgeMs = HEALTH_FRESHNESS_MS
+): boolean {
   if (typeof value !== "string") return false;
   const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && now - timestamp <= HEALTH_FRESHNESS_MS;
+  return Number.isFinite(timestamp) && now - timestamp <= maxAgeMs;
 }
 
 export function selectDiverseGlobalResults<T extends GlobalResultIdentity>(
@@ -1897,7 +1905,9 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
     const termIndexReady = isTermIndexManifest(termIndexPayload);
     const termIndex = termIndexReady
       ? {
-          status: isFreshTimestamp(termIndexPayload.updatedAt) ? "ready" : "stale",
+          status: isFreshTimestamp(termIndexPayload.updatedAt, Date.now(), TERM_INDEX_FRESHNESS_MS)
+            ? "ready"
+            : "stale",
           version: termIndexPayload.version,
           updatedAt: termIndexPayload.updatedAt,
           shardCount: termIndexPayload.shardCount,

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 import boto3
+from botocore.config import Config as BotoConfig
 
 from compact_search import TERM_FILTER_BYTES
 
@@ -235,6 +236,9 @@ def main() -> None:
         aws_access_key_id=require_env("R2_ACCESS_KEY_ID"),
         aws_secret_access_key=require_env("R2_SECRET_ACCESS_KEY"),
         region_name="auto",
+        # R2 issues transient InternalErrors; the boto3 default of four
+        # attempts is not enough for a pass this long.
+        config=BotoConfig(retries={"max_attempts": 10, "mode": "adaptive"}),
     )
     index = build_router(r2, bucket, args.shard_count)
     print(

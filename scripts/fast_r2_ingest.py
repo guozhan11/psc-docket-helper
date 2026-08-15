@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config as BotoConfig
 
 from cloud_ingest import (
     PermanentFilingError,
@@ -115,6 +116,10 @@ class FastR2Store:
                 aws_access_key_id=require_env("R2_ACCESS_KEY_ID"),
                 aws_secret_access_key=require_env("R2_SECRET_ACCESS_KEY"),
                 region_name="auto",
+                # R2 returns a transient InternalError often enough that the
+                # boto3 default of four attempts has ended whole shard runs
+                # mid-pass, taking the router rebuild down with them.
+                config=BotoConfig(retries={"max_attempts": 10, "mode": "adaptive"}),
             )
         self.lock = threading.Lock()
         self.manifests: dict[str, dict[int, dict[str, Any]]] = {}

@@ -144,7 +144,9 @@ jobs:
       ${{ always() && needs.metadata.result == 'success' &&
           (needs.ingest.result == 'success' || needs.ingest.result == 'skipped') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The router reads every case manifest, so its runtime grows with the
+    # corpus. At 120 it began hitting the cap and cancelling mid-publish.
+    timeout-minutes: 300
     permissions:
       contents: read
     env:
