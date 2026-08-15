@@ -488,17 +488,27 @@ test('term frequency separates cases that IDF alone ties', () => {
 });
 
 test('posting lists are read in both published formats', () => {
+  // "case-tf" stores raw document counts, read as a sublinear weight.
   const withCounts = [2, 'FC1176', 7, 'FC1184', 1];
   assert.deepEqual([...postingEntries(withCounts, 'case-tf')], [
-    { caseNumber: 'FC1176', documentsWithTerm: 7 },
-    { caseNumber: 'FC1184', documentsWithTerm: 1 }
+    { caseNumber: 'FC1176', weight: termFrequencyWeight(7) },
+    { caseNumber: 'FC1184', weight: termFrequencyWeight(1) }
   ]);
-  // The first generation stored case numbers only; each counts as one document
-  // so an older index stays readable instead of being rejected.
+
+  // "case-bm25" stores an already length-normalised weight, scaled to an
+  // integer so the wire format stays plain numbers.
+  const withWeights = [2, 'FC1176', 160, 'FC1184', 9];
+  assert.deepEqual([...postingEntries(withWeights, 'case-bm25')], [
+    { caseNumber: 'FC1176', weight: 1.6 },
+    { caseNumber: 'FC1184', weight: 0.09 }
+  ]);
+
+  // The first generation stored case numbers only; each counts as one so an
+  // older index stays readable instead of being rejected.
   const namesOnly = [2, 'FC1176', 'FC1184'];
   assert.deepEqual([...postingEntries(namesOnly, 'case')], [
-    { caseNumber: 'FC1176', documentsWithTerm: 1 },
-    { caseNumber: 'FC1184', documentsWithTerm: 1 }
+    { caseNumber: 'FC1176', weight: 1 },
+    { caseNumber: 'FC1184', weight: 1 }
   ]);
 });
 
