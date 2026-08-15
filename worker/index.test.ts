@@ -757,3 +757,14 @@ test('stemming stops before it destroys a short word', () => {
   assert.equal(stemTerm('gas'), 'gas');
   assert.equal(stemTerm('storm'), 'storm');
 });
+
+test('derivational stems keep clear of unrelated common words', () => {
+  // "gener" would substring-match "general", which appears on nearly every
+  // page of a legal filing — ruinous in a corpus about electricity generation.
+  assert.notEqual(stemTerm('generation'), stemTerm('general'));
+  assert.notEqual(stemTerm('terminations'), stemTerm('terminal'));
+  assert.equal(stemTerm('generation'), stemTerm('generations'));
+  assert.equal(stemTerm('terminations'), stemTerm('termination'));
+  // The unification that motivated stemming still holds.
+  assert.equal(stemTerm('disconnections'), stemTerm('disconnected'));
+});

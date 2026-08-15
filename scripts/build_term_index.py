@@ -65,7 +65,13 @@ TOKEN_PATTERN = re.compile(r"[a-z0-9][a-z0-9'-]{1,39}")
 # the word it came from, which is what lets the Worker verify excerpts with a
 # plain substring match instead of needing morphology at read time.
 MIN_STEM_LENGTH = 5
-STEM_SUFFIXES = ("ations", "ation", "ions", "ing", "ion", "ed", "es", "s")
+# Derivational endings remove more letters than plural or tense endings, so they
+# need more left over to stay meaningful. Stripping "-ation" at the inflectional
+# threshold turned "generation" into "gener", which substring-matches "general"
+# — a word on nearly every page of a legal filing.
+MIN_DERIVED_STEM_LENGTH = 7
+INFLECTIONAL_SUFFIXES = ("ing", "ed", "es", "s")
+DERIVATIONAL_SUFFIXES = ("ations", "ation", "ions", "ion")
 TAG_PATTERN = re.compile(r"<[^>]*>")
 
 
@@ -97,7 +103,17 @@ def stem_term(term: str) -> str:
     word = term.lower()
     if len(word) <= MIN_STEM_LENGTH:
         return word
-    for suffix in STEM_SUFFIXES:
+    # A possessive is not a plural: stripping its "s" leaves a dangling
+    # apostrophe rather than a word.
+    if word.endswith("'s"):
+        return word
+    for suffix in DERIVATIONAL_SUFFIXES:
+        if not word.endswith(suffix):
+            continue
+        stem = word[: len(word) - len(suffix)]
+        if len(stem) >= MIN_DERIVED_STEM_LENGTH:
+            return stem
+    for suffix in INFLECTIONAL_SUFFIXES:
         if not word.endswith(suffix):
             continue
         stem = word[: len(word) - len(suffix)]

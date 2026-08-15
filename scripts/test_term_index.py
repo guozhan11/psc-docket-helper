@@ -209,8 +209,17 @@ class BuildIntegrationTests(unittest.TestCase):
         return r2, index
 
     def _shard_terms(self, r2, index, term, shard_count=64):
-        key = shard_key(index["activeSlot"], term_shard(term, shard_count), shard_count)
-        return json.loads(gzip.decompress(r2.objects[key]))["terms"]
+        """Looks a term up the way the Worker does: by its stem.
+
+        Keying on the raw word would let the builder and the reader drift apart
+        without a test noticing.
+        """
+        from build_term_index import stem_term
+
+        stem = stem_term(term)
+        key = shard_key(index["activeSlot"], term_shard(stem, shard_count), shard_count)
+        terms = json.loads(gzip.decompress(r2.objects[key]))["terms"]
+        return {term: terms[stem]} if stem in terms else terms
 
     def test_postings_carry_length_normalised_weights(self):
         """Presence alone cannot order a match set; weights can."""
@@ -400,6 +409,18 @@ class StemTests(unittest.TestCase):
             "arrearages": "arrearag",
             "rates": "rates",
             "compliance": "compliance",
+            # A derivational ending must not strip down to a prefix of an
+            # unrelated common word: "gener" would match "general".
+            "generation": "generat",
+            "terminations": "terminat",
         }
         for word, expected in golden.items():
             self.assertEqual(stem_term(word), expected, f"stem drift for {word!r}")
+
+    def test_derivational_stems_keep_clear_of_common_words(self) -> None:
+        from build_term_index import stem_term
+
+        self.assertNotEqual(stem_term("generation"), stem_term("general"))
+        self.assertNotEqual(stem_term("terminations"), stem_term("terminal"))
+        # The unification that motivated stemming still holds.
+        self.assertEqual(stem_term("disconnections"), stem_term("disconnected"))

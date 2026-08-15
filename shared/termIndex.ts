@@ -91,11 +91,30 @@ export interface TermIndexShard {
  * a stem length where the remainder stops being a word.
  */
 export const MIN_STEM_LENGTH = 5;
+/**
+ * Derivational endings remove more letters than plural or tense endings, so
+ * they need more left over to stay meaningful. Stripping "-ation" at the
+ * inflectional threshold turned "generation" into "gener", which substring-
+ * matches "general" — a word on nearly every page of a legal filing, and a
+ * ruinous match for a corpus about electricity generation.
+ */
+export const MIN_DERIVED_STEM_LENGTH = 7;
+
+const INFLECTIONAL_SUFFIXES = ["ing", "ed", "es", "s"] as const;
+const DERIVATIONAL_SUFFIXES = ["ations", "ation", "ions", "ion"] as const;
 
 export function stemTerm(term: string): string {
   const word = term.toLowerCase();
   if (word.length <= MIN_STEM_LENGTH) return word;
-  for (const suffix of ["ations", "ation", "ions", "ing", "ion", "ed", "es", "s"]) {
+  // A possessive is not a plural: stripping its "s" leaves a dangling
+  // apostrophe rather than a word.
+  if (word.endsWith("'s")) return word;
+  for (const suffix of DERIVATIONAL_SUFFIXES) {
+    if (!word.endsWith(suffix)) continue;
+    const stem = word.slice(0, word.length - suffix.length);
+    if (stem.length >= MIN_DERIVED_STEM_LENGTH) return stem;
+  }
+  for (const suffix of INFLECTIONAL_SUFFIXES) {
     if (!word.endsWith(suffix)) continue;
     const stem = word.slice(0, word.length - suffix.length);
     if (stem.length >= MIN_STEM_LENGTH) return stem;
