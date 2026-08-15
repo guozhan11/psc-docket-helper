@@ -45,7 +45,15 @@ MAX_DOCUMENT_FREQUENCY = 0.15
 MIN_DOCUMENT_FREQUENCY_CAP = 32
 # Postings interleave each case with the number of its documents holding the
 # term. Readers that predate this fall back to treating every posting as one.
-POSTING_FORMAT = "case-tf"
+POSTING_FORMAT = "case-bm25"
+# BM25 term weighting. Counting documents alone rewards size on its own: the
+# 2,084-filing Exelon/Pepco merger docket led most cross-case questions because
+# any word appears somewhere in a case that large. Dividing by case length lets
+# a mid-sized case that discusses a topic throughout outrank it.
+BM25_K1 = 1.2
+BM25_B = 0.75
+# Weights are stored as integers so the wire format stays plain numbers.
+BM25_WEIGHT_SCALE = 100
 MAX_COMPRESSED_SHARD_BYTES = 8 * 1024 * 1024
 STATE_KEY = f"term-index/v{TERM_INDEX_VERSION}/build-state.json"
 
@@ -102,7 +110,24 @@ def load_gzip_json(r2: Any, bucket: str, key: str) -> Any:
     return json.loads(gzip.decompress(response["Body"].read()))
 
 
-def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> Counter[str]:
+def bm25_weight(
+    documents_with_term: int,
+    case_documents: int,
+    average_documents: float,
+    k1: float = BM25_K1,
+    b: float = BM25_B,
+) -> float:
+    """BM25 term-frequency component, normalised by case length."""
+    if documents_with_term <= 0:
+        return 0.0
+    length_ratio = case_documents / average_documents if average_documents > 0 else 1.0
+    denominator = documents_with_term + k1 * (1 - b + b * length_ratio)
+    if denominator <= 0:
+        return 0.0
+    return (documents_with_term * (k1 + 1)) / denominator
+
+
+def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> tuple[Counter[str], int]:
     """Terms in one case, counted by how many of its documents contain each.
 
     Presence alone cannot rank within a match set: IDF is a per-term constant,
@@ -122,6 +147,7 @@ def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> Counter[st
                 seen_r2_keys.add(r2_key)
 
     counts: Counter[str] = Counter()
+    documents_read = 0
     for r2_key in sorted(seen_r2_keys):
         try:
             response = r2.get_object(Bucket=bucket, Key=r2_key)
@@ -129,8 +155,9 @@ def case_terms(r2: Any, bucket: str, manifest_keys: Iterable[str]) -> Counter[st
             document_html = gzip.decompress(raw).decode("utf-8", "replace")
         except Exception:
             continue
+        documents_read += 1
         counts.update(document_terms(document_html))
-    return counts
+    return counts, documents_read
 
 
 def write_postings(
@@ -141,7 +168,7 @@ def write_postings(
     shard_count: int,
     progress_every: int,
     concurrency: int = 1,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[str, int]]:
     """Stream (term, case) postings into intermediate bucket files.
 
     A full pass makes roughly 200,000 R2 round trips. Serially that runs past
@@ -155,6 +182,9 @@ def write_postings(
     ]
     cases_written = 0
     postings = 0
+    # Case sizes drive BM25 length normalisation at publish time. One integer
+    # per case is small enough to hold for the whole corpus.
+    case_documents: dict[str, int] = {}
     ordered = sorted(grouped)
     batch_size = max(1, concurrency * 8)
     try:
@@ -164,14 +194,15 @@ def write_postings(
                 results = pool.map(
                     lambda case_number: (
                         case_number,
-                        case_terms(r2, bucket, sorted(grouped[case_number])),
+                        *case_terms(r2, bucket, sorted(grouped[case_number])),
                     ),
                     batch,
                 )
-                for case_number, terms in results:
+                for case_number, terms, documents_read in results:
                     if not terms:
                         continue
                     cases_written += 1
+                    case_documents[case_number] = documents_read
                     for term, documents_with_term in terms.items():
                         shard = term_shard(term, shard_count)
                         handles[shard % INTERMEDIATE_BUCKETS].write(
@@ -188,7 +219,7 @@ def write_postings(
     finally:
         for handle in handles:
             handle.close()
-    return cases_written, postings
+    return cases_written, postings, case_documents
 
 
 def publish_shards(
@@ -199,9 +230,13 @@ def publish_shards(
     total_cases: int,
     slot: str,
     generation: str,
+    case_documents: dict[str, int],
 ) -> tuple[int, int, int]:
     """Aggregate each intermediate bucket and upload its shards."""
     frequency_cap = max(MIN_DOCUMENT_FREQUENCY_CAP, int(total_cases * MAX_DOCUMENT_FREQUENCY))
+    average_documents = (
+        sum(case_documents.values()) / len(case_documents) if case_documents else 1.0
+    )
     total_terms = 0
     kept_postings = 0
     compressed_bytes = 0
@@ -236,8 +271,14 @@ def publish_shards(
                     continue
                 interleaved: list[Any] = [frequency]
                 for case_number in sorted(case_counts):
+                    weight = bm25_weight(
+                        case_counts[case_number],
+                        case_documents.get(case_number, 1),
+                        average_documents,
+                    )
                     interleaved.append(case_number)
-                    interleaved.append(case_counts[case_number])
+                    # At least 1: a real posting must never round away to zero.
+                    interleaved.append(max(1, round(weight * BM25_WEIGHT_SCALE)))
                 terms_payload[term] = interleaved
                 kept_postings += frequency
 
@@ -306,12 +347,12 @@ def build(
     work_dir = Path(tempfile.mkdtemp(prefix="term-index-"))
     try:
         print(f"Scanning {len(grouped):,} cases...", flush=True)
-        cases_written, postings = write_postings(
+        cases_written, postings, case_documents = write_postings(
             r2, bucket, grouped, work_dir, shard_count, progress_every, concurrency
         )
         print(f"Publishing {shard_count} shards to slot {slot}...", flush=True)
         total_terms, kept_postings, compressed_bytes = publish_shards(
-            r2, bucket, work_dir, shard_count, cases_written, slot, generation
+            r2, bucket, work_dir, shard_count, cases_written, slot, generation, case_documents
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

@@ -529,3 +529,29 @@ test('term index freshness is judged against its weekly build, not ingestion', (
   const twelveDaysOld = new Date(now - 12 * 24 * 60 * 60 * 1000).toISOString();
   assert.equal(isFreshTimestamp(twelveDaysOld, now, 10 * 24 * 60 * 60 * 1000), false);
 });
+
+test('source list titles are truncated like inline citations', () => {
+  // e-Docket returns a whole order's operative text as some filings'
+  // description; untruncated it renders as a wall of link text.
+  const longTitle = 'The Public Service Commission of the District of Columbia in FC 813, '
+    + 'Order No. 17622 dated September 8, 2014, Formal Case No. 813 shall be closed ten (10) days '
+    + 'from the date of this Order unless an objection is filed in accordance with paragraph 8.';
+  const suffix = answerSuffix('which cases discuss disconnections', 'reply', [{
+    filing_id: 1,
+    case_number: 'FC813',
+    docket_number: null,
+    title: longTitle,
+    received_date: '2014-09-08T00:00:00',
+    official_pdf_url: 'https://edocket.dcpsc.org/apis/api/Filing/download?attachId=1&guidFileName=a.pdf',
+    page_number: 6,
+    text: 'excerpt',
+    rank: -1
+  }]);
+  const line = suffix.split('\n').find(row => row.startsWith('- [FC813:'));
+  assert.ok(line, 'source line missing');
+  assert.ok(!line.includes(longTitle), 'full description must not be rendered');
+  assert.ok(line.includes('...'), 'truncation marker expected');
+  // Still identifiable and still linked to the right page.
+  assert.ok(line.includes('The Public Service Commission of the District of Columbia'));
+  assert.ok(line.includes('page 6'));
+});

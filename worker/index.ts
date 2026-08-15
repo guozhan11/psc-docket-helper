@@ -4,7 +4,6 @@ import {
   TERM_INDEX_VERSION,
   inverseDocumentFrequency,
   postingEntries,
-  termFrequencyWeight,
   termIndexShardKey,
   termShard,
   type TermIndexManifest,
@@ -1141,7 +1140,9 @@ export async function routeCasesByTermIndex(
   const scores = new Map<string, { score: number; hits: number }>();
   // The first published generation stored case numbers only; treat its
   // postings as one document each rather than refusing to read it.
-  const format: TermPostingFormat = manifest.postingFormat === "case-tf" ? "case-tf" : "case";
+  const format: TermPostingFormat = manifest.postingFormat === "case-bm25"
+    ? "case-bm25"
+    : manifest.postingFormat === "case-tf" ? "case-tf" : "case";
   let shardsRead = 0;
   let cappedTerms = 0;
   const shardEntries = Array.from(shardTerms.entries());
@@ -1206,7 +1207,7 @@ export async function routeCasesByTermIndex(
       // separates them.
       for (const posting of postingEntries(entry, format)) {
         const current = scores.get(posting.caseNumber) ?? { score: 0, hits: 0 };
-        current.score += weight * termFrequencyWeight(posting.documentsWithTerm);
+        current.score += weight * posting.weight;
         current.hits += 1;
         scores.set(posting.caseNumber, current);
       }
@@ -1718,10 +1719,13 @@ export function answerSuffix(message: string, reply: string, rows: SearchRow[]):
       : "\n\n> **Search scope:** Cross-case search scans a sample of the indexed cases, not the whole corpus, and the sample shifts with how the question is worded. Relevant proceedings may be missing entirely. Treat these as leads, then confirm by asking about a specific case number or by searching the official e-Docket directly.";
   const replyReportsInsufficientEvidence = /\b(?:no|insufficient|not enough)\s+(?:matching\s+)?evidence\b|\bcould(?:n['’]t| not)\s+find\b/i.test(reply);
   if (replyReportsInsufficientEvidence || !sources.length) return scopeNote;
+  // Truncate here as the inline citations do. e-Docket puts a whole order's
+  // operative text in some filings' description, so an untruncated title turns
+  // one source line into a wall of link text.
   return `${scopeNote}\n\n---\n**Official filing sources**\n${sources.map(row =>
     row.evidence_kind === "metadata"
-      ? `- [${row.case_number}: ${row.title}](${row.official_pdf_url}) — metadata indexed; full text pending`
-      : `- [${row.case_number}: ${row.title} — page ${row.page_number}](${officialPdfPageUrl(row)})`
+      ? `- [${row.case_number}: ${citationTitle(row.title)}](${row.official_pdf_url}) — metadata indexed; full text pending`
+      : `- [${row.case_number}: ${citationTitle(row.title)} — page ${row.page_number}](${officialPdfPageUrl(row)})`
   ).join("\n")}`;
 }
 

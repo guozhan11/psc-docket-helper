@@ -34,7 +34,6 @@ import {
   TERM_INDEX_KEY,
   inverseDocumentFrequency,
   postingEntries,
-  termFrequencyWeight,
   termIndexShardKey,
   termShard,
   type TermIndexManifest,
@@ -83,7 +82,9 @@ interface Routed {
 
 function route(manifest: TermIndexManifest, terms: string[]): Routed {
   const wanted = terms.slice(0, MAX_QUERY_TERMS);
-  const format: TermPostingFormat = manifest.postingFormat === 'case-tf' ? 'case-tf' : 'case';
+  const format: TermPostingFormat = manifest.postingFormat === 'case-bm25'
+    ? 'case-bm25'
+    : manifest.postingFormat === 'case-tf' ? 'case-tf' : 'case';
   const scores = new Map<string, { score: number; hits: number }>();
   const discriminating: string[] = [];
   const capped: string[] = [];
@@ -108,7 +109,7 @@ function route(manifest: TermIndexManifest, terms: string[]): Routed {
     const weight = inverseDocumentFrequency(documentFrequency, manifest.cases);
     for (const posting of postingEntries(entry, format)) {
       const current = scores.get(posting.caseNumber) ?? { score: 0, hits: 0 };
-      current.score += weight * termFrequencyWeight(posting.documentsWithTerm);
+      current.score += weight * posting.weight;
       current.hits += 1;
       scores.set(posting.caseNumber, current);
     }

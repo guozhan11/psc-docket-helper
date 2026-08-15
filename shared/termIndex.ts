@@ -30,10 +30,21 @@ export const TERM_INDEX_MAX_DOCUMENT_FREQUENCY = 0.15;
  * and the order falls back to whatever the tie-break is.
  *
  * "case-tf" interleaves each case with the number of its documents containing
- * the term, which is what separates a case that discusses a topic throughout
- * from one that mentions it once.
+ * the term, which separates a case that discusses a topic throughout from one
+ * that mentions it once — but it rewards size on its own, so the largest docket
+ * in the corpus led most questions regardless of what was asked.
+ *
+ * "case-bm25" stores a weight that already divides the term count by how large
+ * the case is, so a mid-sized case discussing a topic throughout outranks a
+ * two-thousand-filing docket that mentions it in passing.
  */
-export type TermPostingFormat = "case" | "case-tf";
+export type TermPostingFormat = "case" | "case-tf" | "case-bm25";
+
+/**
+ * Scale used to store a BM25 term weight as an integer, keeping the wire format
+ * to plain interleaved numbers.
+ */
+export const BM25_WEIGHT_SCALE = 100;
 
 export interface TermIndexManifest {
   version: number;
@@ -101,23 +112,31 @@ export function termFrequencyWeight(documentsWithTerm: number): number {
   return 1 + Math.log(documentsWithTerm);
 }
 
-/** Walks a posting list in either format, yielding each case and its weight. */
+/**
+ * Walks a posting list in any published format, yielding each case with the
+ * weight its stored number represents. Older generations stay readable so a
+ * rebuild is never a prerequisite for deploying.
+ */
 export function* postingEntries(
   entry: readonly (string | number)[],
   format: TermPostingFormat
-): Generator<{ caseNumber: string; documentsWithTerm: number }> {
+): Generator<{ caseNumber: string; weight: number }> {
   const body = entry.slice(1);
-  if (format === "case-tf") {
+  if (format === "case-tf" || format === "case-bm25") {
     for (let index = 0; index + 1 < body.length; index += 2) {
       const caseNumber = body[index];
-      const count = Number(body[index + 1]);
-      if (typeof caseNumber === "string" && Number.isFinite(count)) {
-        yield { caseNumber, documentsWithTerm: count };
-      }
+      const value = Number(body[index + 1]);
+      if (typeof caseNumber !== "string" || !Number.isFinite(value)) continue;
+      yield {
+        caseNumber,
+        weight: format === "case-bm25"
+          ? value / BM25_WEIGHT_SCALE
+          : termFrequencyWeight(value)
+      };
     }
     return;
   }
   for (const caseNumber of body) {
-    if (typeof caseNumber === "string") yield { caseNumber, documentsWithTerm: 1 };
+    if (typeof caseNumber === "string") yield { caseNumber, weight: 1 };
   }
 }

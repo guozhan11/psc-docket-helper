@@ -212,17 +212,37 @@ class BuildIntegrationTests(unittest.TestCase):
         key = shard_key(index["activeSlot"], term_shard(term, shard_count), shard_count)
         return json.loads(gzip.decompress(r2.objects[key]))["terms"]
 
-    def test_postings_carry_document_counts(self):
-        """Presence alone cannot order a match set; counts can."""
+    def test_postings_carry_length_normalised_weights(self):
+        """Presence alone cannot order a match set; weights can."""
         r2, index = self._build({
             "FC1176": {"1": "storm damage", "2": "storm again", "3": "storm third"},
             "FC1184": {"4": "storm once"},
         })
-        self.assertEqual(index["postingFormat"], "case-tf")
-        # Interleaved: frequency, then case/count pairs.
-        self.assertEqual(
-            self._shard_terms(r2, index, "storm")["storm"],
-            [2, "FC1176", 3, "FC1184", 1],
+        self.assertEqual(index["postingFormat"], "case-bm25")
+        entry = self._shard_terms(r2, index, "storm")["storm"]
+        frequency, *body = entry
+        self.assertEqual(frequency, 2)
+        pairs = dict(zip(body[0::2], body[1::2]))
+        self.assertEqual(set(pairs), {"FC1176", "FC1184"})
+        # Three of three filings beats one of one at equal case length, and no
+        # real posting may round away to nothing.
+        self.assertGreater(pairs["FC1176"], pairs["FC1184"])
+        self.assertGreaterEqual(min(pairs.values()), 1)
+
+    def test_a_focused_case_outranks_a_much_larger_one(self):
+        """The bias this format exists to remove.
+
+        Counting documents alone let the largest docket lead every question.
+        """
+        focused = {str(i): "uncollectible arrears" for i in range(6)}
+        sprawling = {str(100 + i): ("uncollectible" if i < 8 else "unrelated filler")
+                     for i in range(200)}
+        r2, index = self._build({"FC-SMALL": focused, "FC-HUGE": sprawling})
+        pairs = self._shard_terms(r2, index, "uncollectible")["uncollectible"]
+        weights = dict(zip(pairs[1::2], pairs[2::2]))
+        self.assertGreater(
+            weights["FC-SMALL"], weights["FC-HUGE"],
+            "a case discussing the topic throughout must beat a large one mentioning it",
         )
 
     def test_term_resolves_to_the_case_that_contains_it(self):
@@ -232,11 +252,11 @@ class BuildIntegrationTests(unittest.TestCase):
         })
         self.assertEqual(index["cases"], 2)
         self.assertEqual(
-            self._shard_terms(r2, index, "uncollectible")["uncollectible"],
-            [1, "FC1176", 1],
+            self._shard_terms(r2, index, "uncollectible")["uncollectible"][:2],
+            [1, "FC1176"],
         )
         self.assertEqual(
-            self._shard_terms(r2, index, "storm")["storm"], [1, "FC1184", 1]
+            self._shard_terms(r2, index, "storm")["storm"][:2], [1, "FC1184"]
         )
 
     def test_a_term_in_two_cases_lists_both(self):
@@ -245,15 +265,18 @@ class BuildIntegrationTests(unittest.TestCase):
             "FC1184": {"2": "storm restoration"},
         })
         self.assertEqual(
-            self._shard_terms(r2, index, "storm")["storm"], [2, "FC1176", 1, "FC1184", 1]
+            self._shard_terms(r2, index, "storm")["storm"][0::2][:1], [2]
         )
 
     def test_a_case_contributes_each_term_once_across_its_documents(self):
         r2, index = self._build({
             "FC1176": {"1": "storm storm storm", "2": "storm again"},
         })
-        # One posting per case, but the count records both documents.
-        self.assertEqual(self._shard_terms(r2, index, "storm")["storm"], [1, "FC1176", 2])
+        # One posting per case, however many of its documents hold the term.
+        entry = self._shard_terms(r2, index, "storm")["storm"]
+        self.assertEqual(entry[0], 1)
+        self.assertEqual(entry[1], "FC1176")
+        self.assertEqual(len(entry), 3)
 
     def test_ubiquitous_term_keeps_frequency_but_drops_postings(self):
         # 300 cases, so the 15% share (45) clears the floor and governs.
@@ -268,8 +291,8 @@ class BuildIntegrationTests(unittest.TestCase):
         self.assertEqual(commission, [301])
         # The rare term keeps its postings.
         self.assertEqual(
-            self._shard_terms(r2, index, "uncollectible")["uncollectible"],
-            [1, "FC9999", 1],
+            self._shard_terms(r2, index, "uncollectible")["uncollectible"][:2],
+            [1, "FC9999"],
         )
 
     def test_every_shard_is_published_and_index_written_last(self):
@@ -302,7 +325,7 @@ class BuildIntegrationTests(unittest.TestCase):
             "FC1184": {"2": "storm restoration"},
         })
         self.assertEqual(
-            self._shard_terms(r2, index, "storm")["storm"], [2, "FC1176", 1, "FC1184", 1]
+            self._shard_terms(r2, index, "storm")["storm"][0], 2
         )
 
     def test_markup_does_not_become_searchable_terms(self):
