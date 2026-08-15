@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           existing=$(gh issue list --state open --search "$ALERT_TITLE in:title" \
-            --json number,title -q "[.[] | select(.title == \"$ALERT_TITLE\")][0].number")
+            --json number,title -q "[.[] | select(.title == \"$ALERT_TITLE\")] | .[0].number // empty")
 
           if [ "$STATUS" = "ok" ]; then
             if [ -n "$existing" ]; then

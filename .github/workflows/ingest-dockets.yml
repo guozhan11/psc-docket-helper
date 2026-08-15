@@ -185,7 +185,7 @@ jobs:
         run: |
           set -euo pipefail
           existing=$(gh issue list --state open --search "$TITLE in:title" \
-            --json number,title -q "[.[] | select(.title == \"$TITLE\")][0].number")
+            --json number,title -q "[.[] | select(.title == \"$TITLE\")] | .[0].number // empty")
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "Failed again: [run]($RUN_URL)"
           else
