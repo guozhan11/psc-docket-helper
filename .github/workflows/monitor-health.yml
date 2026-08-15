@@ -1,0 +1,90 @@
+name: Monitor health
+
+# The health endpoint is fail-closed, but nothing was watching it. It reported
+# degraded for days in August 2026 and the first anyone knew was a screenshot.
+# This turns that signal into a GitHub issue, which does reach a notification.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: monitor-health
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  HEALTH_URL: https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health
+  # One open issue per condition, reused rather than reopened, so a long outage
+  # does not bury the repository under a new issue every half hour.
+  ALERT_TITLE: "Health check: /api/health is not ok"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read health
+        id: health
+        run: |
+          set -uo pipefail
+          code=$(curl -sS -o response.json -w '%{http_code}' --max-time 30 "$HEALTH_URL" || echo 000)
+          echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" != "200" ]; then
+            echo "status=unreachable" >> "$GITHUB_OUTPUT"
+            echo "issues=HTTP $code" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status=$(python3 -c "import json;print(json.load(open('response.json')).get('status','unknown'))")
+          issues=$(python3 -c "import json;print(', '.join(json.load(open('response.json')).get('issues') or []) or 'none')")
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "issues=$issues" >> "$GITHUB_OUTPUT"
+
+      - name: Open or close the alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.health.outputs.status }}
+          ISSUES: ${{ steps.health.outputs.issues }}
+          HTTP_CODE: ${{ steps.health.outputs.http_code }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --state open --search "$ALERT_TITLE in:title" \
+            --json number,title -q "[.[] | select(.title == \"$ALERT_TITLE\")][0].number")
+
+          if [ "$STATUS" = "ok" ]; then
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "Recovered: \`/api/health\` reports \`ok\` with no issues. [Run]($RUN_URL)"
+              gh issue close "$existing"
+              echo "Closed alert #$existing — health recovered."
+            else
+              echo "Healthy."
+            fi
+            exit 0
+          fi
+
+          body=$(printf '%s\n' \
+            "\`/api/health\` reports **$STATUS** (HTTP $HTTP_CODE)." \
+            "" \
+            "Reported issues: \`$ISSUES\`" \
+            "" \
+            "What the issue names usually means:" \
+            "- \`term-index-stale\` — the weekly \`Build term index\` workflow has not published for over ten days." \
+            "- \`case-router-stale\` / \`metadata-stale\` — an ingestion cycle is failing or timing out." \
+            "- \`*-unavailable\` — an R2 object the Worker needs did not read back." \
+            "- \`turnstile-misconfigured\` — site key and secret disagree; chat protection is off." \
+            "" \
+            "This issue closes itself when health returns to \`ok\`." \
+            "" \
+            "[Run]($RUN_URL)")
+
+          if [ -n "$existing" ]; then
+            echo "Alert #$existing already open; leaving it as the single notification."
+          else
+            gh issue create --title "$ALERT_TITLE" --body "$body"
+          fi
+          # Fail the run too, so the Actions list shows red alongside the issue.
+          exit 1
