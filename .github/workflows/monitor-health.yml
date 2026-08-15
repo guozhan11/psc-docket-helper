@@ -46,6 +46,7 @@ jobs:
       - name: Open or close the alert
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           STATUS: ${{ steps.health.outputs.status }}
           ISSUES: ${{ steps.health.outputs.issues }}
           HTTP_CODE: ${{ steps.health.outputs.http_code }}
