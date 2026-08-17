@@ -55,14 +55,49 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          existing=$(gh issue list --state open --search "$ALERT_TITLE in:title" \
-            --json number,title -q "[.[] | select(.title == \"$ALERT_TITLE\")] | .[0].number // empty")
+
+          # GitHub's API occasionally returns a transient 5xx. Retry notification
+          # operations so an API blip is not mistaken for an unhealthy service.
+          gh_retry() {
+            local attempt=1
+            local max_attempts=5
+            local delay=2
+
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                return 1
+              fi
+              echo "::warning::GitHub API command failed (attempt $attempt/$max_attempts); retrying in ${delay}s." >&2
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          if ! existing=$(gh_retry gh issue list --state open --search "$ALERT_TITLE in:title" \
+            --json number,title -q "[.[] | select(.title == \"$ALERT_TITLE\")] | .[0].number // empty"); then
+            echo "::warning::Could not read the health alert after retries; issue synchronization will resume on the next run."
+            if [ "$STATUS" = "ok" ]; then
+              echo "Health is ok, so a notification API failure will not fail this run."
+              exit 0
+            fi
+            echo "::error::Health is $STATUS (HTTP $HTTP_CODE), and the alert issue could not be synchronized."
+            exit 1
+          fi
 
           if [ "$STATUS" = "ok" ]; then
             if [ -n "$existing" ]; then
-              gh issue comment "$existing" --body "Recovered: \`/api/health\` reports \`ok\` with no issues. [Run]($RUN_URL)"
-              gh issue close "$existing"
-              echo "Closed alert #$existing — health recovered."
+              if ! gh_retry gh issue comment "$existing" --body "Recovered: \`/api/health\` reports \`ok\` with no issues. [Run]($RUN_URL)"; then
+                echo "::warning::Health recovered, but the recovery comment could not be posted after retries."
+              fi
+              if gh_retry gh issue close "$existing"; then
+                echo "Closed alert #$existing — health recovered."
+              else
+                echo "::warning::Health recovered, but alert #$existing could not be closed after retries; the next run will try again."
+              fi
             else
               echo "Healthy."
             fi
@@ -87,7 +122,9 @@ jobs:
           if [ -n "$existing" ]; then
             echo "Alert #$existing already open; leaving it as the single notification."
           else
-            gh issue create --title "$ALERT_TITLE" --body "$body"
+            if ! gh_retry gh issue create --title "$ALERT_TITLE" --body "$body"; then
+              echo "::warning::The health alert issue could not be created after retries."
+            fi
           fi
           # Fail the run too, so the Actions list shows red alongside the issue.
           exit 1
