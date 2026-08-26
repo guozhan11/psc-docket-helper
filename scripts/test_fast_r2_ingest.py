@@ -164,6 +164,64 @@ class FastR2MigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "returned no pages"):
                 fast.main()
 
+    def test_upstream_outage_holds_the_cursor_and_exits_cleanly(self) -> None:
+        saved: list[object] = []
+
+        class FakeStore:
+            shard_index = 1
+            shard_count = 4
+            state = {"nextOffset": 62_500}
+
+            def save_state(self, offset=None) -> None:
+                saved.append(offset)
+
+        arguments = [
+            "fast_r2_ingest.py",
+            "--all",
+            "--shard-index",
+            "1",
+            "--shard-count",
+            "4",
+        ]
+        outage = fast.DCPSCUnavailableError("HTTP 502 on all 8 attempts")
+
+        def unavailable(*_args, **_kwargs):
+            raise outage
+            yield  # pragma: no cover - generator marker
+
+        with (
+            patch.object(sys, "argv", arguments),
+            patch.object(fast, "FastR2Store", return_value=FakeStore()),
+            patch.object(fast, "official_filing_total", return_value=204_301),
+            patch.object(fast, "iter_filings", side_effect=unavailable),
+        ):
+            fast.main()
+
+        # An eDocket outage must neither fail the shard nor move the cursor past
+        # records this run never wrote.
+        self.assertEqual(saved, [])
+
+    def test_outage_on_the_filing_count_exits_cleanly(self) -> None:
+        class FakeStore:
+            shard_index = 0
+            shard_count = 4
+            state = {"nextOffset": 0}
+
+        arguments = ["fast_r2_ingest.py", "--all", "--shard-count", "4"]
+        with (
+            patch.object(sys, "argv", arguments),
+            patch.object(fast, "FastR2Store", return_value=FakeStore()),
+            patch.object(
+                fast,
+                "official_filing_total",
+                side_effect=fast.DCPSCUnavailableError("HTTP 502"),
+            ),
+            patch.object(fast, "iter_filings") as iter_filings,
+        ):
+            fast.main()
+
+        iter_filings.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

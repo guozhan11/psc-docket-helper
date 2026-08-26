@@ -16,6 +16,7 @@ from typing import Any, Iterable
 import requests
 
 from cloud_ingest import (
+    DCPSCUnavailableError,
     EDOCKET_API,
     PAGE_SIZE,
     USER_AGENT,
@@ -240,6 +241,24 @@ def run_full_scan(
                     flush=True,
                 )
                 return
+    except DCPSCUnavailableError as error:
+        checkpoint_full_scan(
+            store,
+            state_key,
+            prior,
+            total_records=total_records,
+            shard_start=shard_start,
+            shard_end=shard_end,
+            next_offset=next_offset,
+            public_pdf_records=public_pdf_records,
+            complete=False,
+        )
+        print(
+            "::warning::DC PSC is unavailable; saved contiguous progress through "
+            f"offset {next_offset:,} and exiting cleanly for the next run. {error}",
+            flush=True,
+        )
+        return
     except requests.RequestException:
         checkpoint_full_scan(
             store,
@@ -299,24 +318,35 @@ def run_recent_scan(
     started = time.monotonic()
     scanned = 0
     pending = 0
-    for case_number, filing, _ in iter_filings(
-        [],
-        since_days,
-        0,
-        start_offset=0,
-        oldest_first=False,
-    ):
-        cases = related_case_numbers(case_number, filing.get("docketNumber"))
-        store.add_metadata(cases, metadata_document(case_number, filing))
-        scanned += 1
-        pending += 1
-        elapsed_hours = (time.monotonic() - started) / 3600
-        if pending >= checkpoint_records or elapsed_hours >= max_hours:
-            store.flush_manifests()
-            store.save_state()
-            pending = 0
-            if elapsed_hours >= max_hours:
-                break
+    try:
+        for case_number, filing, _ in iter_filings(
+            [],
+            since_days,
+            0,
+            start_offset=0,
+            oldest_first=False,
+        ):
+            cases = related_case_numbers(case_number, filing.get("docketNumber"))
+            store.add_metadata(cases, metadata_document(case_number, filing))
+            scanned += 1
+            pending += 1
+            elapsed_hours = (time.monotonic() - started) / 3600
+            if pending >= checkpoint_records or elapsed_hours >= max_hours:
+                store.flush_manifests()
+                store.save_state()
+                pending = 0
+                if elapsed_hours >= max_hours:
+                    break
+    except DCPSCUnavailableError as error:
+        store.flush_manifests()
+        store.save_state()
+        print(
+            "::warning::DC PSC is unavailable; kept the "
+            f"{scanned:,} recent record(s) already refreshed and exiting cleanly "
+            f"without marking this refresh complete. {error}",
+            flush=True,
+        )
+        return
 
     store.flush_manifests()
     store.save_state()
@@ -407,7 +437,15 @@ def main() -> None:
     if mode == "auto":
         mode = "recent" if prior.get("fullScanComplete") else "full"
 
-    total_records = official_filing_total()
+    try:
+        total_records = official_filing_total()
+    except DCPSCUnavailableError as error:
+        print(
+            "::warning::DC PSC is not answering the filing count; exiting "
+            f"cleanly so the next scheduled run retries. {error}",
+            flush=True,
+        )
+        return
     if mode == "full":
         run_full_scan(
             store,

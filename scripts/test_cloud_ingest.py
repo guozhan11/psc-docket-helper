@@ -88,6 +88,40 @@ class DcpscRequestTests(unittest.TestCase):
         sleep.assert_called_once_with(2.5)
 
     @patch.object(cloud_ingest.time, "sleep")
+    def test_exhausted_transient_retries_report_an_outage(self, _sleep: Mock) -> None:
+        session = Mock()
+        session.request.return_value = FakeResponse(502)
+
+        with self.assertRaises(cloud_ingest.DCPSCUnavailableError) as caught:
+            cloud_ingest.dcpsc_request(
+                "GET",
+                "https://example.test",
+                session=session,
+                attempts=3,
+            )
+
+        # Callers holding a resumable cursor tell an outage apart from a bug by
+        # type, while per-request retry loops still see a RequestException.
+        self.assertIsInstance(caught.exception, requests.RequestException)
+        self.assertIn("502", str(caught.exception))
+        self.assertEqual(session.request.call_count, 3)
+
+    @patch.object(cloud_ingest.time, "sleep")
+    def test_exhausted_connection_errors_report_an_outage(self, _sleep: Mock) -> None:
+        session = Mock()
+        session.request.side_effect = requests.ConnectionError("offline")
+
+        with self.assertRaises(cloud_ingest.DCPSCUnavailableError):
+            cloud_ingest.dcpsc_request(
+                "GET",
+                "https://example.test",
+                session=session,
+                attempts=2,
+            )
+
+        self.assertEqual(session.request.call_count, 2)
+
+    @patch.object(cloud_ingest.time, "sleep")
     def test_does_not_retry_non_transient_400(self, sleep: Mock) -> None:
         session = Mock()
         session.request.return_value = FakeResponse(400)
@@ -222,6 +256,36 @@ class PdfDownloadTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"%PDF-complete")
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(1.5)
+
+    @patch.object(cloud_ingest.time, "sleep")
+    @patch.object(cloud_ingest, "dcpsc_retry_delay", return_value=1.5)
+    def test_retries_a_transient_status_from_the_attachment_endpoint(
+        self,
+        _retry_delay: Mock,
+        _sleep: Mock,
+    ) -> None:
+        # download_pdf owns its own retry loop, so an outage raised by the inner
+        # single-attempt request must stay catchable as a RequestException.
+        good = Mock()
+        good.__enter__ = Mock(return_value=good)
+        good.__exit__ = Mock(return_value=False)
+        good.iter_content.return_value = iter([b"%PDF-complete"])
+        filing = {"attachmentId": 1, "attachment": "document.pdf"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = Path(temp_dir) / "document.pdf"
+            with patch.object(
+                cloud_ingest,
+                "dcpsc_request",
+                side_effect=[
+                    cloud_ingest.DCPSCUnavailableError("HTTP 503"),
+                    good,
+                ],
+            ) as request:
+                cloud_ingest.download_pdf(filing, destination, attempts=2)
+
+            self.assertEqual(destination.read_bytes(), b"%PDF-complete")
+        self.assertEqual(request.call_count, 2)
 
     def test_non_pdf_is_permanently_unavailable_without_retry(self) -> None:
         response = Mock()

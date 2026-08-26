@@ -86,6 +86,9 @@ Add these GitHub Actions secrets:
 
 The `Ingest DC PSC dockets` workflow starts at 00:17, 06:17, 12:17, and 18:17 UTC. A metadata job first publishes all public PDF filing records and official links; later runs refresh the newest three days. Four extraction shards process non-overlapping record ranges with controlled parallelism. After metadata and any enabled extraction finish, one router job rebuilds the 16-part global case index. Compressed HTML, sharded case manifests, independent cursors, failed-filing lists, and the case router are stored in R2, so interrupted runs continue from their checkpoints without consuming D1's per-row daily write allowance.
 
+When eDocket itself is down, ingestion does not fail. Every DC PSC call retries a transient response (429, 500, 502, 503, 504) eight times with backoff, honouring `Retry-After`; if the outage outlasts that, the shard keeps its last checkpoint, prints a `::warning::` annotation on the run, and exits successfully so the next scheduled run resumes from the same cursor. Nothing is lost, because the cursor never advances past records that run did not write. A failed run therefore still means something this repository can act on, and the `alert` job opens or updates the `Ingestion run failed` issue only for those. To find suppressed outages, look for the warning annotations on green runs.
+
+
 To build or refresh metadata locally:
 
 ```bash

@@ -143,6 +143,53 @@ class MetadataShardTests(unittest.TestCase):
         self.assertEqual(status_events[0]["officialRecordsScanned"], 100)
         self.assertFalse(status_events[0]["fullScanComplete"])
 
+    def test_upstream_outage_checkpoints_without_failing_the_shard(self) -> None:
+        events: list[tuple[str, object]] = []
+
+        class FakeR2:
+            def put_object(self, **kwargs) -> None:
+                events.append(("status", json.loads(kwargs["Body"])))
+
+        class FakeStore:
+            shard_index = 0
+            shard_count = 4
+            bucket = "test-bucket"
+            r2 = FakeR2()
+
+            def flush_manifests(self) -> None:
+                events.append(("flush", None))
+
+            def save_state(self) -> None:
+                events.append(("save-write-accounting", None))
+
+            def add_metadata(self, cases, document) -> None:
+                raise AssertionError("The synthetic page should contain no filings")
+
+        def unavailable_pages(start_offset: int, end_offset: int):
+            del start_offset, end_offset
+            yield 100, []
+            raise metadata.DCPSCUnavailableError("HTTP 502 on all 8 attempts")
+
+        with patch.object(
+            metadata,
+            "public_pdf_metadata_pages",
+            side_effect=unavailable_pages,
+        ):
+            # No exception: eDocket being down is not a failure this repository
+            # can act on, and the next scheduled run resumes from the cursor.
+            metadata.run_full_scan(
+                FakeStore(),
+                {},
+                total_records=1_000,
+                checkpoint_records=5_000,
+                max_hours=1.0,
+            )
+
+        status_events = [value for name, value in events if name == "status"]
+        self.assertEqual(len(status_events), 1)
+        self.assertEqual(status_events[0]["nextOffset"], 100)
+        self.assertFalse(status_events[0]["fullScanComplete"])
+
     def test_local_coordinator_launches_all_four_shards(self) -> None:
         commands: list[list[str]] = []
 

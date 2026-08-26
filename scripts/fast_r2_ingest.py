@@ -22,6 +22,7 @@ import boto3
 from botocore.config import Config as BotoConfig
 
 from cloud_ingest import (
+    DCPSCUnavailableError,
     PermanentFilingError,
     clean_text,
     compact_document_html,
@@ -478,7 +479,15 @@ def main() -> None:
             f"Retry recovery: rescanning shard for {len(pending_retry_ids):,} "
             "previously failed filing(s); compact documents will be skipped."
         )
-    total_records = official_filing_total()
+    try:
+        total_records = official_filing_total()
+    except DCPSCUnavailableError as error:
+        print(
+            "::warning::DC PSC is not answering the filing count, so this shard "
+            f"has nothing to resume from and is exiting cleanly. {error}",
+            flush=True,
+        )
+        return
     if args.all and start_offset >= total_records:
         print(
             f"Shard {args.shard_index + 1}/{args.shard_count} is caught up at "
@@ -582,35 +591,62 @@ def main() -> None:
         )
         return elapsed_hours < args.max_hours
 
-    for item in iter_filings(
-        [],
-        0 if args.all else args.since_days,
-        args.limit,
-        start_offset=start_offset,
-        oldest_first=args.all,
-        end_offset=shard_end,
-        on_page_scanned=record_scanned_page,
-    ):
-        eligible_seen = True
-        batch.append(item)
-        if len(batch) >= MANIFEST_FLUSH_BATCH:
-            if not run_batch(batch):
+    # An eDocket outage is not something a rerun here can fix, so stop on the
+    # last checkpoint instead of failing the shard. Filings already listed into
+    # `batch` are deliberately dropped rather than downloaded: their downloads
+    # would fail against the same outage and burn each filing's retry budget.
+    upstream_outage = False
+    try:
+        for item in iter_filings(
+            [],
+            0 if args.all else args.since_days,
+            args.limit,
+            start_offset=start_offset,
+            oldest_first=args.all,
+            end_offset=shard_end,
+            on_page_scanned=record_scanned_page,
+        ):
+            eligible_seen = True
+            batch.append(item)
+            if len(batch) >= MANIFEST_FLUSH_BATCH:
+                if not run_batch(batch):
+                    batch = []
+                    break
                 batch = []
-                break
-            batch = []
+    except DCPSCUnavailableError as error:
+        upstream_outage = True
+        batch = []
+        print(
+            "::warning::DC PSC stopped answering the filing list; holding the "
+            "checkpoint at offset "
+            f"{int(store.state.get('nextOffset') or start_offset):,} so the next "
+            f"scheduled run resumes there. {error}",
+            flush=True,
+        )
     if batch:
         run_batch(batch)
     saved_offset = int(store.state.get("nextOffset") or start_offset)
     pending_count = len(store.state.get("failedFilingIds", []))
-    if args.all and not pending_count and scanned_offset > saved_offset:
+    if (
+        args.all
+        and not upstream_outage
+        and not pending_count
+        and scanned_offset > saved_offset
+    ):
         store.save_state(scanned_offset)
     target_offset = min(shard_end, total_records) if shard_end is not None else total_records
-    if args.all and not eligible_seen and scanned_offset == start_offset < target_offset:
+    if (
+        args.all
+        and not upstream_outage
+        and not eligible_seen
+        and scanned_offset == start_offset < target_offset
+    ):
         raise RuntimeError(
             f"DC PSC returned no pages for incomplete shard at offset {start_offset:,}"
         )
     print(
-        f"Fast R2 ingestion complete: {processed:,} written, {compacted:,} compacted, "
+        f"Fast R2 ingestion {'stopped early' if upstream_outage else 'complete'}: "
+        f"{processed:,} written, {compacted:,} compacted, "
         f"{skipped:,} existing, {pending_count:,} queued for retry, "
         f"{unavailable_total:,} unavailable."
     )

@@ -32,7 +32,7 @@ MAX_D1_ESTIMATED_BYTES = 400 * 1024 * 1024
 MAX_DOCUMENTS_PER_RUN = 5_000
 MAX_D1_ROWS_WRITTEN_PER_DAY = 80_000
 MAX_R2_OBJECTS_WRITTEN_PER_DAY = 5_000
-DCPSC_REQUEST_ATTEMPTS = 6
+DCPSC_REQUEST_ATTEMPTS = 8
 DCPSC_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
 
@@ -42,6 +42,17 @@ class FreeTierLimitReached(RuntimeError):
 
 class PermanentFilingError(RuntimeError):
     """Raised when an official attachment cannot become searchable PDF text."""
+
+
+class DCPSCUnavailableError(requests.RequestException):
+    """Raised when DC PSC still fails a transient way after every retry.
+
+    Subclasses ``RequestException`` so existing per-request retry loops keep
+    treating it as a network failure. Callers that own a resumable cursor
+    catch it to checkpoint and exit cleanly, because an eDocket outage is not
+    something a rerun of this repository can fix. A non-retryable status still
+    raises a plain ``HTTPError``, which stays a loud failure.
+    """
 
 
 def require_env(name: str) -> str:
@@ -108,7 +119,9 @@ def dcpsc_request(
             response = client.request(method, url, **kwargs)
         except requests.RequestException as error:
             if attempt == attempts - 1:
-                raise
+                raise DCPSCUnavailableError(
+                    f"DC PSC was unreachable after {attempts} attempts: {error}"
+                ) from error
             delay = dcpsc_retry_delay(attempt)
             print(
                 f"DC PSC request failed ({type(error).__name__}); "
@@ -122,7 +135,12 @@ def dcpsc_request(
             response.raise_for_status()
             return response
         if attempt == attempts - 1:
-            response.raise_for_status()
+            status = response.status_code
+            response.close()
+            raise DCPSCUnavailableError(
+                f"DC PSC returned HTTP {status} on all {attempts} attempts",
+                response=response,
+            )
         delay = dcpsc_retry_delay(attempt, response.headers.get("Retry-After"))
         status = response.status_code
         response.close()
