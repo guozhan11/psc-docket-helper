@@ -95,6 +95,29 @@ To build or refresh metadata locally:
 npm run rag:metadata-cloud
 ```
 
+## Usage
+
+`npm run usage:report` answers how much real traffic the deployed assistant is
+getting. Pass `-- --days N` for a longer window, up to 28.
+
+Two numbers matter, and only one of them is exact. **Questions answered** comes
+from AI Gateway, where every answer appears once, so a zero there means nobody
+asked anything. **Visits** is an estimate, because the scheduled workflows
+dominate raw Worker invocations: `Monitor health` polls the health endpoint
+every forty minutes or so, which alone accounts for roughly thirty invocations
+a day. The report matches invocation minutes against the workflow runs that
+caused them and reports the remainder, converting it to page views at the rate
+one view costs — three fixed API calls plus one link check per news item, probed
+live rather than assumed.
+
+Reading raw invocation counts from the Cloudflare dashboard instead will
+overstate human traffic by an order of magnitude.
+
+The report reuses the `wrangler login` credentials, or `CLOUDFLARE_API_TOKEN`
+when set, and needs the GitHub CLI to identify scheduled traffic. Per-path
+Workers Logs would remove the guesswork, but that query needs a token carrying
+the Workers Observability scope, which the OAuth login does not include.
+
 ## Term Index
 
 The `Build term index` workflow rebuilds the inverted index that serves cross-case questions. It runs weekly, on its own schedule rather than inside ingestion: a full pass reads every stored document, and the ingestion jobs are already sized against GitHub's six-hour job limit. Weekly rather than daily because each run rewrites every shard and R2 bills Class A operations past one million per month, while the corpus barely moves between runs. It uses the same four secrets as ingestion.

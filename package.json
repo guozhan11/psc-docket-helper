@@ -29,7 +29,8 @@
     "eval:validate": "node scripts/validate-evaluation.ts",
     "eval:retrieval": "node scripts/evaluate-retrieval.ts",
     "eval:cross-case": "node scripts/evaluate-cross-case.ts",
-    "security:audit": "npm audit --audit-level=high"
+    "security:audit": "npm audit --audit-level=high",
+    "usage:report": "python3 scripts/usage_report.py"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
