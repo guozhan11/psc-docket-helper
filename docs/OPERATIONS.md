@@ -15,7 +15,7 @@ npm run security:audit
 
 ```bash
 npm install
-npm run build:client
+npm run build
 npx wrangler login
 npm run cloudflare:deploy
 npm run cloudflare:db:remote
@@ -163,13 +163,3 @@ npm run rag:publish-cloud -- --case 1176 --concurrency 4
 
 The publisher uploads compressed HTML to R2, imports the compact index into D1, removes stale objects for the selected docket, and records resumable progress in `.rag-data`.
 
-## Render Fallback
-
-Create a Render Web Service with:
-
-```text
-Build Command: npm install && npm run build
-Start Command: npm start
-```
-
-Add `OPENAI_API_KEY` to the Render environment. Render's normal filesystem is ephemeral; a persistent local RAG deployment needs a persistent disk and `RAG_DATA_DIR` pointed at its mount path. Do not rebuild large PDF collections during an incoming chat request.

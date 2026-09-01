@@ -52,15 +52,15 @@ The Worker verifies exact matches against the stored page text before OpenAI pre
 
 ## Run Locally
 
-Requirements: Node.js, npm, and an OpenAI API key for synthesized answers.
+Requirements: Node.js, npm, a Cloudflare account, and an OpenAI API key for synthesized answers.
 
 ```bash
 npm install
-export OPENAI_API_KEY="your_api_key_here"
+npm run cloudflare:db:local
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+`npm run dev` builds the client and serves it through the Worker with `wrangler dev`, so local behaviour matches production. Wrangler prints the local URL. Put `OPENAI_API_KEY` in a `.dev.vars` file for synthesized answers; without it the assistant returns indexed excerpts directly.
 
 ## Checking Retrieval Quality
 
