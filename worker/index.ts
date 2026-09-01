@@ -312,11 +312,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * Content length is deliberately not validated here.
+ *
+ * The assistant's own answers carry an appended scope note and up to
+ * ANSWER_SOURCE_LIMIT source links, which alone can run past half of
+ * MAX_HISTORY_MESSAGE_LENGTH, so an ordinary long answer exceeds it. Rejecting
+ * the request then stranded the whole conversation: the oversized answer sits
+ * in the client's stored history and is replayed on every later turn, so each
+ * one failed until it aged out of the window, and retrying could not help.
+ *
+ * Nothing was gained by the rejection. buildTranscript already truncates each
+ * message to MAX_HISTORY_MESSAGE_LENGTH when it builds the prompt, and
+ * readLimitedJson caps the whole body at MAX_CHAT_BODY_BYTES, so the abuse
+ * ceiling holds without a per-message limit.
+ */
 function isChatMessage(value: unknown): value is ChatMessage {
   return isRecord(value)
     && (value.role === "user" || value.role === "model")
-    && typeof value.content === "string"
-    && value.content.length <= MAX_HISTORY_MESSAGE_LENGTH;
+    && typeof value.content === "string";
 }
 
 export function parseChatRequestBody(value: unknown): ChatRequestBody | null {
@@ -2514,7 +2528,8 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
     const body = parseChatRequestBody(rawBody);
     if (!body) {
       return json({
-        error: `Message is required and must be at most ${MAX_MESSAGE_LENGTH} characters; history must contain at most ${MAX_HISTORY_MESSAGES} valid messages.`
+        error: `Message is required and must be at most ${MAX_MESSAGE_LENGTH} characters; history must contain at most ${MAX_HISTORY_MESSAGES} valid messages.`,
+        userMessage: `Your question must not be empty and must be at most ${MAX_MESSAGE_LENGTH} characters. If it is within that limit, reset the chat and ask again.`
       }, 400);
     }
     const admissionFailure = await admitChatRequest(

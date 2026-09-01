@@ -152,6 +152,31 @@ test('chat request validation rejects oversized messages and history', () => {
   }), null);
 });
 
+// A long answer used to strand the conversation: it failed validation, and the
+// client replays its stored history on every later turn, so each one failed
+// until the answer aged out of the window.
+test('chat request validation accepts an answer longer than the transcript limit', () => {
+  const longAnswer = 'x'.repeat(9_000);
+  const parsed = parseChatRequestBody({
+    message: 'And what about 2024?',
+    history: [{ role: 'model', content: longAnswer }]
+  });
+  assert.equal(parsed?.history.length, 1);
+  assert.equal(parsed?.history[0].content, longAnswer);
+});
+
+test('an oversized history message is truncated into the prompt rather than refused', () => {
+  const payload = openAiRequestPayload(
+    {} as Env,
+    [{ role: 'model', content: `${'x'.repeat(5_000)}TAIL` }],
+    'And what about 2024?',
+    []
+  );
+  const input = payload.input as string;
+  assert.equal(input.includes('TAIL'), false);
+  assert.equal(input.includes('x'.repeat(5_000)), true);
+});
+
 test('coverage refuses to calculate percentages from partial shard state', () => {
   const coverage = fullTextCoverageSummary([
     { documentsIndexed: 10, failedFilingIds: [], unavailableFilingIds: [] },
