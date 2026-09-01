@@ -3,6 +3,11 @@ import type { AnswerFeedback, HealthSummary, Message, NewsUpdate, PublicAppConfi
 export interface AssistantResponse {
   reply: string;
   feedbackToken: string | null;
+  /**
+   * The backend answered, but with a stand-in for an answer it could not
+   * produce. The reply is worth showing; the turn is still worth retrying.
+   */
+  degraded: boolean;
 }
 
 export class AssistantRequestError extends Error {
@@ -97,6 +102,7 @@ export async function chatWithDocketAssistant(
       let buffer = "";
       let reply = "";
       let feedbackToken: string | null = null;
+      let degraded = false;
 
       const processFrame = (frame: string) => {
         const event = frame.split(/\r?\n/).find(line => line.startsWith("event:"))?.slice(6).trim();
@@ -111,9 +117,11 @@ export async function chatWithDocketAssistant(
           reply += payload.delta;
           onDelta?.(payload.delta);
         }
-        if (event === "done" && payload && typeof payload === "object"
-          && "feedbackToken" in payload && typeof payload.feedbackToken === "string") {
-          feedbackToken = payload.feedbackToken;
+        if (event === "done" && payload && typeof payload === "object") {
+          if ("feedbackToken" in payload && typeof payload.feedbackToken === "string") {
+            feedbackToken = payload.feedbackToken;
+          }
+          degraded = "degraded" in payload && payload.degraded === true;
         }
         if (event === "error") {
           const userMessage = payload && typeof payload === "object" && "userMessage" in payload
@@ -139,7 +147,7 @@ export async function chatWithDocketAssistant(
           "Docket Assistant stream completed without text"
         );
       }
-      return { reply, feedbackToken };
+      return { reply, feedbackToken, degraded };
     }
 
     const data: unknown = await response.json();
@@ -153,7 +161,8 @@ export async function chatWithDocketAssistant(
       reply: data.reply,
       feedbackToken: "feedbackToken" in data && typeof data.feedbackToken === "string"
         ? data.feedbackToken
-        : null
+        : null,
+      degraded: "degraded" in data && data.degraded === true
     };
   } catch (error) {
     if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {

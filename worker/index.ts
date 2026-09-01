@@ -181,6 +181,11 @@ const EDOCKET_API_URL = "https://edocket.dcpsc.org/apis/api/";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const OPENAI_RESPONSE_START_TIMEOUT_MS = 60_000;
 const OPENAI_NON_STREAM_TIMEOUT_MS = 120_000;
+// e-Docket is the one upstream that has no timeout of its own and a history of
+// stalling. Two of these run back to back on a bare case-number question, so
+// keep the per-call budget short enough that both fit well inside the time a
+// user will wait.
+const EDOCKET_TIMEOUT_MS = 8_000;
 const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const TURNSTILE_TIMEOUT_MS = 5_000;
 const TURNSTILE_ACTION = "turnstile-spin-v2";
@@ -527,8 +532,11 @@ async function verifyTurnstile(
     if (!response.ok) return false;
     const result = await response.json<TurnstileSiteverifyResponse>();
     if (result.success !== true || result.action !== TURNSTILE_ACTION) return false;
-    return !env.TURNSTILE_EXPECTED_HOSTNAME
-      || result.hostname === env.TURNSTILE_EXPECTED_HOSTNAME;
+    // A comma-separated list: a single pinned hostname means the day the app
+    // gains a custom domain, every question 403s until this var is updated.
+    const expected = (env.TURNSTILE_EXPECTED_HOSTNAME ?? "")
+      .split(",").map(host => host.trim()).filter(Boolean);
+    return expected.length === 0 || expected.includes(result.hostname ?? "");
   } catch (error) {
     console.error(JSON.stringify({
       message: "Turnstile validation unavailable",
@@ -1058,7 +1066,8 @@ async function fetchEdocketJson(endpoint: string, params: Record<string, string 
   const url = new URL(endpoint, EDOCKET_API_URL);
   for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
   const response = await fetch(url.href, {
-    headers: { Accept: "application/json", "User-Agent": "PSC-Docket-Assistant/1.0 (+https://dcpsc.org/)" }
+    headers: { Accept: "application/json", "User-Agent": "PSC-Docket-Assistant/1.0 (+https://dcpsc.org/)" },
+    signal: AbortSignal.timeout(EDOCKET_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`e-Docket API returned ${response.status} for ${endpoint}`);
   return response.json();
@@ -1973,11 +1982,23 @@ function encodeAssistantEvent(event: "delta" | "done" | "error", data: unknown):
   return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-function staticAssistantStream(reply: string, requestId: string, feedbackToken: string | null): Response {
+/**
+ * `degraded` marks a reply that stands in for an answer we could not produce.
+ * It is delivered as a normal reply so the user sees something useful, but the
+ * client needs to tell it apart from a real answer to offer a retry: without
+ * the flag a transient upstream failure looked like a finished turn and left
+ * retyping the question as the only way forward.
+ */
+function staticAssistantStream(
+  reply: string,
+  requestId: string,
+  feedbackToken: string | null,
+  degraded = false
+): Response {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       controller.enqueue(encodeAssistantEvent("delta", { delta: reply }));
-      controller.enqueue(encodeAssistantEvent("done", { requestId, feedbackToken }));
+      controller.enqueue(encodeAssistantEvent("done", { requestId, feedbackToken, degraded }));
       controller.close();
     }
   });
@@ -2085,7 +2106,7 @@ async function streamAnswerWithOpenAi(
           if (!rawReply.trim()) throw new Error("OpenAI returned no text");
           const suffix = answerSuffix(message, rawReply, rows);
           if (suffix) controller.enqueue(encodeAssistantEvent("delta", { delta: suffix }));
-          controller.enqueue(encodeAssistantEvent("done", { requestId, feedbackToken }));
+          controller.enqueue(encodeAssistantEvent("done", { requestId, feedbackToken, degraded: false }));
           logChatStage(requestId, "ai-summary", modelStartedAt, { outcome: "streamed" });
         } catch (error) {
           if (!requestSignal.aborted) {
@@ -2560,7 +2581,18 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
           ? staticAssistantStream(reply, requestId, feedbackToken)
           : json({ reply, requestId, feedbackToken });
       }
-      const directCaseReply = await buildDetailedCaseNumberReply(message);
+      // A bare case-number question is answered from e-Docket live, but the
+      // corpus is indexed precisely so that a request does not depend on
+      // e-Docket being up. Treat an outage as "no direct reply" and let the
+      // search below answer instead of failing the whole question.
+      const directCaseReply = await buildDetailedCaseNumberReply(message).catch(error => {
+        console.error(JSON.stringify({
+          message: "e-Docket direct case lookup unavailable; falling back to the indexed corpus",
+          requestId,
+          error: error instanceof Error ? error.message : String(error)
+        }));
+        return null;
+      });
       if (directCaseReply) {
         logChatStage(requestId, "chat-request", requestStartedAt, { outcome: "direct-case" });
         return wantsEventStream
@@ -2592,8 +2624,8 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       }));
       const reply = `⚠️ The assistant could not complete this search right now. Please try again, or use the [official e-Docket search](${EDOCKET_SEARCH_URL}).`;
       return wantsEventStream
-        ? staticAssistantStream(reply, requestId, feedbackToken)
-        : json({ reply, requestId, feedbackToken });
+        ? staticAssistantStream(reply, requestId, feedbackToken, true)
+        : json({ reply, requestId, feedbackToken, degraded: true });
     }
   }
 

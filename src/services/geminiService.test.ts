@@ -41,8 +41,46 @@ test('chat responses stream incremental text to the caller', async () => {
   try {
     const deltas: string[] = [];
     const reply = await chatWithDocketAssistant([], 'Question', 'test-client', null, undefined, delta => deltas.push(delta));
-    assert.deepEqual(reply, { reply: 'Hello world', feedbackToken: 'signed-token' });
+    assert.deepEqual(reply, { reply: 'Hello world', feedbackToken: 'signed-token', degraded: false });
     assert.deepEqual(deltas, ['Hello', ' world']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// A stand-in reply arrives as an ordinary answer. Without the flag the caller
+// cannot tell it from a finished turn, and the user is left retyping.
+test('a stand-in reply is reported as degraded so the caller can offer a retry', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response([
+    'event: delta\ndata: {"delta":"Could not complete this search."}\n\n',
+    'event: done\ndata: {"feedbackToken":null,"degraded":true}\n\n'
+  ].join(''), { headers: { 'Content-Type': 'text/event-stream' } })) as typeof fetch;
+
+  try {
+    const reply = await chatWithDocketAssistant([], 'Question', 'test-client', null);
+    assert.equal(reply.degraded, true);
+    assert.equal(reply.feedbackToken, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a non-streamed reply carries the degraded flag through', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => Response.json({
+    reply: 'Could not complete this search.',
+    feedbackToken: 'signed-token',
+    degraded: true
+  })) as typeof fetch;
+
+  try {
+    const reply = await chatWithDocketAssistant([], 'Question', 'test-client', null);
+    assert.deepEqual(reply, {
+      reply: 'Could not complete this search.',
+      feedbackToken: 'signed-token',
+      degraded: true
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }

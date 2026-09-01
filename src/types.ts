@@ -3,6 +3,12 @@ export interface Message {
   content: string;
   feedbackToken?: string;
   feedbackRating?: 'up' | 'down';
+  /**
+   * A client-side failure notice rendered in the assistant's place. It is not
+   * something the assistant said, so it is kept out of the history sent back
+   * on later turns.
+   */
+  isError?: boolean;
 }
 
 export interface NewsUpdate {

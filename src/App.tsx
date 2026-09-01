@@ -110,6 +110,98 @@ function LatestUpdatesSection({ news, loading }: { news: NewsUpdate[]; loading: 
   );
 }
 
+const SESSIONS_STORAGE_KEY = 'dc_psc_chat_sessions';
+const GREETING = "Hello! I'm your DC PSC Docket Assistant. How can I help you find information about dockets or regulatory filings today?";
+
+/**
+ * How many conversations are kept in this browser.
+ *
+ * localStorage has a hard per-origin quota and one answer with its source list
+ * runs to several KB, so a regular user reaches it. Once setItem throws there
+ * is nowhere to report it from, and the old code logged and carried on: the
+ * history quietly stopped saving, and the loss only surfaced on the next
+ * reload. Bounding what is kept means the write keeps succeeding.
+ */
+const MAX_STORED_SESSIONS = 30;
+
+function createSession(): ChatSession {
+  return {
+    // Date.now() alone collides when two sessions are created in the same
+    // millisecond, which duplicate-keys the list and makes both unselectable.
+    id: `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    title: "New Inquiry",
+    messages: [{ role: 'model', content: GREETING }],
+    createdAt: Date.now()
+  };
+}
+
+function isStoredMessage(value: unknown): value is Message {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<Message>;
+  return (item.role === 'user' || item.role === 'model') && typeof item.content === 'string';
+}
+
+function isStoredSession(value: unknown): value is ChatSession {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<ChatSession>;
+  return typeof item.id === 'string'
+    && typeof item.title === 'string'
+    && Array.isArray(item.messages)
+    && item.messages.every(isStoredMessage);
+}
+
+/**
+ * Stored history is validated rather than trusted. A session missing its
+ * messages array threw during the first render, and because the bad value
+ * lives in storage the reload threw as well: the app stayed blank until the
+ * user cleared site data by hand. Anything off-shape is dropped instead.
+ */
+function loadStoredSessions(): ChatSession[] {
+  try {
+    const saved = localStorage.getItem(SESSIONS_STORAGE_KEY);
+    if (saved) {
+      const parsed: unknown = JSON.parse(saved);
+      if (Array.isArray(parsed)) {
+        const valid = parsed.filter(isStoredSession).map(session => ({
+          ...session,
+          createdAt: typeof session.createdAt === 'number' ? session.createdAt : Date.now()
+        }));
+        if (valid.length > 0) return valid.slice(0, MAX_STORED_SESSIONS);
+      }
+    }
+  } catch (error) {
+    console.error("Error loading chat sessions from localStorage:", error);
+  }
+  return [createSession()];
+}
+
+/**
+ * Writes the history, dropping the oldest conversations until it fits, and
+ * returns what was actually stored so the list on screen matches the list on
+ * disk. The active conversation is never dropped.
+ */
+function persistSessions(sessions: ChatSession[], activeSessionId: string): ChatSession[] {
+  let candidate = sessions.slice(0, MAX_STORED_SESSIONS);
+  for (;;) {
+    try {
+      localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(candidate));
+      return candidate;
+    } catch (error) {
+      const oldest = candidate.reduce(
+        (found, session, index) => session.id === activeSessionId ? found : index,
+        -1
+      );
+      if (oldest < 0) {
+        // Only the active conversation is left and it still does not fit.
+        // Leave both the stored value and the list on screen alone.
+        console.error("Chat history could not be saved:", error);
+        return sessions;
+      }
+      candidate = candidate.filter((_, index) => index !== oldest);
+    }
+  }
+}
+
 export default function App() {
   const [news, setNews] = useState<NewsUpdate[]>([]);
   const [loadingNews, setLoadingNews] = useState(true);
@@ -117,31 +209,9 @@ export default function App() {
   const [health, setHealth] = useState<HealthSummary | null>(null);
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
   const [turnstileResetSignal, setTurnstileResetSignal] = useState(0);
+  const [turnstileStalled, setTurnstileStalled] = useState(false);
   
-  const [sessions, setSessions] = useState<ChatSession[]>(() => {
-    try {
-      const saved = localStorage.getItem('dc_psc_chat_sessions');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed;
-        }
-      }
-    } catch (e) {
-      console.error("Error loading chat sessions from localStorage:", e);
-    }
-    const defaultId = 'session_' + Date.now();
-    return [
-      {
-        id: defaultId,
-        title: "New Inquiry",
-        messages: [
-          { role: 'model', content: "Hello! I'm your DC PSC Docket Assistant. How can I help you find information about dockets or regulatory filings today?" }
-        ],
-        createdAt: Date.now()
-      }
-    ];
-  });
+  const [sessions, setSessions] = useState<ChatSession[]>(loadStoredSessions);
 
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
     try {
@@ -199,12 +269,9 @@ export default function App() {
 
   useEffect(() => {
     if (isTyping) return;
-    try {
-      localStorage.setItem('dc_psc_chat_sessions', JSON.stringify(sessions));
-    } catch (e) {
-      console.error("Error saving chat sessions to localStorage:", e);
-    }
-  }, [sessions, isTyping]);
+    const stored = persistSessions(sessions, activeSessionId);
+    if (stored.length !== sessions.length) setSessions(stored);
+  }, [sessions, isTyping, activeSessionId]);
 
   useEffect(() => {
     if (activeSessionId) {
@@ -224,17 +291,31 @@ export default function App() {
     }
   }, [corpusPanelOpen]);
 
+  // The widget renders `interaction-only`, so when challenges.cloudflare.com is
+  // blocked — a privacy extension, a corporate proxy — there is nothing on
+  // screen and no token, and the send button simply stays greyed out with no
+  // reason given. Wait long enough that an ordinary solve never trips this,
+  // then say what is wrong.
+  useEffect(() => {
+    if (!appConfig?.turnstileRequired || turnstileToken) {
+      setTurnstileStalled(false);
+      return;
+    }
+    const timer = setTimeout(() => setTurnstileStalled(true), 8000);
+    return () => clearTimeout(timer);
+  }, [appConfig?.turnstileRequired, turnstileToken]);
+
   useEffect(() => {
     if (confirmClear) {
       const timer = setTimeout(() => {
         setConfirmClear(false);
-      }, 3000);
+      }, 5000);
       return () => clearTimeout(timer);
     }
   }, [confirmClear]);
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
-  const messages = activeSession ? activeSession.messages : [];
+  const messages = activeSession?.messages ?? [];
   const hasUserMessages = messages.some(message => message.role === 'user');
 
   const cancelActiveRequest = (sessionId?: string) => {
@@ -272,17 +353,9 @@ export default function App() {
     cancelActiveRequest();
     shouldAutoScrollRef.current = true;
     setFailedRequest(null);
-    const newId = 'session_' + Date.now();
-    const newSession: ChatSession = {
-      id: newId,
-      title: "New Inquiry",
-      messages: [
-        { role: 'model', content: "Hello! I'm your DC PSC Docket Assistant. How can I help you find information about dockets or regulatory filings today?" }
-      ],
-      createdAt: Date.now()
-    };
-    setSessions(prev => [newSession, ...prev]);
-    setActiveSessionId(newId);
+    const newSession = createSession();
+    setSessions(prev => [newSession, ...prev].slice(0, MAX_STORED_SESSIONS));
+    setActiveSessionId(newSession.id);
   };
 
   const handleDeleteChat = (idToDelete: string, e: React.MouseEvent) => {
@@ -290,18 +363,9 @@ export default function App() {
     cancelActiveRequest(idToDelete);
     shouldAutoScrollRef.current = true;
     if (sessions.length <= 1) {
-      const defaultId = 'session_' + Date.now();
-      setSessions([
-        {
-          id: defaultId,
-          title: "New Inquiry",
-          messages: [
-            { role: 'model', content: "Hello! I'm your DC PSC Docket Assistant. How can I help you find information about dockets or regulatory filings today?" }
-          ],
-          createdAt: Date.now()
-        }
-      ]);
-      setActiveSessionId(defaultId);
+      const replacement = createSession();
+      setSessions([replacement]);
+      setActiveSessionId(replacement.id);
       return;
     }
     const nextSessions = sessions.filter(s => s.id !== idToDelete);
@@ -321,9 +385,7 @@ export default function App() {
           return {
             ...session,
             title: "New Inquiry",
-            messages: [
-              { role: 'model', content: "Hello! I'm your DC PSC Docket Assistant. How can I help you find information about dockets or regulatory filings today?" }
-            ]
+            messages: [{ role: 'model', content: GREETING }]
           };
         }
         return session;
@@ -429,13 +491,25 @@ export default function App() {
 
     try {
       const activeSess = sessions.find(s => s.id === targetSessionId) || sessions[0];
-      const history = appendUserMessage
-        ? activeSess.messages
-        : activeSess.messages.at(-1)?.role === 'model'
-          ? activeSess.messages.slice(0, -1)
-          : activeSess.messages;
       // `message` is sent separately; including it in history duplicated the
-      // current question in the model transcript.
+      // current question in the model transcript. On a first attempt this
+      // holds on its own, because `sessions` here predates the user message
+      // just appended. A retry replays a question already in the transcript,
+      // so its turn — the failed answer and the question itself — has to come
+      // off explicitly.
+      // Failure notices are rendered in the assistant's place but were never
+      // said by it. Replaying them made the model apologise for errors it had
+      // not made, so they are dropped from what goes back upstream.
+      const priorMessages = (activeSess?.messages ?? []).filter(item => !item.isError);
+      const withoutFailedTurn = (): Message[] => {
+        const withoutAnswer = priorMessages.at(-1)?.role === 'model'
+          ? priorMessages.slice(0, -1)
+          : priorMessages;
+        return withoutAnswer.at(-1)?.role === 'user' && withoutAnswer.at(-1)?.content === userMessage
+          ? withoutAnswer.slice(0, -1)
+          : withoutAnswer;
+      };
+      const history = appendUserMessage ? priorMessages : withoutFailedTurn();
       const currentHistory: Message[] = history.slice(-10);
       const response = await chatWithDocketAssistant(
         currentHistory,
@@ -466,6 +540,12 @@ export default function App() {
           feedbackToken: response.feedbackToken ?? undefined
         }]);
       }
+      // The backend answered, but with a stand-in for an answer it could not
+      // produce. It arrives as an ordinary reply, so without this the turn
+      // looked finished and retyping the question was the only way forward.
+      if (response.degraded) {
+        setFailedRequest({ sessionId: targetSessionId, message: userMessage });
+      }
     } catch (error) {
       if (error instanceof AssistantRequestCancelledError) return;
       console.error("Chat error:", error);
@@ -477,7 +557,7 @@ export default function App() {
       const content = error instanceof AssistantRequestError
         ? error.userMessage
         : "The assistant could not be reached. Please retry the request.";
-      updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content }]);
+      updateSessionMessages(targetSessionId, prev => [...prev, { role: 'model', content, isError: true }]);
       setFailedRequest({ sessionId: targetSessionId, message: userMessage });
     } finally {
       if (activeRequestRef.current?.controller === requestController) {
@@ -1104,6 +1184,16 @@ export default function App() {
                             resetSignal={turnstileResetSignal}
                             onToken={setTurnstileToken}
                           />
+                          {turnstileStalled && (
+                            <div className="mt-2 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                              <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+                              <span>
+                                Security verification has not finished, so sending is paused. It usually clears on its own in a moment.
+                                If it does not, an ad blocker, privacy extension, or network filter is likely blocking
+                                <span className="whitespace-nowrap"> challenges.cloudflare.com</span> — allow it for this site and reload.
+                              </span>
+                            </div>
+                          )}
                         </div>
                       ) : appConfig?.turnstileRequired ? (
                         <div className="mt-3 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
@@ -1139,7 +1229,7 @@ export default function App() {
               <div className="grid gap-5 text-sm leading-relaxed text-slate-600 md:grid-cols-2">
                 <div>
                   <h3 className="mb-2 text-base text-slate-900">Stored on this device</h3>
-                  <p>Conversation history is saved in this browser's local storage so it can reappear on your next visit. Clearing browser storage removes it. Changing domains does not transfer that history automatically.</p>
+                  <p>Conversation history is saved in this browser's local storage so it can reappear on your next visit. The {MAX_STORED_SESSIONS} most recent conversations are kept; older ones are discarded to stay within the browser's storage limit. Clearing browser storage removes it. Changing domains does not transfer that history automatically.</p>
                 </div>
                 <div>
                   <h3 className="mb-2 text-base text-slate-900">Sent for answer generation</h3>
