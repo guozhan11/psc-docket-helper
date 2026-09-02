@@ -2,7 +2,7 @@
 
 ## Application Stack
 
-The application uses React, TypeScript, Vite, Tailwind CSS, Cloudflare Workers, D1, R2, and the OpenAI Responses API. The Express server supports local development and a Render-compatible fallback.
+The application uses React, TypeScript, Vite, Tailwind CSS, Cloudflare Workers, D1, R2, and the OpenAI Responses API. The Worker is the only implementation of the assistant, and it serves both local development and production.
 
 ## Filing Search Pipeline
 

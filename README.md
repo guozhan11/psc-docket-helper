@@ -78,7 +78,7 @@ npm run eval:cross-case   # score cross-case routing against the published index
 - [Deployment, ingestion, and operations](docs/OPERATIONS.md)
 - [Industry beta release checklist](docs/RELEASE_CHECKLIST.md)
 
-The main stack is React, TypeScript, Vite, Cloudflare Workers, D1, R2, and the OpenAI Responses API. An Express server remains available for local development and as a Render-compatible fallback.
+The main stack is React, TypeScript, Vite, Cloudflare Workers, D1, R2, and the OpenAI Responses API. The Worker is the only implementation of the assistant, and it serves both local development and production.
 
 ## Sources and Disclaimer
 

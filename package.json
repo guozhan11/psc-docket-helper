@@ -14,6 +14,7 @@
     "rag:ingest-shard-0-cloud": "python3 scripts/fast_r2_ingest.py --all --concurrency 4 --max-hours 5.25 --shard-index 0 --shard-count 4",
     "rag:ingest-d1-legacy": "python3 scripts/cloud_ingest.py --all --no-ocr",
     "build": "vite build",
+    "start": "node scripts/render-redirect.mjs",
     "cloudflare:dev": "npm run build && wrangler dev",
     "cloudflare:deploy": "npm run build && wrangler deploy",
     "cloudflare:db:local": "wrangler d1 migrations apply DB --local && wrangler d1 migrations apply DB_1 --local && wrangler d1 migrations apply DB_2 --local",

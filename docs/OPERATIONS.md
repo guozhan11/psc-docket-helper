@@ -24,6 +24,23 @@ npx wrangler secret put OPENAI_API_KEY
 
 Do not share a production URL until every gate in [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) passes.
 
+## The Render Service
+
+`psc-docket-helper.onrender.com` predates the move to Cloudflare and used to run
+the Express implementation in `server.ts`. That file is gone, so the service now
+runs `npm start`, which is `scripts/render-redirect.mjs`: a dependency-free Node
+process that answers `/healthz` with 200 for Render's health check and sends
+every other request to the Worker with an HTTP 301.
+
+It is a redirect rather than a second deployment on purpose. The Express app had
+its own retrieval path, no Turnstile, and no rate limiting; by the end it had no
+index either, so it answered from the model alone, without citations. Anything
+that keeps the old address serving HTML rather than forwarding brings that back.
+
+The service needs no environment variables. `OPENAI_API_KEY` and the RAG disk
+mount left over from the Express deployment can be removed from the Render
+dashboard. Set `CANONICAL_URL` only if the Worker's public hostname changes.
+
 ## Turnstile and Chat Protection
 
 Production chat requests use two Workers Rate Limiting bindings: 30 requests per anonymous browser per minute and an additional 300-request-per-minute regional safety ceiling. The frontend stores a random anonymous client identifier in browser local storage; no account or user profile is created.
