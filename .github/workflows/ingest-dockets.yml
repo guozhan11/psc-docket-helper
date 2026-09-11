@@ -36,7 +36,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - name: Check DC PSC before launching ingestion shards
+        id: check
+        shell: bash
+        run: |
+          set -uo pipefail
+          url='https://edocket.dcpsc.org/apis/api/Filing/GetFilings?caseNumber=&isAdmin=false&orderByColumn=receivedDate&sortBy=asc&recordsToSkip=0&recordsToShow=1'
+          body=$(mktemp)
+          max_attempts=8
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            status=$(curl --silent --show-error \
+              --connect-timeout 25 --max-time 60 \
+              --output "$body" --write-out '%{http_code}' \
+              "$url") || status=000
+
+            if [ "$status" = 200 ] && jq -e '.totalRecords != null' "$body" >/dev/null 2>&1; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+              echo "DC PSC is available."
+              exit 0
+            fi
+
+            case "$status" in
+              000|429|500|502|503|504|522)
+                ;;
+              *)
+                echo "::error::DC PSC returned non-transient HTTP $status during the source check."
+                exit 1
+                ;;
+            esac
+
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              delay=$((1 << (attempt - 1)))
+              if [ "$delay" -gt 30 ]; then delay=30; fi
+              echo "DC PSC returned HTTP $status; retrying in ${delay}s ($((attempt + 1))/$max_attempts)."
+              sleep "$delay"
+            fi
+          done
+
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::DC PSC is still unavailable after $max_attempts attempts; keeping the last complete R2 snapshot and deferring this ingestion cycle."
+
   metadata:
+    needs: source
+    if: ${{ needs.source.outputs.available == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -169,7 +218,7 @@ jobs:
   alert:
     # Scheduled runs have no one watching them; an ingest shard died on a
     # transient R2 error in August 2026 and went unnoticed for two days.
-    needs: [metadata, ingest, case-router]
+    needs: [source, metadata, ingest, case-router]
     if: >-
       ${{ always() &&
           (contains(needs.*.result, 'failure') ||
