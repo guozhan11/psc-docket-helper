@@ -55,6 +55,31 @@ class DcpscRequestTests(unittest.TestCase):
         sleep.assert_called_once_with(1.25)
 
     @patch.object(cloud_ingest.time, "sleep")
+    @patch.object(cloud_ingest.random, "uniform", return_value=0.25)
+    def test_retries_522_with_exponential_backoff(
+        self,
+        _uniform: Mock,
+        sleep: Mock,
+    ) -> None:
+        first = FakeResponse(522)
+        success = FakeResponse(200)
+        session = Mock()
+        session.request.side_effect = [first, success]
+
+        response = cloud_ingest.dcpsc_request(
+            "GET",
+            "https://example.test",
+            session=session,
+            attempts=2,
+            timeout=1,
+        )
+
+        self.assertIs(response, success)
+        self.assertTrue(first.closed)
+        self.assertEqual(session.request.call_count, 2)
+        sleep.assert_called_once_with(1.25)
+
+    @patch.object(cloud_ingest.time, "sleep")
     def test_honors_numeric_retry_after(self, sleep: Mock) -> None:
         limited = FakeResponse(429, retry_after="7")
         success = FakeResponse(200)
