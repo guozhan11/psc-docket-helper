@@ -33,7 +33,13 @@ MAX_DOCUMENTS_PER_RUN = 5_000
 MAX_D1_ROWS_WRITTEN_PER_DAY = 80_000
 MAX_R2_OBJECTS_WRITTEN_PER_DAY = 5_000
 DCPSC_REQUEST_ATTEMPTS = 8
-DCPSC_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 522})
+# eDocket sits behind Cloudflare, so an origin outage surfaces as whichever
+# 52x Cloudflare picks that moment (521 down, 522 connect timeout, 524 read
+# timeout, 525/526 TLS) rather than as one stable code. Retry the family, not
+# the code we happened to see last.
+DCPSC_RETRYABLE_STATUS_CODES = frozenset(
+    {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530}
+)
 
 
 class FreeTierLimitReached(RuntimeError):

@@ -64,7 +64,9 @@ jobs:
             fi
 
             case "$status" in
-              000|429|500|502|503|504|522)
+              # Same Cloudflare 52x family the Python client retries: an
+              # eDocket origin outage picks a different code each time.
+              000|408|429|500|502|503|504|520|521|522|523|524|525|526|527|530)
                 ;;
               *)
                 echo "::error::DC PSC returned non-transient HTTP $status during the source check."

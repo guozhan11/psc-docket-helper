@@ -56,28 +56,54 @@ class DcpscRequestTests(unittest.TestCase):
 
     @patch.object(cloud_ingest.time, "sleep")
     @patch.object(cloud_ingest.random, "uniform", return_value=0.25)
-    def test_retries_522_with_exponential_backoff(
+    def test_retries_every_cloudflare_origin_error(
         self,
         _uniform: Mock,
         sleep: Mock,
     ) -> None:
-        first = FakeResponse(522)
-        success = FakeResponse(200)
-        session = Mock()
-        session.request.side_effect = [first, success]
+        # One eDocket origin outage surfaces as whichever 52x Cloudflare picks,
+        # so retrying only the code from the last incident leaves the next one
+        # crashing the shard on an uncaught HTTPError.
+        for status in (408, 520, 521, 522, 523, 524, 525, 526, 527, 530):
+            with self.subTest(status=status):
+                sleep.reset_mock()
+                first = FakeResponse(status)
+                success = FakeResponse(200)
+                session = Mock()
+                session.request.side_effect = [first, success]
 
-        response = cloud_ingest.dcpsc_request(
-            "GET",
-            "https://example.test",
-            session=session,
-            attempts=2,
-            timeout=1,
-        )
+                response = cloud_ingest.dcpsc_request(
+                    "GET",
+                    "https://example.test",
+                    session=session,
+                    attempts=2,
+                    timeout=1,
+                )
 
-        self.assertIs(response, success)
-        self.assertTrue(first.closed)
-        self.assertEqual(session.request.call_count, 2)
-        sleep.assert_called_once_with(1.25)
+                self.assertIs(response, success)
+                self.assertTrue(first.closed)
+                self.assertEqual(session.request.call_count, 2)
+                sleep.assert_called_once_with(1.25)
+
+    @patch.object(cloud_ingest.time, "sleep")
+    def test_exhausted_cloudflare_origin_errors_report_an_outage(
+        self,
+        _sleep: Mock,
+    ) -> None:
+        # Callers resume from their checkpoint on DCPSCUnavailableError; a bare
+        # HTTPError would instead fail the job and open an alert issue.
+        for status in (520, 521, 522, 523, 524, 525, 526, 527, 530):
+            with self.subTest(status=status):
+                session = Mock()
+                session.request.return_value = FakeResponse(status)
+
+                with self.assertRaises(cloud_ingest.DCPSCUnavailableError):
+                    cloud_ingest.dcpsc_request(
+                        "GET",
+                        "https://example.test",
+                        session=session,
+                        attempts=2,
+                    )
 
     @patch.object(cloud_ingest.time, "sleep")
     def test_honors_numeric_retry_after(self, sleep: Mock) -> None:
