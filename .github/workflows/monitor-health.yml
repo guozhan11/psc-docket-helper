@@ -25,7 +25,8 @@ permissions:
 env:
   HEALTH_URL: ${{ inputs.health-url || 'https://psc-docket-assistant.psc-docket-helper.workers.dev/api/health?live=1' }}
   # One open issue per condition, reused rather than reopened, so a long outage
-  # does not bury the repository under a new issue every half hour.
+  # does not bury the repository under a new issue every half hour. The run
+  # fails only when the condition is new or has changed; see the final step.
   ALERT_TITLE: "Health check: /api/health is not ok"
 
 jobs:
@@ -77,8 +78,8 @@ jobs:
             done
           }
 
-          if ! existing=$(gh_retry gh issue list --state open --search "$ALERT_TITLE in:title" \
-            --json number,title -q "[.[] | select(.title == \"$ALERT_TITLE\")] | .[0].number // empty"); then
+          if ! existing_json=$(gh_retry gh issue list --state open --search "$ALERT_TITLE in:title" \
+            --json number,title,body -q "[.[] | select(.title == \"$ALERT_TITLE\")] | .[0] // empty"); then
             echo "::warning::Could not read the health alert after retries; issue synchronization will resume on the next run."
             if [ "$STATUS" = "ok" ]; then
               echo "Health is ok, so a notification API failure will not fail this run."
@@ -86,6 +87,17 @@ jobs:
             fi
             echo "::error::Health is $STATUS (HTTP $HTTP_CODE), and the alert issue could not be synchronized."
             exit 1
+          fi
+
+          existing=""
+          recorded=""
+          if [ -n "${existing_json:-}" ]; then
+            existing=$(jq -r '.number // empty' <<< "$existing_json")
+            # The marker the body carries, so a repeat of the same condition is
+            # recognisable without re-parsing prose. An alert opened before this
+            # marker existed reads as empty and is treated as a change once.
+            recorded=$(jq -r '.body // ""' <<< "$existing_json" \
+              | sed -n 's/.*<!-- issues: \(.*\) -->.*/\1/p' | tail -n 1)
           fi
 
           if [ "$STATUS" = "ok" ]; then
@@ -117,14 +129,35 @@ jobs:
             "" \
             "This issue closes itself when health returns to \`ok\`." \
             "" \
-            "[Run]($RUN_URL)")
+            "[Run]($RUN_URL)" \
+            "" \
+            "<!-- issues: $ISSUES -->")
 
-          if [ -n "$existing" ]; then
-            echo "Alert #$existing already open; leaving it as the single notification."
-          else
+          if [ -z "$existing" ]; then
             if ! gh_retry gh issue create --title "$ALERT_TITLE" --body "$body"; then
               echo "::warning::The health alert issue could not be created after retries."
             fi
+            # First run to see this condition: fail so the Actions list goes red
+            # alongside the new issue.
+            exit 1
           fi
-          # Fail the run too, so the Actions list shows red alongside the issue.
+
+          if [ "$recorded" = "$ISSUES" ]; then
+            # Already reported, and nothing about it has changed. A DC PSC outage
+            # held metadata stale for days in September 2026, and failing every
+            # half hour added no information anyone could act on. The open issue
+            # is the standing notification; repeat red runs only teach us to
+            # ignore the alarm that matters.
+            echo "::notice::Alert #$existing already reports \`$ISSUES\`; leaving it open without a repeat failure."
+            exit 0
+          fi
+
+          echo "Alert #$existing reported \`${recorded:-an earlier condition}\`; health now reports \`$ISSUES\`."
+          if ! gh_retry gh issue comment "$existing" --body "$body"; then
+            echo "::warning::The changed health condition could not be posted after retries."
+          fi
+          if ! gh_retry gh issue edit "$existing" --body "$body"; then
+            echo "::warning::Alert #$existing could not be updated after retries; the next run will report the change again."
+          fi
+          # The condition changed, so notify again.
           exit 1
