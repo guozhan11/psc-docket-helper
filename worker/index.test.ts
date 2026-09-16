@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   COMPACT_DOCUMENT_GROUP_TARGET,
   DEFAULT_RANKING_WEIGHTS,
+  EXCERPT_CHARACTER_BUDGET,
   EVIDENCE_MAX_PER_DOCUMENT,
   EVIDENCE_ROW_BUDGET,
   admitChatRequest,
@@ -10,6 +11,8 @@ import {
   documentRankingScore,
   extractQueryYears,
   filterFillRatio,
+  findPageExcerpts,
+  pageBlocks,
   saturationAdjustedHits,
   fullTextCoverageSummary,
   isFreshTimestamp,
@@ -118,6 +121,116 @@ test('OpenAI request payload does not impose an answer-length cap', () => {
   const payload = openAiRequestPayload({} as Env, [], 'Explain FC1176.', [], true);
   assert.equal('max_output_tokens' in payload, false);
   assert.equal(payload.stream, true);
+});
+
+// Layout of pages 13 and 14 of Pepco's CY2025 Annual Informational Filing
+// (FC1176-584), trimmed. The page 14 table continues section 5 from page 13.
+const CONTINUED_TABLE_PAGE = [
+  'Category                           3/3 Compliance Filing          2025 Actuals      Variance',
+  '',
+  'Capacity Planning and Management              122,830            39,640,385      9,287,514',
+  'Corrective Maintenance                         3,725,397            13,731,732     (8,300,065)',
+  'Grand Total                                  $15,945,370           $63,647,389    ($1,266,969)',
+  '',
+  '',
+  'As corrected, the record shows that the Company had underspent relative to forecast in 2025,',
+  'and confirms that the Company&#x27;s 69 kV capital planning was reasonable.',
+  '',
+  'Pepco DC Annual Information Filing O&amp;M Summary',
+  '',
+  'Overall, Pepco DC Distribution O&amp;M 2025 actual expenses were approximately $7.1 million',
+  'higher than 2025 projections. The variance was driven primarily by higher bad debt expense.',
+  '',
+  '                                 9'
+].join('\n');
+const TITLED_TABLE_PAGE = [
+  '4. ITNs in FC 1176 Main Application – Variances of ITNs.',
+  '',
+  'Category                           3/3 Compliance Filing          2025 Actuals      Variance',
+  'Back Office                                      0                 338           (338)',
+  'Capacity Planning and Management                  0              6,445,211     (6,445,211)',
+  '',
+  'Within Capacity Planning, the variance reflects continued execution of a project.'
+].join('\n');
+const excerptDocument = {
+  filing_id: 239085,
+  case_number: 'FC1176',
+  docket_number: 'FC1176 - 584',
+  title: 'Pepco Annual Informational Filing',
+  received_date: '2026-03-31',
+  official_pdf_url: 'https://edocket.dcpsc.org/apis/api/Filing/download?attachId=1&guidFileName=a.pdf',
+  r2_key: 'filings/2026/239085.html.gz',
+  term_filter: null
+} as never;
+const pageHtml = (page: number, text: string) => `<section data-page="${page}"><pre>${text}</pre></section>`;
+
+test('page layout separates tables from paragraphs and drops page numbers', () => {
+  const blocks = pageBlocks(CONTINUED_TABLE_PAGE.replace(/&amp;/g, '&'));
+  assert.deepEqual(blocks.map(block => block.kind), ['table', 'text', 'text', 'text']);
+  // The column header, split from its rows by a blank line, stays with the table.
+  assert.match(blocks[0].lines[0], /^Category\s+3\/3 Compliance Filing/);
+  assert.equal(blocks[0].lines.length, 4);
+});
+
+test('prose with pleading line numbers is not mistaken for a table', () => {
+  const blocks = pageBlocks([
+    '4    Q62. What are the major cost drivers that are projected to contribute to the changes in',
+    '5    total O&M projection for 2022 to 2023?',
+    '6    A62. Customer Operations O&M costs are projected to increase by $7.1 million from'
+  ].join('\n'));
+  assert.deepEqual(blocks.map(block => block.kind), ['text']);
+});
+
+test('an excerpt centres on the paragraph that matches, not the table above it', () => {
+  const [row] = findPageExcerpts(
+    pageHtml(14, CONTINUED_TABLE_PAGE),
+    ['2025', 'expense', 'variance'],
+    excerptDocument
+  );
+  assert.equal(row.page_number, 14);
+  assert.match(row.text, /O&M 2025 actual expenses were approximately \$7\.1 million/);
+  // Everything fits the budget, but the untitled table is still left out.
+  assert.match(row.text, /^…\n\nAs corrected, the record shows/);
+  assert.doesNotMatch(row.text, /9,287,514|8,300,065|\[Table/);
+});
+
+test('a table without a title on its page is marked as possibly continued', () => {
+  const [row] = findPageExcerpts(
+    pageHtml(14, CONTINUED_TABLE_PAGE),
+    ['corrective', 'maintenance'],
+    excerptDocument
+  );
+  assert.match(row.text, /^\[Table at the top of the page, with no title on this page; it may continue a table from the previous page\]\nCategory \| 3\/3 Compliance Filing \| 2025 Actuals \| Variance\n/);
+  assert.match(row.text, /Corrective Maintenance \| 3,725,397 \| 13,731,732 \| \(8,300,065\)/);
+  assert.match(row.text, /\[End of table\]/);
+});
+
+test('a titled table keeps its title and closes before the next paragraph', () => {
+  const [row] = findPageExcerpts(pageHtml(13, TITLED_TABLE_PAGE), ['capacity', 'planning'], excerptDocument);
+  assert.match(row.text, /^4\. ITNs in FC 1176 Main Application – Variances of ITNs\.\n\n\[Table\]\n/);
+  assert.match(row.text, /\[End of table\]\n\nWithin Capacity Planning/);
+});
+
+test('excerpts decode hex entities and match curly apostrophes', () => {
+  const [decoded] = findPageExcerpts(pageHtml(14, CONTINUED_TABLE_PAGE), ['company\'s'], excerptDocument);
+  assert.match(decoded.text, /the Company's 69 kV capital planning/);
+  assert.doesNotMatch(decoded.text, /&#x27;|&amp;/);
+  const [curly] = findPageExcerpts(pageHtml(3, 'Pepco’s annual filing.'), ['pepco\'s'], excerptDocument);
+  assert.equal(curly.page_number, 3);
+});
+
+test('an overlong paragraph is cut to the budget around its first match', () => {
+  const paragraph = `${'lorem '.repeat(600)}rate base ${'ipsum '.repeat(600)}`;
+  const [row] = findPageExcerpts(pageHtml(5, paragraph), ['rate'], excerptDocument);
+  assert.ok(row.text.length <= EXCERPT_CHARACTER_BUDGET + 2);
+  assert.match(row.text, /^…/);
+  assert.match(row.text, /rate base/);
+});
+
+test('the model is told not to attach table figures to nearby paragraphs', () => {
+  const payload = openAiRequestPayload({} as Env, [], 'Explain FC1176.', []);
+  assert.match(String(payload.instructions), /\[Table\] and \[End of table\] is a separate table/);
+  assert.match(String(payload.instructions), /never present them as details of a neighboring paragraph/);
 });
 
 function r2Object(payload: unknown) {

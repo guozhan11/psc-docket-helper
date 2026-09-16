@@ -1019,16 +1019,27 @@ function replaceOpaqueSourceLabels(reply: string, rows: SearchRow[]): string {
   }, reply);
 }
 
-function decodeHtml(value: string): string {
+function codePointOr(code: number, fallback: string): string {
+  const valid = Number.isInteger(code) && code > 0 && code <= 0x10ffff
+    && !(code >= 0xd800 && code <= 0xdfff);
+  return valid ? String.fromCodePoint(code) : fallback;
+}
+
+// Python's html.escape writes an apostrophe as &#x27;, so stored page text is
+// full of hex references. &amp; is decoded last so "&amp;lt;" stays "&lt;".
+function decodeEntities(value: string): string {
   return value
     .replace(/&nbsp;/gi, " ")
-    .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]{1,6});/gi, (entity, hex: string) => codePointOr(parseInt(hex, 16), entity))
+    .replace(/&#(\d{1,7});/g, (entity, decimal: string) => codePointOr(Number(decimal), entity))
     .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/&amp;/g, "&");
+}
+
+function decodeHtml(value: string): string {
+  return decodeEntities(value).replace(/\s+/g, " ").trim();
 }
 
 function stripHtml(value: string): string {
@@ -1581,6 +1592,94 @@ async function loadCaseManifest(env: WorkerEnv, caseNumber: string): Promise<Cas
   };
 }
 
+export interface PageBlock {
+  kind: "text" | "table";
+  lines: string[];
+}
+
+// Page text is extracted with its layout, so table columns are separated by
+// runs of spaces. A cell is numeric when it is an amount, count, or percentage,
+// including accounting negatives such as (8,300,065).
+const NUMERIC_CELL = /^[(−-]?\$?[(−-]?\d[\d,]*(?:\.\d+)?%?\)?$/;
+
+function tableCells(line: string): string[] {
+  return line.trim().split(/\s{2,}/).filter(Boolean);
+}
+
+function numericCellCount(line: string): number {
+  return tableCells(line).filter(cell => NUMERIC_CELL.test(cell)).length;
+}
+
+function isTableRow(line: string): boolean {
+  return numericCellCount(line) >= 2 || tableCells(line).length >= 3;
+}
+
+/**
+ * Splits one page into paragraphs and tables.
+ *
+ * Excerpts used to be a character window around the first matching term, with
+ * all whitespace collapsed. A table then read as one more sentence of whatever
+ * paragraph sat next to it: in Pepco's CY2025 Annual Informational Filing, a
+ * 69 kV capital-variance table continued from the previous page sits directly
+ * above the O&M summary, and answers reported its figures as O&M variances.
+ * Keeping blocks whole, and marking tables, lets the model see the boundary.
+ */
+export function pageBlocks(text: string): PageBlock[] {
+  const groups: string[][] = [];
+  let current: string[] = [];
+  for (const line of text.replace(/\r\n?/g, "\n").split("\n")) {
+    if (line.trim()) {
+      current.push(line.trimEnd());
+    } else if (current.length) {
+      groups.push(current);
+      current = [];
+    }
+  }
+  if (current.length) groups.push(current);
+
+  const blocks: PageBlock[] = [];
+  // A lone column-header line is often separated from its rows by a blank
+  // line; hold it until the next group shows whether rows follow.
+  let pendingHeader: string[] = [];
+  for (const lines of groups) {
+    // Page numbers carry no content.
+    if (lines.every(line => /^\s*\d{1,4}\s*$/.test(line))) continue;
+    const tableRows = lines.filter(isTableRow).length;
+    const isTable = tableRows * 2 >= lines.length && lines.some(line => numericCellCount(line) >= 2);
+    if (!isTable) {
+      if (pendingHeader.length) blocks.push({ kind: "text", lines: pendingHeader });
+      pendingHeader = [];
+      if (lines.length === 1 && tableCells(lines[0]).length >= 3) {
+        pendingHeader = lines;
+      } else {
+        blocks.push({ kind: "text", lines });
+      }
+      continue;
+    }
+    const tableLines = [...pendingHeader, ...lines];
+    pendingHeader = [];
+    const previous = blocks.at(-1);
+    // Rows of one table can also be split by blank lines.
+    if (previous?.kind === "table") {
+      previous.lines.push(...tableLines);
+    } else {
+      blocks.push({ kind: "table", lines: tableLines });
+    }
+  }
+  if (pendingHeader.length) blocks.push({ kind: "text", lines: pendingHeader });
+  return blocks;
+}
+
+function renderPageBlock(block: PageBlock, index: number): string {
+  if (block.kind === "text") return block.lines.join(" ").replace(/\s+/g, " ").trim();
+  const opening = index === 0
+    ? "[Table at the top of the page, with no title on this page; it may continue a table from the previous page]"
+    : "[Table]";
+  return [opening, ...block.lines.map(line => tableCells(line).join(" | ")), "[End of table]"].join("\n");
+}
+
+export const EXCERPT_CHARACTER_BUDGET = 2000;
+
 export function findPageExcerpts(
   html: string,
   terms: string[],
@@ -1590,13 +1689,69 @@ export function findPageExcerpts(
   const rows: SearchRow[] = [];
   const sections = html.matchAll(/<section\s+data-page=["'](\d+)["'][^>]*>([\s\S]*?)<\/section>/gi);
   for (const section of sections) {
-    const text = stripHtml(section[2]);
-    const normalized = text.toLowerCase();
+    const blocks = pageBlocks(decodeEntities(section[2].replace(/<[^>]*>/g, "")));
+    const rendered = blocks.map(renderPageBlock);
+    // Filings mostly use curly apostrophes; query terms are typed with straight ones.
+    const lowered = rendered.map(value => value.toLowerCase().replace(/[‘’]/g, "'"));
+    const normalized = lowered.join("\n");
     const matchingTerms = terms.filter(term => normalized.includes(term));
     if (matchingTerms.length < minimumTermMatches) continue;
-    const firstMatch = Math.min(...matchingTerms.map(term => normalized.indexOf(term)).filter(index => index >= 0));
-    const start = Math.max(0, firstMatch - 500);
-    const end = Math.min(text.length, firstMatch + 1700);
+
+    // Centre on the block where the most query terms occur together, not on
+    // wherever the first term happens to appear. A paragraph beats a table on
+    // a tie, since a table's header words match many questions.
+    const scores = lowered.map(value => matchingTerms.filter(term => value.includes(term)).length);
+    let best = 0;
+    for (let index = 1; index < blocks.length; index += 1) {
+      if (scores[index] > scores[best]
+        || (scores[index] === scores[best] && blocks[best].kind === "table" && blocks[index].kind === "text")) {
+        best = index;
+      }
+    }
+
+    let text: string;
+    let first = best;
+    let last = best;
+    if (rendered[best].length > EXCERPT_CHARACTER_BUDGET) {
+      const value = rendered[best];
+      const firstMatch = Math.min(...matchingTerms
+        .map(term => lowered[best].indexOf(term))
+        .filter(index => index >= 0));
+      const start = Math.max(0, firstMatch - 500);
+      const end = Math.min(value.length, start + EXCERPT_CHARACTER_BUDGET);
+      text = `${start > 0 ? "…" : ""}${value.slice(start, end)}${end < value.length ? "…" : ""}`;
+    } else {
+      // Grow by whole blocks, preceding context first, while the budget allows.
+      // An untitled table at the top of the page is never pulled in as context:
+      // nothing on the page says what it measures, which is exactly how its
+      // figures end up attributed to the paragraph below it.
+      const untitledTopTable = blocks[0]?.kind === "table";
+      let length = rendered[best].length;
+      let canGrowBefore = true;
+      let canGrowAfter = true;
+      while (canGrowBefore || canGrowAfter) {
+        if (canGrowBefore) {
+          const reachesUntitledTable = first === 1 && untitledTopTable;
+          const added = first > 0 && !reachesUntitledTable ? rendered[first - 1].length + 2 : Infinity;
+          if (length + added <= EXCERPT_CHARACTER_BUDGET) {
+            first -= 1;
+            length += added;
+          } else {
+            canGrowBefore = false;
+          }
+        }
+        if (canGrowAfter) {
+          const added = last < rendered.length - 1 ? rendered[last + 1].length + 2 : Infinity;
+          if (length + added <= EXCERPT_CHARACTER_BUDGET) {
+            last += 1;
+            length += added;
+          } else {
+            canGrowAfter = false;
+          }
+        }
+      }
+      text = `${first > 0 ? "…\n\n" : ""}${rendered.slice(first, last + 1).join("\n\n")}${last < rendered.length - 1 ? "\n\n…" : ""}`;
+    }
     rows.push({
       filing_id: document.filing_id,
       case_number: document.case_number,
@@ -1605,8 +1760,10 @@ export function findPageExcerpts(
       received_date: document.received_date,
       official_pdf_url: document.official_pdf_url,
       page_number: Number(section[1]),
-      text: `${start > 0 ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}`,
-      rank: -matchingTerms.length
+      text,
+      // Pages are ordered by how many terms they contain; among those, a page
+      // where the terms meet in one block is the more direct evidence.
+      rank: -matchingTerms.length - scores[best] / (matchingTerms.length + 1)
     });
   }
   return rows.sort((left, right) => left.rank - right.rank).slice(0, 2);
@@ -1958,6 +2115,7 @@ export function openAiRequestPayload(
 Only answer questions related to the DC Public Service Commission, its proceedings, dockets, utilities, or public filings.
 Ground document-content claims in the supplied indexed excerpts. Cite evidence inline using each record's exact Required citation Markdown.
 Metadata-only records may establish that a filing exists, its title, date, case, and official URL, but never what its document body says.
+Excerpts keep each page's layout. Text between [Table] and [End of table] is a separate table: describe its figures only as its own title, column headers, and row labels define them, and never present them as details of a neighboring paragraph. A table marked as having no title on its page may continue from the previous page, so do not infer what it measures from nearby text; if its subject matters to the answer and is not stated, say so.
 Never show labels such as Source 1, Source 2, or Evidence 1 to the user. Content citations must identify the filing by title and PDF page; metadata citations must identify it as a filing record.
 Never invent a filing, quotation, page, date, or URL. If evidence is insufficient, say so and suggest a narrower search.
 Keep exact keyword matches distinct from interpretation. Always include the official e-Docket search link when useful.`,
@@ -2190,7 +2348,8 @@ function buildDirectExcerptReply(rows: SearchRow[], reason: "disabled" | "unavai
         `[Open the official PDF](${row.official_pdf_url})`
       ].join("\n\n") : [
           `**${index + 1}. ${row.case_number}: ${row.title} — page ${row.page_number}**`,
-          row.text.slice(0, 700),
+          // Layout and table markers are for the model; a reader gets plain text.
+          row.text.replace(/\s+/g, " ").trim().slice(0, 700),
           `[Open the official PDF at page ${row.page_number}](${officialPdfPageUrl(row)})`
         ].join("\n\n")),
       `[Search the complete official e-Docket](${EDOCKET_SEARCH_URL})`
