@@ -6,9 +6,11 @@ An independent beta AI assistant for exploring District of Columbia Public Servi
 
 ### [Open the PSC Docket Helper](https://psc-docket-assistant.psc-docket-helper.workers.dev/)
 
-[![PSC Docket Helper chat interface](docs/images/chat-page.jpg)](https://psc-docket-assistant.psc-docket-helper.workers.dev/#docket-chat)
+[![PSC Docket Helper answering "In FC1176, what drove Pepco's 2025 O&M expense variance?" with cited filings and pages](docs/images/Screenshot_1.png)](https://psc-docket-assistant.psc-docket-helper.workers.dev/#docket-chat)
 
-*The Docket Assistant searches indexed public filings and links every answer back to the official PDF and page. Click the screenshot to open the live chat.*
+[![The official filing sources listed beneath the same answer, each linked to its PDF page](docs/images/Screenshot_2.png)](https://psc-docket-assistant.psc-docket-helper.workers.dev/#docket-chat)
+
+*One answer, top and bottom: the Docket Assistant searches indexed public filings, cites the filings and pages it draws on, and lists every retrieved filing with a link to the official PDF. Click a screenshot to open the live chat.*
 
 No installation is required.
 
