@@ -11,8 +11,8 @@ The application uses React, TypeScript, Vite, Tailwind CSS, Cloudflare Workers, 
 3. Four independent jobs download PDFs to temporary runner storage and extract text page by page without OCR on the historical first pass.
 4. Gzipped page-level HTML is stored privately in R2.
 5. Each case gets four compressed R2 manifest parts. Each extraction job owns one part, preventing concurrent manifest overwrites.
-6. After ingestion, a GitHub Actions job folds the document filters into compact case-level filters and atomically publishes a 16-part global case router to R2.
-7. For questions with no case number, the Worker scans the router, ranks eight candidate cases, and verifies the strongest candidates against their stored filing text. Case-specific questions skip this routing step.
+6. After ingestion, a GitHub Actions job folds the document filters into compact case-level filters and atomically publishes a 16-part global case router to R2. A separate weekly workflow rebuilds the inverted term index described below.
+7. For questions with no case number, the Worker ranks cases through the inverted term index, opens filings in the strongest candidates (the top-ranked case gets a deeper read than the rest), and verifies them against their stored filing text. If the index is unpublished or a shard the question needs cannot be read, the Worker falls back to the case router, which ranks eight candidate cases from one partition. Case-specific questions skip this routing step, and a follow-up that names no subject of its own leads with the cases the conversation has already cited.
 8. The Worker sends only verified excerpts to OpenAI. Metadata-only answers are explicitly labelled; document-content claims require extracted text. Answers link to the official PDF.
 
 PDFs are temporary during extraction and are not permanently duplicated in project storage. When `CLOUDFLARE_ACCOUNT_ID` is configured, OpenAI requests use Cloudflare AI Gateway for monitoring and spend controls.
@@ -37,6 +37,10 @@ The inverted index stores the opposite direction: term to the cases containing i
 
 Each posting list carries its document frequency, which gives inverse document frequency ranking. This is what the Bloom filters could not express: they counted a hit on a term appearing in nearly every filing the same as a hit on a rare one, so questions built mostly from common words left a large block of cases tied at the top, with filing dates left to break the tie. Terms above 15 percent document frequency keep their frequency for ranking but drop their posting lists, since they cannot separate one case from another.
 
+A case's score for a term is that inverse document frequency multiplied by a per-case weight stored in the posting list. The `case-tf` format stored how many of the case's filings contained the term. That separated a case discussing a topic throughout from one mentioning it once, but it also rewarded size on its own, and the largest docket in the corpus led most questions regardless of what was asked. The current `case-bm25` format stores a BM25 term weight, which divides the count by the size of the case, scaled by 100 so the wire format stays integers. The Worker still reads every earlier format, so deploying never depends on a rebuild, and `/api/health` reports which format is live.
+
+Terms are indexed by stem. `stemTerm` in `shared/termIndex.ts` strips only suffixes that leave a prefix of the original word, because excerpt verification is a plain substring match against page text: the stem `disconnect` still matches `disconnection` and `disconnected`. Derivational endings such as `-ation` need a longer remaining stem than plural or tense endings, since stripping `generation` to `gener` would match `general` on nearly every page. Bloom-filter candidate selection still uses the exact tokens the filters were built from.
+
 Cross-case answers carry a scope note describing the path actually taken, so the note narrows automatically when the Worker falls back to the router. Generations publish into alternating slots and the index object is written last, so readers only ever see a complete generation.
 
 ## Compact Index Design
@@ -59,4 +63,4 @@ npm run rag:build -- --cases 1176 --concurrency 4
 
 Multiple cases can be supplied as a comma-separated list. The command reuses extracted content in `.rag-data` and deletes temporary PDFs unless `--keep-pdfs` is supplied. Set `RAG_DATA_DIR` to store local RAG data elsewhere.
 
-Ollama is a local model runner, not an OCR engine. This project uses OCRmyPDF and Tesseract for deterministic, open-source OCR without per-page API charges.
+The local build does not run OCR; it reports how many pages had no extractable text. The legacy D1 ingestion script, `scripts/cloud_ingest.py`, can OCR such pages with OCRmyPDF, which uses Tesseract, unless `--no-ocr` is passed. The current R2 ingestion does not OCR on its first pass.

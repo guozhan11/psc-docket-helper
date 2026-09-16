@@ -22,7 +22,7 @@ Review every prompt in `evaluation/questions.json` against the deployed candidat
 2. Document-content claims have a relevant official filing and page citation.
 3. Official links open successfully.
 4. Metadata-only evidence is not presented as proof of document contents.
-5. Cross-case answers display the non-exhaustive scope note and include diverse cases when supported.
+5. Cross-case answers display the scope note for the path actually taken (every indexed case through the term index, or a sample through the case router fallback) and include diverse cases when supported.
 6. Insufficient-evidence prompts produce an explicit limitation rather than a guess.
 
 Release threshold: no fabricated filing, page, quotation, date, or URL; 100% working citations in the reviewed sample; at least 90% overall reviewer pass rate.

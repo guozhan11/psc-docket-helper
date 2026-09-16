@@ -32,7 +32,7 @@ No installation is required.
 
 A question naming a case number searches that case directly. A question without one searches all 40,000-plus indexed cases, ranks them, and then opens the strongest candidates to verify the actual filing text before answering.
 
-Ranking favours rarer, more distinctive words: a term appearing in most filings — `commission`, `residential` — cannot separate one case from another and is set aside. **The more specific your wording, the better the result.**
+Ranking favours rarer, more distinctive words. A term found in more than 15% of cases, such as `commission` or `residential`, cannot separate one case from another and is set aside. **The more specific your wording, the better the result.**
 
 A follow-up such as `And for 2024?` continues within the cases just discussed.
 

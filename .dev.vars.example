@@ -1,7 +1,9 @@
-# Copy this file to .dev.vars for `npm run cloudflare:dev`.
+# Copy this file to .dev.vars for `npm run dev` (`npm run cloudflare:dev`).
 # Never commit real secret values.
 OPENAI_API_KEY=""
 CF_AIG_TOKEN=""
 TURNSTILE_SECRET=""
 TURNSTILE_SITE_KEY=""
 TURNSTILE_EXPECTED_HOSTNAME="localhost"
+# Any random string enables the answer feedback controls locally.
+FEEDBACK_SECRET=""

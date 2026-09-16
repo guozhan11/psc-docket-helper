@@ -107,7 +107,6 @@ Before launching any shard, the workflow checks eDocket once with the same eight
 
 Every DC PSC call also retries those transient responses eight times with backoff, honouring `Retry-After`, to cover an outage that starts after the preflight check. If that happens, the shard keeps its last checkpoint, prints a `::warning::` annotation, and exits successfully so the next scheduled run resumes from the same cursor. Nothing is lost, because the cursor never advances past records that run did not write. A failed run therefore still means something this repository can act on, and the `alert` job opens or updates the `Ingestion run failed` issue only for those. To find deferred upstream outages, look for warning annotations on green runs and the freshness status from `/api/health`.
 
-
 To build or refresh metadata locally:
 
 ```bash
@@ -165,7 +164,7 @@ npm run rag:ingest-shard-0-cloud
 
 The four shard states collectively stop before 8 GiB of tracked R2 storage or 700,000 tracked R2 writes in one calendar month. These are project safeguards rather than billing guarantees. Monitor the Cloudflare dashboard as the corpus grows.
 
-The public health endpoint returns HTTP 503 with `status: "degraded"` when a metadata or ingestion shard is unavailable, when metadata or the case router is more than 36 hours old, when the router is unavailable, or when Turnstile is disabled/misconfigured. It does not calculate a coverage percentage from partial shard state.
+The public health endpoint returns HTTP 503 with `status: "degraded"` when a metadata or ingestion shard is unavailable, when metadata or the case router is more than 36 hours old, when the router is unavailable, when a published term index is more than ten days old, or when Turnstile is disabled/misconfigured. It does not calculate a coverage percentage from partial shard state.
 
 GitHub Actions runs application validation on every pull request and push to `main`. Ingestion remains a separate scheduled workflow so a DC PSC upstream outage cannot block ordinary code validation.
 
