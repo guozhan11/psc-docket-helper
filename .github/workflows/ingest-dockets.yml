@@ -21,7 +21,7 @@ on:
         default: "100"
         type: string
       concurrency:
-        description: "PDF workers per shard (4 shards run in parallel)"
+        description: "PDF workers per shard (shards currently run one at a time)"
         required: false
         default: "2"
         type: string

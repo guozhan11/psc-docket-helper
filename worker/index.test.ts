@@ -187,6 +187,53 @@ test('coverage refuses to calculate percentages from partial shard state', () =>
   assert.equal(coverage.complete, false);
 });
 
+test('coverage reconciles a stale metadata total after ingestion reaches every shard boundary', () => {
+  const coverage = fullTextCoverageSummary([
+    { documentsIndexed: 8, failedFilingIds: [], unavailableFilingIds: [9] },
+    { documentsIndexed: 4, failedFilingIds: [], unavailableFilingIds: [] }
+  ], 10, true, [7, 3]);
+  assert.equal(coverage.metadataPublicPdfRecords, 10);
+  assert.equal(coverage.publicPdfRecords, 13);
+  assert.equal(coverage.coverageBasis, 'complete-ingestion-scan');
+  assert.equal(coverage.searchablePercent, 92.31);
+  assert.equal(coverage.accountedPercent, 100);
+  assert.equal(coverage.complete, true);
+});
+
+test('a surplus in one shard does not hide a shortfall in another', () => {
+  // Summed, 11 accounted filings against 11 metadata records would read as
+  // complete. Shard 0 is still 3 short of its own metadata count.
+  const coverage = fullTextCoverageSummary([
+    { documentsIndexed: 5, failedFilingIds: [], unavailableFilingIds: [] },
+    { documentsIndexed: 6, failedFilingIds: [], unavailableFilingIds: [] }
+  ], 11, true, [8, 3]);
+  assert.equal(coverage.publicPdfRecords, 14);
+  assert.equal(coverage.unaccountedDocuments, 3);
+  assert.equal(coverage.searchablePercent, 78.57);
+  assert.equal(coverage.accountedPercent, 78.57);
+  assert.equal(coverage.complete, false);
+});
+
+test('coverage does not reconcile when shard counts do not line up', () => {
+  const coverage = fullTextCoverageSummary([
+    { documentsIndexed: 4, failedFilingIds: [], unavailableFilingIds: [] },
+    { documentsIndexed: 4, failedFilingIds: [], unavailableFilingIds: [] }
+  ], 10, true, [10]);
+  assert.equal(coverage.coverageBasis, 'metadata-scan');
+  assert.equal(coverage.publicPdfRecords, 10);
+  assert.equal(coverage.searchablePercent, 80);
+});
+
+test('coverage does not turn inconsistent partial counts into a capped 100 percent', () => {
+  const coverage = fullTextCoverageSummary([
+    { documentsIndexed: 11, failedFilingIds: [], unavailableFilingIds: [] }
+  ], 10, true);
+  assert.equal(coverage.searchablePercent, null);
+  assert.equal(coverage.accountedPercent, null);
+  assert.equal(coverage.unaccountedDocuments, null);
+  assert.equal(coverage.complete, false);
+});
+
 test('R2 health reads recover from a transient missing object', async () => {
   let reads = 0;
   const bucket = {

@@ -638,7 +638,10 @@ export function allowsLastKnownGoodHealth(url: URL): boolean {
 export function fullTextCoverageSummary(
   ingestionShards: Array<Record<string, unknown> | null>,
   publicPdfRecords: number,
-  stateAvailable = true
+  stateAvailable = true,
+  // Each shard's metadata public-PDF count, supplied only once every ingestion
+  // shard has reached its latest official-record boundary.
+  scannedShardPublicPdfRecords: number[] | null = null
 ) {
   const indexedDocuments = ingestionShards.reduce(
     (total, shard) => total + numericStateValue(shard?.documentsIndexed),
@@ -652,28 +655,53 @@ export function fullTextCoverageSummary(
     (total, shard) => total + stateArrayLength(shard?.unavailableFilingIds),
     0
   );
-  const searchablePercent = stateAvailable && publicPdfRecords > 0
-    ? Math.min(100, Number((indexedDocuments * 100 / publicPdfRecords).toFixed(2)))
+  const accountedDocuments = indexedDocuments + unavailableDocuments + retryPendingDocuments;
+  // Recent metadata refreshes do not rescan old shard totals, so a shard's
+  // stored public-PDF count can lag its ingestion cursor. Once every shard has
+  // reached the latest boundary, each shard's denominator is the larger of its
+  // metadata count and what ingestion accounted for there.
+  //
+  // This must be reconciled shard by shard. documentsIndexed is a running
+  // counter, not a set of filing ids: a run that stops between uploading a
+  // filing and saving its checkpoint skips that filing next time without
+  // counting it. A surplus in one shard (usually records added since the last
+  // full scan) would otherwise cancel a shortfall in another and report the
+  // corpus as fully accounted for when it is not known to be.
+  const ingestionScanComplete = scannedShardPublicPdfRecords !== null
+    && scannedShardPublicPdfRecords.length === ingestionShards.length;
+  const effectivePublicPdfRecords = ingestionScanComplete
+    ? ingestionShards.reduce((total, shard, shardIndex) => total + Math.max(
+        numericStateValue(scannedShardPublicPdfRecords[shardIndex]),
+        numericStateValue(shard?.documentsIndexed)
+          + stateArrayLength(shard?.unavailableFilingIds)
+          + stateArrayLength(shard?.failedFilingIds)
+      ), 0)
+    : publicPdfRecords;
+  const countsConsistent = effectivePublicPdfRecords >= accountedDocuments;
+  const canCalculate = stateAvailable && countsConsistent && effectivePublicPdfRecords > 0;
+  const searchablePercent = canCalculate
+    ? Number((indexedDocuments * 100 / effectivePublicPdfRecords).toFixed(2))
     : null;
-  const accountedPercent = stateAvailable && publicPdfRecords > 0
-    ? Math.min(100, Number(((indexedDocuments + unavailableDocuments) * 100 / publicPdfRecords).toFixed(2)))
+  const accountedPercent = canCalculate
+    ? Number(((indexedDocuments + unavailableDocuments) * 100 / effectivePublicPdfRecords).toFixed(2))
     : null;
   return {
     source: "r2-ingestion-state",
     stateAvailable,
     indexedDocuments,
-    publicPdfRecords,
+    publicPdfRecords: effectivePublicPdfRecords,
+    metadataPublicPdfRecords: publicPdfRecords,
+    coverageBasis: ingestionScanComplete ? "complete-ingestion-scan" : "metadata-scan",
     retryPendingDocuments,
     unavailableDocuments,
-    unaccountedDocuments: stateAvailable
-      ? Math.max(0, publicPdfRecords - indexedDocuments - unavailableDocuments)
+    unaccountedDocuments: canCalculate
+      ? Math.max(0, effectivePublicPdfRecords - indexedDocuments - unavailableDocuments)
       : null,
     searchablePercent,
     accountedPercent,
-    complete: stateAvailable
-      && publicPdfRecords > 0
+    complete: canCalculate
       && retryPendingDocuments === 0
-      && indexedDocuments + unavailableDocuments >= publicPdfRecords
+      && indexedDocuments + unavailableDocuments === effectivePublicPdfRecords
   };
 }
 
@@ -2343,6 +2371,19 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       : { status: "not-published", coverage: "case-router-sample" };
     const metadataStateAvailable = metadataCoverageShards.every(item => item !== null);
     const ingestionStateAvailable = ingestionShards.every(item => item !== null);
+    const latestOfficialRecords = metadataCoverage && "officialRecords" in metadataCoverage
+      ? numericStateValue(metadataCoverage.officialRecords)
+      : 0;
+    const ingestionScanComplete = metadataStateAvailable
+      && ingestionStateAvailable
+      && latestOfficialRecords > 0
+      && ingestionShards.every((shard, shardIndex) => {
+        const metadataShard = metadataCoverageShards[shardIndex];
+        const expectedEnd = shardIndex === ingestionShards.length - 1
+          ? latestOfficialRecords
+          : numericStateValue(metadataShard?.shardEnd);
+        return expectedEnd > 0 && numericStateValue(shard?.nextOffset) >= expectedEnd;
+      });
     const routerReady = isCaseRouterIndex(caseRouterPayload);
     const metadataFresh = isFreshTimestamp(metadataCoverage && "updatedAt" in metadataCoverage
       ? metadataCoverage.updatedAt
@@ -2367,7 +2408,10 @@ async function handleApi(request: Request, env: WorkerEnv, context: ExecutionCon
       fullTextCoverage: fullTextCoverageSummary(
         ingestionShards,
         publicPdfRecords,
-        metadataStateAvailable && ingestionStateAvailable
+        metadataStateAvailable && ingestionStateAvailable,
+        ingestionScanComplete
+          ? metadataCoverageShards.map(shard => numericStateValue(shard?.publicPdfRecords))
+          : null
       ),
       shards: shardCounts,
       metadataCoverage,

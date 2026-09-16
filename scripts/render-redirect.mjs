@@ -7,6 +7,7 @@
 // visitor to the Worker instead. Permanent, because the move is not provisional:
 // crawlers should attribute the old address to the canonical one.
 import { createServer } from "node:http";
+import { pathToFileURL } from "node:url";
 
 const CANONICAL = (
   process.env.CANONICAL_URL ??
@@ -15,6 +16,18 @@ const CANONICAL = (
 
 // Render's health check wants a 200, which a redirect never gives it.
 const HEALTH_PATH = "/healthz";
+
+export function redirectTarget(requestUrl, canonicalUrl = CANONICAL) {
+  const incoming = new URL(requestUrl ?? "/", "http://placeholder");
+  const target = new URL(canonicalUrl.endsWith("/") ? canonicalUrl : canonicalUrl + "/");
+  // Assigning pathname and search separately keeps the configured origin even
+  // when URL normalisation turns a path such as /a/..//example.com into a
+  // protocol-relative-looking //example.com path.
+  target.pathname = incoming.pathname;
+  target.search = incoming.search;
+  target.hash = "";
+  return target.toString();
+}
 
 const server = createServer((request, response) => {
   let target;
@@ -25,9 +38,7 @@ const server = createServer((request, response) => {
       response.end("ok\n");
       return;
     }
-    // Re-serialised through URL, so nothing from the request reaches the
-    // Location header unencoded.
-    target = new URL(incoming.pathname + incoming.search, CANONICAL).toString();
+    target = redirectTarget(request.url);
   } catch {
     target = CANONICAL + "/";
   }
@@ -46,7 +57,9 @@ const server = createServer((request, response) => {
   );
 });
 
-const port = Number(process.env.PORT ?? 3000);
-server.listen(port, "0.0.0.0", () => {
-  console.log(`Redirecting every request to ${CANONICAL} (port ${port})`);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const port = Number(process.env.PORT ?? 3000);
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`Redirecting every request to ${CANONICAL} (port ${port})`);
+  });
+}
