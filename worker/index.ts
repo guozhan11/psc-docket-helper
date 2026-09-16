@@ -1670,6 +1670,45 @@ export function pageBlocks(text: string): PageBlock[] {
   return blocks;
 }
 
+function wordCount(value: string): number {
+  return value.split(/\s+/).filter(Boolean).length;
+}
+
+function occurrences(haystack: string, needle: string): number {
+  let count = 0;
+  for (let index = haystack.indexOf(needle); index >= 0; index = haystack.indexOf(needle, index + needle.length)) {
+    count += 1;
+  }
+  return count;
+}
+
+const PASSAGE_BM25_K1 = 1.2;
+const PASSAGE_BM25_B = 0.75;
+
+/**
+ * BM25 score of one page block. Pages used to be ordered by how many distinct
+ * query terms they contained, which left a dozen pages of Pepco's CY2025
+ * Annual Informational Filing tied for "what drove the 2025 O&M variance", and
+ * the tie went to the cover letter because it happened to say "Pepco's". Term
+ * rarity within the filing, repetition, and block length separate them: the
+ * O&M summary now ranks first. Length normalisation also keeps a spreadsheet
+ * page that mentions every term once from outranking a paragraph.
+ */
+export function passageScore(
+  lowered: string,
+  terms: string[],
+  inverseFrequency: Map<string, number>,
+  averageLength: number
+): number {
+  const lengthFactor = 1 - PASSAGE_BM25_B + PASSAGE_BM25_B * wordCount(lowered) / averageLength;
+  return terms.reduce((score, term) => {
+    const frequency = occurrences(lowered, term);
+    if (!frequency) return score;
+    return score + (inverseFrequency.get(term) ?? 0)
+      * frequency * (PASSAGE_BM25_K1 + 1) / (frequency + PASSAGE_BM25_K1 * lengthFactor);
+  }, 0);
+}
+
 function renderPageBlock(block: PageBlock, index: number): string {
   if (block.kind === "text") return block.lines.join(" ").replace(/\s+/g, " ").trim();
   const opening = index === 0
@@ -1686,21 +1725,48 @@ export function findPageExcerpts(
   document: CompactDocumentRow,
   minimumTermMatches = 1
 ): SearchRow[] {
-  const rows: SearchRow[] = [];
-  const sections = html.matchAll(/<section\s+data-page=["'](\d+)["'][^>]*>([\s\S]*?)<\/section>/gi);
-  for (const section of sections) {
-    const blocks = pageBlocks(decodeEntities(section[2].replace(/<[^>]*>/g, "")));
-    const rendered = blocks.map(renderPageBlock);
+  // A possessive matches the plain word as well: "Pepco's" should find "Pepco
+  // DC Distribution", and must not hand a cover letter that happens to say
+  // "Pepco's" an extra term over the page that answers the question.
+  const matchTerms = Array.from(new Set(terms.map(term => term.replace(/'s$/, "")).filter(Boolean)));
+  const pages: Array<{ number: number; text: string; matchingTerms: string[] }> = [];
+  const documentFrequency = new Map(matchTerms.map(term => [term, 0]));
+  let pageCount = 0;
+  for (const section of html.matchAll(/<section\s+data-page=["'](\d+)["'][^>]*>([\s\S]*?)<\/section>/gi)) {
+    pageCount += 1;
+    const text = decodeEntities(section[2].replace(/<[^>]*>/g, ""));
     // Filings mostly use curly apostrophes; query terms are typed with straight ones.
-    const lowered = rendered.map(value => value.toLowerCase().replace(/[‘’]/g, "'"));
-    const normalized = lowered.join("\n");
-    const matchingTerms = terms.filter(term => normalized.includes(term));
-    if (matchingTerms.length < minimumTermMatches) continue;
+    const lowered = text.toLowerCase().replace(/[‘’]/g, "'");
+    const matchingTerms = matchTerms.filter(term => lowered.includes(term));
+    for (const term of matchingTerms) documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
+    if (matchingTerms.length >= minimumTermMatches) {
+      pages.push({ number: Number(section[1]), text, matchingTerms });
+    }
+  }
+  if (!pages.length) return [];
 
-    // Centre on the block where the most query terms occur together, not on
-    // wherever the first term happens to appear. A paragraph beats a table on
-    // a tie, since a table's header words match many questions.
-    const scores = lowered.map(value => matchingTerms.filter(term => value.includes(term)).length);
+  // Terms are weighted by how rare they are within this filing, so "Pepco" and
+  // "2025" in Pepco's 2025 filing count for little and the words that single
+  // out a passage count for more.
+  const inverseFrequency = new Map(matchTerms.map(term => {
+    const frequency = documentFrequency.get(term) ?? 0;
+    return [term, Math.log(1 + (pageCount - frequency + 0.5) / (frequency + 0.5))];
+  }));
+  const laidOut = pages.map(page => {
+    const blocks = pageBlocks(page.text);
+    const rendered = blocks.map(renderPageBlock);
+    const lowered = rendered.map(value => value.toLowerCase().replace(/[‘’]/g, "'"));
+    return { ...page, blocks, rendered, lowered };
+  });
+  const blockLengths = laidOut.flatMap(page => page.lowered.map(wordCount));
+  const averageBlockLength = Math.max(1, blockLengths.reduce((total, length) => total + length, 0) / blockLengths.length);
+
+  const rows: SearchRow[] = [];
+  for (const { number, blocks, rendered, lowered, matchingTerms } of laidOut) {
+    // Score each block as a passage with BM25 and centre on the best one,
+    // rather than on wherever the first term happens to appear. A paragraph
+    // beats a table on a tie, since a table's header words match many questions.
+    const scores = lowered.map(value => passageScore(value, matchingTerms, inverseFrequency, averageBlockLength));
     let best = 0;
     for (let index = 1; index < blocks.length; index += 1) {
       if (scores[index] > scores[best]
@@ -1708,6 +1774,8 @@ export function findPageExcerpts(
         best = index;
       }
     }
+    // The only match was in something pageBlocks drops, such as a page number.
+    if (!(scores[best] > 0)) continue;
 
     let text: string;
     let first = best;
@@ -1759,11 +1827,9 @@ export function findPageExcerpts(
       title: document.title,
       received_date: document.received_date,
       official_pdf_url: document.official_pdf_url,
-      page_number: Number(section[1]),
+      page_number: number,
       text,
-      // Pages are ordered by how many terms they contain; among those, a page
-      // where the terms meet in one block is the more direct evidence.
-      rank: -matchingTerms.length - scores[best] / (matchingTerms.length + 1)
+      rank: -scores[best]
     });
   }
   return rows.sort((left, right) => left.rank - right.rank).slice(0, 2);

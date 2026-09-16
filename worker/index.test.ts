@@ -13,6 +13,7 @@ import {
   filterFillRatio,
   findPageExcerpts,
   pageBlocks,
+  passageScore,
   saturationAdjustedHits,
   fullTextCoverageSummary,
   isFreshTimestamp,
@@ -225,6 +226,40 @@ test('an overlong paragraph is cut to the budget around its first match', () => 
   assert.ok(row.text.length <= EXCERPT_CHARACTER_BUDGET + 2);
   assert.match(row.text, /^…/);
   assert.match(row.text, /rate base/);
+});
+
+test('the page that answers the question outranks a cover letter that mentions its words', () => {
+  const coverLetter = [
+    'As directed, Pepco&#x27;s 2025 Annual Informational Filing provides a detailed report on',
+    'variances in revenue requirements items for CY2025, such as O&amp;M and plant additions.'
+  ].join('\n');
+  const summary = [
+    'Pepco DC Annual Information Filing O&amp;M Summary',
+    '',
+    'Overall, Pepco DC Distribution O&amp;M 2025 actual expenses were approximately $7.1 million',
+    'higher than 2025 projections. The variance was driven primarily by higher bad debt expense.',
+    'FERC Account 904 was $4.9 million higher than 2025 projections, reflecting higher 2025 bad debt expense.'
+  ].join('\n');
+  const filler = (page: number) => pageHtml(page, 'Pepco 2025 schedule of rate base items.');
+  const html = [pageHtml(1, coverLetter), filler(2), filler(3), filler(4), pageHtml(14, summary)].join('\n');
+  const rows = findPageExcerpts(html, ['drove', "pepco's", '2025', 'expense', 'variance'], excerptDocument);
+  assert.equal(rows[0].page_number, 14);
+  assert.match(rows[0].text, /\$7\.1 million/);
+});
+
+test('passage scores favour rare, repeated terms in short blocks', () => {
+  const idf = new Map([['pepco', 0.2], ['variance', 2]]);
+  const short = passageScore('the variance was driven by bad debt. the variance grew.', ['pepco', 'variance'], idf, 10);
+  const long = passageScore(`variance ${'row '.repeat(200)}`, ['pepco', 'variance'], idf, 10);
+  const common = passageScore('pepco pepco pepco filed a schedule.', ['pepco', 'variance'], idf, 10);
+  assert.ok(short > long);
+  assert.ok(short > common);
+  assert.equal(passageScore('nothing relevant here', ['variance'], idf, 10), 0);
+});
+
+test('a page whose only match is its page number is not evidence', () => {
+  const rows = findPageExcerpts(pageHtml(7, 'Unrelated text about tariffs.\n\n2025'), ['2025'], excerptDocument);
+  assert.equal(rows.length, 0);
 });
 
 test('the model is told not to attach table figures to nearby paragraphs', () => {
